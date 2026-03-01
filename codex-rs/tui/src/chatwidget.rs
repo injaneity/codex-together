@@ -333,6 +333,7 @@ use codex_together_protocol::TogetherThreadShareResponse;
 use codex_together_protocol::TogetherThreadSummary;
 use codex_utils_approval_presets::ApprovalPreset;
 use codex_utils_approval_presets::builtin_approval_presets;
+use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 use futures::SinkExt;
 use futures::StreamExt;
 use serde::de::DeserializeOwned;
@@ -8505,6 +8506,7 @@ struct TogetherRpcClient {
 
 impl TogetherRpcClient {
     async fn connect(endpoint: &str) -> anyhow::Result<Self> {
+        ensure_rustls_crypto_provider();
         let parsed = Url::parse(endpoint)
             .map_err(|err| anyhow::anyhow!("invalid together endpoint `{endpoint}`: {err}"))?;
         let (socket, _) = connect_async(parsed.as_str()).await.map_err(|err| {

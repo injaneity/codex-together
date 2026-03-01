@@ -3679,6 +3679,16 @@ impl ChatWidget {
                     "join".to_string(),
                 );
             }
+            SlashCommand::Share => {
+                if !self.together_enabled() {
+                    self.add_info_message(
+                        "Codex Together is disabled.".to_string(),
+                        Some("Enable the together feature in /experimental first.".to_string()),
+                    );
+                    return;
+                }
+                self.run_together_command("share".to_string());
+            }
             SlashCommand::Host => {
                 if !self.together_enabled() {
                     self.add_info_message(
@@ -4073,6 +4083,22 @@ impl ChatWidget {
                     return;
                 };
                 self.run_together_command(format!("join {prepared_args}"));
+                self.bottom_pane.drain_pending_submission_state();
+            }
+            SlashCommand::Share if !trimmed.is_empty() => {
+                if !self.together_enabled() {
+                    self.add_info_message(
+                        "Codex Together is disabled.".to_string(),
+                        Some("Enable the together feature in /experimental first.".to_string()),
+                    );
+                    return;
+                }
+                let Some((prepared_args, _prepared_elements)) =
+                    self.bottom_pane.prepare_inline_args_submission(false)
+                else {
+                    return;
+                };
+                self.run_together_command(format!("share {prepared_args}"));
                 self.bottom_pane.drain_pending_submission_state();
             }
             _ => self.dispatch_command(cmd),
@@ -9451,6 +9477,7 @@ fn together_overview_hint(connected: bool) -> String {
             "Codex-Together lets collaborators branch conversations safely.",
             "Available now:",
             "/status  show current connection",
+            "/share   share current thread",
             "/threads browse shared threads (Enter checkout, f fork, d delete-owner)",
             "/history browse lineage for current thread",
             "/fork    fork your current session",

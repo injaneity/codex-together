@@ -57,6 +57,7 @@ use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputQuestion;
 use codex_protocol::user_input::TextElement;
+use codex_together_client::status_env_key;
 use codex_utils_cli::format_env_display::format_env_display;
 use image::DynamicImage;
 use image::ImageReader;
@@ -1058,15 +1059,7 @@ pub(crate) fn new_session_info(
     );
     let mut parts: Vec<Box<dyn HistoryCell>> = vec![Box::new(header)];
 
-    let together_status = std::env::var("CODEX_TOGETHER_STATUS")
-        .ok()
-        .unwrap_or_else(|| "disconnected".to_string());
-    parts.push(Box::new(PlainHistoryCell {
-        lines: vec![Line::from(vec![
-            "  together: ".dim(),
-            together_status.into(),
-        ])],
-    }));
+    parts.push(Box::new(TogetherStatusHistoryCell));
 
     if is_first_event {
         // Help lines below the header (new copy and list)
@@ -1122,6 +1115,21 @@ pub(crate) fn new_session_info(
     }
 
     SessionInfoCell(CompositeHistoryCell { parts })
+}
+
+#[derive(Debug)]
+struct TogetherStatusHistoryCell;
+
+impl HistoryCell for TogetherStatusHistoryCell {
+    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        let together_status = std::env::var(status_env_key())
+            .ok()
+            .unwrap_or_else(|| "disconnected".to_string());
+        vec![Line::from(vec![
+            "  together: ".dim(),
+            together_status.into(),
+        ])]
+    }
 }
 
 pub(crate) fn new_user_prompt(

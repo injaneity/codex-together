@@ -35,7 +35,11 @@ pub(crate) fn builtins_for_input(
         .filter(|(_, cmd)| audio_device_selection_enabled || *cmd != SlashCommand::Settings)
         .filter(|(_, cmd)| !connected || *cmd != SlashCommand::Host)
         .filter(|(_, cmd)| {
-            connected || !matches!(cmd, SlashCommand::Threads | SlashCommand::History)
+            connected
+                || !matches!(
+                    cmd,
+                    SlashCommand::Share | SlashCommand::Threads | SlashCommand::History
+                )
         })
         .collect()
 }
@@ -169,6 +173,28 @@ mod tests {
         assert_eq!(
             find_builtin_command("host", true, true, true, false, true, false),
             None
+        );
+    }
+
+    #[test]
+    fn share_hidden_when_disconnected() {
+        unsafe {
+            std::env::set_var("CODEX_TOGETHER_STATUS", "disconnected");
+        }
+        assert_eq!(
+            find_builtin_command("share", true, true, true, false, true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn share_visible_when_connected() {
+        unsafe {
+            std::env::set_var("CODEX_TOGETHER_STATUS", "together @owner@local");
+        }
+        assert_eq!(
+            find_builtin_command("share", true, true, true, false, true, false),
+            Some(SlashCommand::Share)
         );
     }
 }

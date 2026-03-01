@@ -297,8 +297,6 @@ use codex_together_protocol::METHOD_TOGETHER_AUTH;
 use codex_together_protocol::METHOD_TOGETHER_HISTORY_LINEAGE;
 use codex_together_protocol::METHOD_TOGETHER_JOIN;
 use codex_together_protocol::METHOD_TOGETHER_LEAVE;
-use codex_together_protocol::METHOD_TOGETHER_MEMBER_ADD;
-use codex_together_protocol::METHOD_TOGETHER_MEMBER_REMOVE;
 use codex_together_protocol::METHOD_TOGETHER_SERVER_CLOSE;
 use codex_together_protocol::METHOD_TOGETHER_SERVER_CREATE;
 use codex_together_protocol::METHOD_TOGETHER_SERVER_INFO;
@@ -311,7 +309,6 @@ use codex_together_protocol::TogetherHistoryLineageRequest;
 use codex_together_protocol::TogetherHistoryLineageResponse;
 use codex_together_protocol::TogetherJoinRequest;
 use codex_together_protocol::TogetherJoinResponse;
-use codex_together_protocol::TogetherMemberUpdateRequest;
 use codex_together_protocol::TogetherRole;
 use codex_together_protocol::TogetherServerCloseResponse;
 use codex_together_protocol::TogetherServerCreateRequest;
@@ -343,6 +340,9 @@ const DEFAULT_STATUS_LINE_ITEMS: [&str; 3] =
     ["model-with-reasoning", "context-remaining", "current-dir"];
 const TOGETHER_DEFAULT_ENDPOINT_URL: &str = "ws://127.0.0.1:8788/ws";
 const TOGETHER_ENDPOINT_ENV_KEY: &str = "CODEX_TOGETHER_ENDPOINT";
+const TOGETHER_ENDPOINT_ALIASES_ENV_KEY: &str = "CODEX_TOGETHER_ENDPOINT_ALIASES";
+const TOGETHER_ACTOR_ENV_KEY: &str = "CODEX_TOGETHER_ACTOR";
+const NGROK_TUNNELS_API_URL: &str = "http://127.0.0.1:4040/api/tunnels";
 // Track information about an in-flight exec command.
 struct RunningCommand {
     command: Vec<String>,
@@ -4823,6 +4823,8 @@ impl ChatWidget {
             .unwrap_or_else(|_| "disconnected".to_string())
             .to_ascii_lowercase();
         let is_host = together_status.contains("host:");
+        let is_disconnected =
+            together_status.trim().is_empty() || together_status == "disconnected";
 
         let run_item = |name: &str, description: &str, args: &str| -> SelectionItem {
             let args = args.to_string();
@@ -4862,87 +4864,81 @@ impl ChatWidget {
         };
 
         let mut items = Vec::new();
-        if !is_host {
-            items.push(prompt_item(
+        if is_disconnected {
+            items.push(run_item(
                 "Create app server",
-                "Start a local together host process and generate invite links.",
-                "Create app server",
-                "Enter public ngrok base URL and press Enter",
+                "Start a local together host, auto-create ngrok URL, and join.",
                 "create",
             ));
+            items.push(prompt_item(
+                "Join app server",
+                "Connect to a shared server via ngrok URL or short invite id.",
+                "Join app server",
+                "Enter ngrok URL or invite id and press Enter",
+                "join",
+            ));
+            items.push(run_item("Help", "Show together workflow summary.", "help"));
         } else {
             items.push(run_item(
-                "Close app server",
-                "Shut down your hosted together server for all members.",
-                "close",
+                "Status",
+                "Show active together server info and your role.",
+                "status",
+            ));
+            items.push(run_item(
+                "Share thread",
+                "Publish current thread to together history.",
+                "share",
             ));
             items.push(prompt_item(
-                "Add user",
-                "Allow a new email to join this together server.",
-                "Add user",
-                "Enter collaborator email and press Enter",
-                "add-user",
+                "Checkout thread",
+                "Read-only checkout for non-owners.",
+                "Checkout thread",
+                "Enter thread id and press Enter",
+                "checkout",
             ));
             items.push(prompt_item(
-                "Remove user",
-                "Revoke a member from this together server.",
-                "Remove user",
-                "Enter collaborator email and press Enter",
-                "remove-user",
+                "Fork thread",
+                "Fork selected shared thread and continue on child.",
+                "Fork thread",
+                "Enter parent thread id and press Enter",
+                "fork",
             ));
+            items.push(prompt_item(
+                "View thread history",
+                "Lazygit-style lineage tree (up/down + enter checkout).",
+                "View thread history",
+                "Enter root thread id and press Enter",
+                "lineage",
+            ));
+            items.push(run_item(
+                "List shared threads",
+                "Show threads shared on the active together server.",
+                "list",
+            ));
+            if is_host {
+                items.push(run_item(
+                    "Close app server",
+                    "Shut down your hosted together server for all members.",
+                    "close",
+                ));
+            } else {
+                items.push(run_item(
+                    "Leave app server",
+                    "Disconnect from the current together server.",
+                    "leave",
+                ));
+            }
+            items.push(run_item("Help", "Show together workflow summary.", "help"));
         }
-
-        items.push(prompt_item(
-            "Join app server by invite",
-            "Connect to a shared codex-together invite link.",
-            "Join app server",
-            "Paste invite token or link and press Enter",
-            "join",
-        ));
-        items.push(run_item(
-            "Share thread",
-            "Publish current thread to together ACL.",
-            "share",
-        ));
-        items.push(prompt_item(
-            "Checkout thread",
-            "Read-only checkout for non-owners.",
-            "Checkout thread",
-            "Enter thread id and press Enter",
-            "checkout",
-        ));
-        items.push(prompt_item(
-            "Fork thread",
-            "Fork selected shared thread and continue on child.",
-            "Fork thread",
-            "Enter parent thread id and press Enter",
-            "fork",
-        ));
-        items.push(prompt_item(
-            "View thread history",
-            "Lazygit-style lineage tree (up/down + enter checkout).",
-            "View thread history",
-            "Enter root thread id and press Enter",
-            "lineage",
-        ));
-        items.push(run_item(
-            "List shared threads",
-            "Show threads shared on the active together server.",
-            "list",
-        ));
-        items.push(run_item(
-            "Status",
-            "Show active together server info and your role.",
-            "status",
-        ));
-        items.push(run_item("Help", "Show together workflow summary.", "help"));
 
         self.bottom_pane.show_selection_view(SelectionViewParams {
             title: Some("Codex Together".to_string()),
-            subtitle: Some(if is_host {
-                "Owner + member actions".to_string()
+            subtitle: Some(if is_disconnected {
+                "Disconnected".to_string()
+            } else if is_host {
+                "Host actions".to_string()
             } else {
-                "Member actions".to_string()
+                "Connected member actions".to_string()
             }),
             footer_hint: Some(standard_popup_hint_line()),
             items,
@@ -8274,7 +8270,7 @@ impl TogetherRpcClient {
             .call(
                 METHOD_TOGETHER_AUTH,
                 TogetherAuthRequest {
-                    email: "codex@local".to_string(),
+                    email: local_together_actor_id(),
                 },
             )
             .await?;
@@ -8395,11 +8391,12 @@ async fn execute_together_command(
             hint: Some(together_usage_hint()),
         }),
         "create" => {
-            let Some(public_base_url) = rest.first() else {
-                anyhow::bail!("usage: /together create <public-base-url>");
-            };
+            if !rest.is_empty() {
+                anyhow::bail!("usage: /together create");
+            }
             let endpoint = TOGETHER_DEFAULT_ENDPOINT_URL.to_string();
             ensure_local_together_server_running(&endpoint).await?;
+            let public_base_url = ensure_ngrok_public_base_url(&endpoint).await?;
             let mut client = connect_and_auth(&endpoint).await?;
             let response: TogetherServerCreateResponse = client
                 .call(
@@ -8411,6 +8408,7 @@ async fn execute_together_command(
                 )
                 .await?;
 
+            remember_together_server_endpoint(&response.server_id, &public_base_url);
             set_together_endpoint(Some(endpoint));
             set_together_status(Some(format!(
                 "together host:{}",
@@ -8423,8 +8421,11 @@ async fn execute_together_command(
                     short_server_id(&response.server_id)
                 ),
                 hint: Some(format!(
-                    "Invite link: {}\nInvite token: {}\nRemote websocket transport is experimental in v1.",
-                    response.invite_link, response.invite_token
+                    "Public URL: {}\nJoin with URL: /together join {}\nJoin with short id: /together join {}\nInvite id: {}\nRemote websocket transport is experimental in v1.",
+                    public_base_url,
+                    public_base_url,
+                    short_server_id(&response.server_id),
+                    response.invite_token
                 )),
             })
         }
@@ -8442,21 +8443,20 @@ async fn execute_together_command(
             })
         }
         "join" => {
-            let Some(invite) = rest.first() else {
-                anyhow::bail!("usage: /together join <invite-token-or-link>");
+            let Some(target) = rest.first() else {
+                anyhow::bail!("usage: /together join <ngrok-url-or-invite-id>");
             };
-            let invite_payload = decode_invite(invite)
-                .map_err(|err| anyhow::anyhow!("failed to decode invite token: {err}"))?;
-            let endpoint = normalize_together_ws_endpoint(&invite_payload.endpoint)?;
+            let endpoint = resolve_together_join_endpoint(target)?;
             let mut client = connect_and_auth(&endpoint).await?;
             let response: TogetherJoinResponse = client
                 .call(
                     METHOD_TOGETHER_JOIN,
                     TogetherJoinRequest {
-                        invite: invite.clone(),
+                        invite: target.clone(),
                     },
                 )
                 .await?;
+            remember_together_server_endpoint(&response.server_id, &endpoint);
             set_together_endpoint(Some(endpoint.clone()));
             set_together_status(Some(status_label_for_role(
                 response.role,
@@ -8487,44 +8487,6 @@ async fn execute_together_command(
             Ok(TogetherCommandOutput {
                 message: "Left together server.".to_string(),
                 hint: None,
-            })
-        }
-        "add-user" => {
-            let Some(email) = rest.first() else {
-                anyhow::bail!("usage: /together add-user <email>");
-            };
-            let endpoint = current_together_endpoint();
-            let mut client = connect_and_auth(&endpoint).await?;
-            let response: codex_together_protocol::TogetherMemberUpdateResponse = client
-                .call(
-                    METHOD_TOGETHER_MEMBER_ADD,
-                    TogetherMemberUpdateRequest {
-                        email: email.clone(),
-                    },
-                )
-                .await?;
-            Ok(TogetherCommandOutput {
-                message: format!("Member add result: {}", response.updated),
-                hint: Some(format!("Email: {email}")),
-            })
-        }
-        "remove-user" => {
-            let Some(email) = rest.first() else {
-                anyhow::bail!("usage: /together remove-user <email>");
-            };
-            let endpoint = current_together_endpoint();
-            let mut client = connect_and_auth(&endpoint).await?;
-            let response: codex_together_protocol::TogetherMemberUpdateResponse = client
-                .call(
-                    METHOD_TOGETHER_MEMBER_REMOVE,
-                    TogetherMemberUpdateRequest {
-                        email: email.clone(),
-                    },
-                )
-                .await?;
-            Ok(TogetherCommandOutput {
-                message: format!("Member remove result: {}", response.updated),
-                hint: Some(format!("Email: {email}")),
             })
         }
         "share" => {
@@ -8674,6 +8636,7 @@ async fn execute_together_command(
             let response: TogetherServerInfoResponse = client
                 .call(METHOD_TOGETHER_SERVER_INFO, serde_json::json!({}))
                 .await?;
+            remember_together_server_endpoint(&response.server_id, &response.public_base_url);
             set_together_endpoint(Some(endpoint.clone()));
             set_together_status(Some(status_label_for_role(
                 response.role,
@@ -8717,6 +8680,180 @@ async fn connect_and_auth(endpoint: &str) -> anyhow::Result<TogetherRpcClient> {
     client.initialize().await?;
     client.authenticate().await?;
     Ok(client)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct NgrokTunnelsResponse {
+    #[serde(default)]
+    tunnels: Vec<NgrokTunnel>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct NgrokTunnel {
+    public_url: String,
+    #[serde(default)]
+    config: Option<NgrokTunnelConfig>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct NgrokTunnelConfig {
+    #[serde(default)]
+    addr: Option<String>,
+}
+
+fn local_together_actor_id() -> String {
+    if let Ok(value) = std::env::var(TOGETHER_ACTOR_ENV_KEY)
+        && !value.trim().is_empty()
+    {
+        return value;
+    }
+
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "coder".to_string());
+    let normalized = user
+        .trim()
+        .to_ascii_lowercase()
+        .replace(|ch: char| !ch.is_ascii_alphanumeric(), "-");
+    let actor = if normalized.trim_matches('-').is_empty() {
+        "coder@local".to_string()
+    } else {
+        format!("{}@local", normalized.trim_matches('-'))
+    };
+
+    unsafe {
+        std::env::set_var(TOGETHER_ACTOR_ENV_KEY, &actor);
+    }
+    actor
+}
+
+fn resolve_together_join_endpoint(target: &str) -> anyhow::Result<String> {
+    let target = target.trim();
+    if target.is_empty() {
+        anyhow::bail!("join target cannot be empty");
+    }
+
+    if let Ok(invite_payload) = decode_invite(target) {
+        return normalize_together_ws_endpoint(&invite_payload.endpoint);
+    }
+
+    if let Some(candidate) = endpoint_candidate_from_target(target) {
+        return normalize_together_ws_endpoint(&candidate);
+    }
+
+    if let Some(endpoint) = known_together_server_endpoint(target) {
+        return normalize_together_ws_endpoint(&endpoint);
+    }
+
+    anyhow::bail!(
+        "unable to resolve together endpoint from `{target}`; use the host ngrok URL or invite id"
+    )
+}
+
+fn endpoint_candidate_from_target(target: &str) -> Option<String> {
+    if Url::parse(target).is_ok() {
+        return Some(target.to_string());
+    }
+    if target.contains('.') && !target.chars().any(|ch| ch.is_whitespace()) {
+        return Some(format!("https://{target}"));
+    }
+    None
+}
+
+fn remember_together_server_endpoint(server_id: &str, endpoint: &str) {
+    let Ok(normalized) = normalize_together_ws_endpoint(endpoint) else {
+        return;
+    };
+    let mut map = together_endpoint_aliases();
+    map.insert(server_id.to_string(), normalized.clone());
+    map.insert(short_server_id(server_id), normalized);
+
+    if let Ok(encoded) = serde_json::to_string(&map) {
+        unsafe {
+            std::env::set_var(TOGETHER_ENDPOINT_ALIASES_ENV_KEY, encoded);
+        }
+    }
+}
+
+fn known_together_server_endpoint(alias: &str) -> Option<String> {
+    let mut aliases = together_endpoint_aliases();
+    aliases.remove(alias)
+}
+
+fn together_endpoint_aliases() -> HashMap<String, String> {
+    let Ok(raw) = std::env::var(TOGETHER_ENDPOINT_ALIASES_ENV_KEY) else {
+        return HashMap::new();
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+async fn ensure_ngrok_public_base_url(endpoint: &str) -> anyhow::Result<String> {
+    let parsed = Url::parse(endpoint)
+        .map_err(|err| anyhow::anyhow!("invalid together endpoint `{endpoint}`: {err}"))?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("together endpoint missing port: `{endpoint}`"))?;
+
+    if let Some(existing) = find_ngrok_tunnel_for_port(port).await? {
+        return Ok(existing);
+    }
+
+    spawn_ngrok_http_tunnel(port)?;
+    for _ in 0..40 {
+        if let Some(url) = find_ngrok_tunnel_for_port(port).await? {
+            return Ok(url);
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    anyhow::bail!(
+        "timed out waiting for ngrok tunnel on port {port}; ensure ngrok is installed and authenticated"
+    );
+}
+
+async fn find_ngrok_tunnel_for_port(port: u16) -> anyhow::Result<Option<String>> {
+    let Ok(response) = reqwest::get(NGROK_TUNNELS_API_URL).await else {
+        return Ok(None);
+    };
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+    let payload: NgrokTunnelsResponse = response
+        .json()
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to parse ngrok tunnels response: {err}"))?;
+
+    let port_suffix = format!(":{port}");
+    let mut fallback: Option<String> = None;
+    for tunnel in payload.tunnels {
+        let Some(addr) = tunnel.config.and_then(|config| config.addr) else {
+            continue;
+        };
+        if !addr.ends_with(&port_suffix) {
+            continue;
+        }
+        let normalized = tunnel.public_url.trim_end_matches('/').to_string();
+        if normalized.starts_with("https://") {
+            return Ok(Some(normalized));
+        }
+        if fallback.is_none() {
+            fallback = Some(normalized);
+        }
+    }
+
+    Ok(fallback)
+}
+
+fn spawn_ngrok_http_tunnel(port: u16) -> anyhow::Result<()> {
+    std::process::Command::new("ngrok")
+        .arg("http")
+        .arg(port.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| anyhow::anyhow!("failed to launch `ngrok http {port}`: {err}"))
 }
 
 async fn ensure_local_together_server_running(endpoint: &str) -> anyhow::Result<()> {
@@ -8883,15 +9020,13 @@ fn status_label_for_role(role: TogetherRole, owner_email: &str, server_id: &str)
 
 fn together_usage_hint() -> String {
     [
-        "/together create <public-base-url>",
-        "/together join <invite>",
+        "/together create",
+        "/together join <ngrok-url-or-invite-id>",
         "/together share [thread-id]",
         "/together checkout <thread-id>",
         "/together fork <thread-id>",
         "/together list [search-term]",
         "/together lineage <root-thread-id>",
-        "/together add-user <email>",
-        "/together remove-user <email>",
         "/together status [endpoint]",
         "/together close | leave | help",
     ]

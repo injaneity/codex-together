@@ -22,10 +22,7 @@ use axum::routing::get;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
-use codex_app_server_protocol::Account;
 use codex_app_server_protocol::ClientInfo;
-use codex_app_server_protocol::GetAccountParams;
-use codex_app_server_protocol::GetAccountResponse;
 use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::InitializeResponse;
@@ -122,7 +119,6 @@ use uuid::Uuid;
 const RPC_ERR_NOT_CONNECTED: i64 = -39000;
 const RPC_ERR_FORBIDDEN: i64 = -39001;
 const RPC_ERR_SERVER_CLOSED: i64 = -39003;
-const RPC_ERR_IDENTITY_UNAVAILABLE: i64 = -39004;
 const RPC_ERR_SINGLETON_CONFLICT: i64 = -39005;
 const RPC_ERR_MEMBER_NOT_ALLOWED: i64 = -39006;
 const RPC_ERR_OVERLOADED: i64 = -39007;
@@ -245,14 +241,19 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let connection_id = Uuid::new_v4();
+    let actor_id = default_actor_id(connection_id);
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
     {
         let mut guard = state.inner.lock().await;
-        guard
-            .connections
-            .insert(connection_id, ConnectionEntry { tx, email: None });
+        guard.connections.insert(
+            connection_id,
+            ConnectionEntry {
+                tx,
+                email: Some(actor_id.clone()),
+            },
+        );
     }
 
     let send_task = tokio::spawn(async move {
@@ -263,7 +264,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     });
 
-    let mut ctx = ConnectionContext::default();
+    let mut ctx = ConnectionContext {
+        initialized: false,
+        email: Some(actor_id),
+    };
 
     while let Some(Ok(msg)) = receiver.next().await {
         let Message::Text(text) = msg else {
@@ -360,25 +364,14 @@ async fn together_auth(
     ctx: &mut ConnectionContext,
     req: JsonRpcRequest,
 ) -> JsonRpcResponse {
-    let _payload: TogetherAuthRequest = match serde_json::from_value(req.params) {
+    let payload: TogetherAuthRequest = match serde_json::from_value(req.params) {
         Ok(p) => p,
         Err(_) => return rpc_error(req.id, -32602, "invalid params"),
     };
 
-    let canonical_email = {
-        let mut bridge = state.app_server.lock().await;
-        match bridge.account_email().await {
-            Ok(Some(email)) => email,
-            Ok(None) => {
-                return rpc_error(
-                    req.id,
-                    RPC_ERR_IDENTITY_UNAVAILABLE,
-                    "ChatGPT email required for together membership in v1.",
-                );
-            }
-            Err(err) => return app_server_error_response(req.id, err),
-        }
-    };
+    let canonical_email = non_empty_string(payload.email)
+        .or_else(|| ctx.email.clone())
+        .unwrap_or_else(|| default_actor_id(connection_id));
 
     ctx.email = Some(canonical_email.clone());
     set_connection_email(state, connection_id, Some(canonical_email.clone())).await;
@@ -415,13 +408,10 @@ async fn together_server_create(
         Ok(p) => p,
         Err(_) => return rpc_error(req.id, -32602, "invalid params"),
     };
-    let Some(owner_email) = ctx.email.clone() else {
-        return rpc_error(
-            req.id,
-            RPC_ERR_IDENTITY_UNAVAILABLE,
-            "ChatGPT email required for together membership in v1.",
-        );
-    };
+    let owner_email = ctx
+        .email
+        .clone()
+        .unwrap_or_else(|| "host@local".to_string());
 
     let now = Utc::now();
     let created_at_epoch = now.timestamp();
@@ -523,13 +513,10 @@ async fn together_server_close(
     ctx: &ConnectionContext,
     req: JsonRpcRequest,
 ) -> JsonRpcResponse {
-    let Some(email) = ctx.email.clone() else {
-        return rpc_error(
-            req.id,
-            RPC_ERR_IDENTITY_UNAVAILABLE,
-            "ChatGPT email required for together membership in v1.",
-        );
-    };
+    let email = ctx
+        .email
+        .clone()
+        .unwrap_or_else(|| "guest@local".to_string());
 
     let hosted = {
         let mut guard = state.inner.lock().await;
@@ -596,13 +583,10 @@ async fn update_member(
         Err(_) => return rpc_error(req.id, -32602, "invalid params"),
     };
 
-    let Some(caller_email) = ctx.email.clone() else {
-        return rpc_error(
-            req.id,
-            RPC_ERR_IDENTITY_UNAVAILABLE,
-            "ChatGPT email required for together membership in v1.",
-        );
-    };
+    let caller_email = ctx
+        .email
+        .clone()
+        .unwrap_or_else(|| "guest@local".to_string());
 
     let (server_id, changed) = {
         let mut guard = state.inner.lock().await;
@@ -676,13 +660,10 @@ async fn together_server_info(
     ctx: &ConnectionContext,
     req: JsonRpcRequest,
 ) -> JsonRpcResponse {
-    let Some(email) = ctx.email.clone() else {
-        return rpc_error(
-            req.id,
-            RPC_ERR_IDENTITY_UNAVAILABLE,
-            "ChatGPT email required for together membership in v1.",
-        );
-    };
+    let email = ctx
+        .email
+        .clone()
+        .unwrap_or_else(|| "guest@local".to_string());
 
     let guard = state.inner.lock().await;
     let Some(hosted) = guard.hosted.as_ref() else {
@@ -735,13 +716,10 @@ async fn together_thread_share(
         Ok(p) => p,
         Err(_) => return rpc_error(req.id, -32602, "invalid params"),
     };
-    let Some(caller_email) = ctx.email.clone() else {
-        return rpc_error(
-            req.id,
-            RPC_ERR_IDENTITY_UNAVAILABLE,
-            "ChatGPT email required for together membership in v1.",
-        );
-    };
+    let caller_email = ctx
+        .email
+        .clone()
+        .unwrap_or_else(|| "guest@local".to_string());
 
     let thread = {
         let mut bridge = state.app_server.lock().await;
@@ -857,13 +835,10 @@ async fn together_thread_checkout(
         Ok(p) => p,
         Err(_) => return rpc_error(req.id, -32602, "invalid params"),
     };
-    let Some(email) = ctx.email.clone() else {
-        return rpc_error(
-            req.id,
-            RPC_ERR_IDENTITY_UNAVAILABLE,
-            "ChatGPT email required for together membership in v1.",
-        );
-    };
+    let email = ctx
+        .email
+        .clone()
+        .unwrap_or_else(|| "guest@local".to_string());
 
     let guard = state.inner.lock().await;
     let Some(hosted) = guard.hosted.as_ref() else {
@@ -907,13 +882,10 @@ async fn together_thread_fork(
         Ok(p) => p,
         Err(_) => return rpc_error(req.id, -32602, "invalid params"),
     };
-    let Some(caller_email) = ctx.email.clone() else {
-        return rpc_error(
-            req.id,
-            RPC_ERR_IDENTITY_UNAVAILABLE,
-            "ChatGPT email required for together membership in v1.",
-        );
-    };
+    let caller_email = ctx
+        .email
+        .clone()
+        .unwrap_or_else(|| "guest@local".to_string());
 
     {
         let guard = state.inner.lock().await;
@@ -1058,13 +1030,10 @@ async fn together_thread_list(
             search_term: None,
         });
 
-    let Some(email) = ctx.email.clone() else {
-        return rpc_error(
-            req.id,
-            RPC_ERR_IDENTITY_UNAVAILABLE,
-            "ChatGPT email required for together membership in v1.",
-        );
-    };
+    let email = ctx
+        .email
+        .clone()
+        .unwrap_or_else(|| "guest@local".to_string());
 
     let guard = state.inner.lock().await;
     let Some(hosted) = guard.hosted.as_ref() else {
@@ -1128,13 +1097,10 @@ async fn together_history_lineage(
         Err(_) => return rpc_error(req.id, -32602, "invalid params"),
     };
 
-    let Some(email) = ctx.email.clone() else {
-        return rpc_error(
-            req.id,
-            RPC_ERR_IDENTITY_UNAVAILABLE,
-            "ChatGPT email required for together membership in v1.",
-        );
-    };
+    let email = ctx
+        .email
+        .clone()
+        .unwrap_or_else(|| "guest@local".to_string());
 
     let guard = state.inner.lock().await;
     let Some(hosted) = guard.hosted.as_ref() else {
@@ -1192,49 +1158,68 @@ async fn together_join(
         Err(_) => return rpc_error(req.id, -32602, "invalid params"),
     };
 
-    let Some(email) = ctx.email.clone() else {
-        return rpc_error(
-            req.id,
-            RPC_ERR_IDENTITY_UNAVAILABLE,
-            "ChatGPT email required for together membership in v1.",
-        );
-    };
+    let email = ctx
+        .email
+        .clone()
+        .unwrap_or_else(|| "guest@local".to_string());
+    let server_hint = invite_server_hint(&payload.invite);
+    let now = Utc::now().timestamp();
 
-    let token = extract_token(&payload.invite);
-    let invite = match decode_invite(&token) {
-        Ok(invite) => invite,
-        Err(_) => return rpc_error(req.id, -32602, "invalid invite token"),
-    };
-    if invite.exp < Utc::now().timestamp() {
-        return rpc_error(req.id, -32602, "invite token expired");
-    }
+    let (server_id, owner_email, endpoint, role, newly_added_member) = {
+        let mut guard = state.inner.lock().await;
+        let Some(hosted) = guard.hosted.as_mut() else {
+            return rpc_error(req.id, RPC_ERR_NOT_CONNECTED, "TOGETHER_NOT_CONNECTED");
+        };
 
-    let guard = state.inner.lock().await;
-    let Some(hosted) = guard.hosted.as_ref() else {
-        return rpc_error(req.id, RPC_ERR_NOT_CONNECTED, "TOGETHER_NOT_CONNECTED");
-    };
-
-    if hosted.server_id != invite.server_id || hosted.owner_email != invite.owner_email {
-        return rpc_error(req.id, RPC_ERR_SERVER_CLOSED, "TOGETHER_SERVER_CLOSED");
-    }
-
-    let role = match member_role(hosted, &email) {
-        Some(role) => role,
-        None => {
-            return rpc_error(
-                req.id,
-                RPC_ERR_MEMBER_NOT_ALLOWED,
-                "TOGETHER_MEMBER_NOT_ALLOWED",
-            );
+        if let Some(hint) = server_hint.as_deref()
+            && hosted.server_id != hint
+            && !hosted.server_id.starts_with(hint)
+        {
+            return rpc_error(req.id, RPC_ERR_SERVER_CLOSED, "TOGETHER_SERVER_CLOSED");
         }
+
+        let role = if email == hosted.owner_email {
+            TogetherRole::Owner
+        } else {
+            TogetherRole::Member
+        };
+        let newly_added_member = if matches!(role, TogetherRole::Member) {
+            hosted.members.insert(email.clone())
+        } else {
+            false
+        };
+
+        (
+            hosted.server_id.clone(),
+            hosted.owner_email.clone(),
+            hosted.public_base_url.clone(),
+            role,
+            newly_added_member,
+        )
     };
+
+    if newly_added_member
+        && let Err(err) = state
+            .state_db
+            .upsert_together_member(&TogetherMemberRecord {
+                server_id: server_id.clone(),
+                email: email.clone(),
+                role: StateTogetherRole::Member,
+                added_at: now,
+                removed_at: None,
+            })
+            .await
+    {
+        error!(error = %err, "failed to persist together joined member");
+        return rpc_error(req.id, -32603, "failed to persist member join");
+    }
 
     JsonRpcResponse::ok(
         req.id,
         TogetherJoinResponse {
-            server_id: hosted.server_id.clone(),
-            owner_email: hosted.owner_email.clone(),
-            endpoint: invite.endpoint,
+            server_id,
+            owner_email,
+            endpoint,
             role,
         },
     )
@@ -1262,6 +1247,11 @@ fn member_role(hosted: &HostedServer, email: &str) -> Option<TogetherRole> {
         return Some(TogetherRole::Member);
     }
     None
+}
+
+fn default_actor_id(connection_id: Uuid) -> String {
+    let short = connection_id.simple().to_string();
+    format!("anon+{}@local", &short[..12])
 }
 
 async fn set_connection_email(state: &AppState, connection_id: Uuid, email: Option<String>) {
@@ -1309,6 +1299,28 @@ fn extract_token(invite: &str) -> String {
         return invite[(index + "/together/invite/".len())..].to_string();
     }
     invite.to_string()
+}
+
+fn invite_server_hint(invite: &str) -> Option<String> {
+    let token = extract_token(invite);
+    if let Ok(payload) = decode_invite(&token) {
+        return Some(payload.server_id);
+    }
+
+    let trimmed = invite.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("srv_")
+        || (trimmed.len() <= 16
+            && trimmed
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+    {
+        return Some(trimmed.to_string());
+    }
+
+    None
 }
 
 fn broadcast_notification(state: &ServerState, method: &str, params: Value) {
@@ -1530,27 +1542,6 @@ impl AppServerBridge {
         self.write_message(&initialized).await?;
 
         Ok(())
-    }
-
-    async fn account_email(&mut self) -> Result<Option<String>, AppServerError> {
-        let response: GetAccountResponse = self
-            .request_with_retry(
-                "account/read",
-                serde_json::to_value(GetAccountParams {
-                    refresh_token: false,
-                })
-                .map_err(|err| {
-                    AppServerError::Decode(anyhow::anyhow!(
-                        "failed to serialize account/read params: {err}"
-                    ))
-                })?,
-            )
-            .await?;
-
-        Ok(match response.account {
-            Some(Account::Chatgpt { email, .. }) => Some(email),
-            _ => None,
-        })
     }
 
     async fn thread_read(

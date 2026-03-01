@@ -159,8 +159,8 @@ impl RolloutReconstructionState {
                             active_segment.turn_id.as_deref(),
                             Some(event.turn_id.as_str()),
                         )
-                    }) {
-                        if let Some(active_segment) = active_segment.take() {
+                    })
+                        && let Some(active_segment) = active_segment.take() {
                             finalize_active_segment(
                                 active_segment,
                                 &mut new_history_base,
@@ -170,7 +170,6 @@ impl RolloutReconstructionState {
                                 &mut pending_rollback_turns,
                             );
                         }
-                    }
                 }
                 RolloutItem::ResponseItem(_)
                 | RolloutItem::Compacted(_)
@@ -358,7 +357,6 @@ fn finalize_active_segment(
             replacement_history,
             rollout_suffix_start: RolloutIndex(newest_rollout_index.0 + 1),
         });
-        return;
     }
 }
 

@@ -20,12 +20,12 @@ pub(super) struct RolloutReconstruction {
 // forward from this location" contract, but can back that location with an opaque file cursor
 // instead of an in-memory signed index.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RolloutIndex(isize);
+struct RolloutIndex(i64);
 
 #[derive(Clone, Debug)]
 struct InMemoryReverseRolloutSource {
     rollout_items: Arc<[RolloutItem]>,
-    startup_rollout_len: isize,
+    startup_rollout_len: i64,
     next_older_index: usize,
 }
 
@@ -33,7 +33,7 @@ impl InMemoryReverseRolloutSource {
     fn new(rollout_items: Vec<RolloutItem>) -> Self {
         let rollout_items = Arc::<[RolloutItem]>::from(rollout_items);
         let startup_rollout_len =
-            isize::try_from(rollout_items.len()).expect("rollout length should fit in isize");
+            i64::try_from(rollout_items.len()).expect("rollout length should fit in i64");
         let next_older_index = rollout_items.len();
         Self {
             rollout_items,
@@ -70,7 +70,7 @@ impl InMemoryReverseRolloutSource {
 
     fn rollout_index_from_actual(&self, actual_index: usize) -> RolloutIndex {
         let actual_index =
-            isize::try_from(actual_index).expect("actual rollout index should fit in isize");
+            i64::try_from(actual_index).expect("actual rollout index should fit in i64");
         RolloutIndex(actual_index - self.startup_rollout_len)
     }
 }

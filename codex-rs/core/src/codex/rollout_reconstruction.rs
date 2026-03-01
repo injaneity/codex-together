@@ -26,7 +26,7 @@ struct RolloutIndex(i64);
 struct InMemoryReverseRolloutSource {
     rollout_items: Arc<[RolloutItem]>,
     startup_rollout_len: i64,
-    loaded_start_actual_index: usize,
+    loaded_start_index: RolloutIndex,
 }
 
 impl InMemoryReverseRolloutSource {
@@ -34,16 +34,15 @@ impl InMemoryReverseRolloutSource {
         let rollout_items = Arc::<[RolloutItem]>::from(rollout_items);
         let startup_rollout_len =
             i64::try_from(rollout_items.len()).expect("rollout length should fit in i64");
-        let loaded_start_actual_index = rollout_items.len();
         Self {
             rollout_items,
             startup_rollout_len,
-            loaded_start_actual_index,
+            loaded_start_index: RolloutIndex(0),
         }
     }
 
     fn loaded_start_index(&self) -> RolloutIndex {
-        self.rollout_index_from_actual(self.loaded_start_actual_index)
+        self.loaded_start_index
     }
 
     fn items_between(&self, start: RolloutIndex, end: RolloutIndex) -> &[RolloutItem] {
@@ -53,25 +52,21 @@ impl InMemoryReverseRolloutSource {
     }
 
     fn pop_older(&mut self) -> Option<(RolloutIndex, RolloutItem)> {
-        if self.loaded_start_actual_index == 0 {
+        if self.actual_index_from_rollout_index(self.loaded_start_index) == 0 {
             return None;
         }
 
-        self.loaded_start_actual_index -= 1;
-        let item_index = self.rollout_index_from_actual(self.loaded_start_actual_index);
-        let actual_index = self.actual_index_from_rollout_index(item_index);
-        Some((item_index, self.rollout_items[actual_index].clone()))
+        self.loaded_start_index.0 -= 1;
+        let actual_index = self.actual_index_from_rollout_index(self.loaded_start_index);
+        Some((
+            self.loaded_start_index,
+            self.rollout_items[actual_index].clone(),
+        ))
     }
 
     fn actual_index_from_rollout_index(&self, rollout_index: RolloutIndex) -> usize {
         usize::try_from(rollout_index.0 + self.startup_rollout_len)
             .expect("rollout index should map to a loaded rollout row")
-    }
-
-    fn rollout_index_from_actual(&self, actual_index: usize) -> RolloutIndex {
-        let actual_index =
-            i64::try_from(actual_index).expect("actual rollout index should fit in i64");
-        RolloutIndex(actual_index - self.startup_rollout_len)
     }
 }
 

@@ -4319,7 +4319,7 @@ mod handlers {
                         crate::codex::rollout_reconstruction::RolloutReconstructionState::new(
                             rollout_items,
                         );
-                    reconstruction_state.apply_backtracking(num_turns);
+                    reconstruction_state.apply_backtracking(turn_context.as_ref(), num_turns);
                     Some(
                         sess.reconstruct_history_from_rollout_state(
                             turn_context.as_ref(),

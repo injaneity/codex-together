@@ -268,7 +268,7 @@ async fn rollout_reconstruction_state_backtracks_before_rollout_suffix() {
             .expect("serialize expected reference context item")
     );
 
-    reconstruction_state.apply_backtracking(1);
+    reconstruction_state.apply_backtracking(&turn_context, 1);
     let reconstructed = session
         .reconstruct_history_from_rollout_state(&turn_context, &reconstruction_state)
         .await;
@@ -284,7 +284,7 @@ async fn rollout_reconstruction_state_backtracks_before_rollout_suffix() {
             .expect("serialize expected reference context item")
     );
 
-    reconstruction_state.apply_backtracking(1);
+    reconstruction_state.apply_backtracking(&turn_context, 1);
     let reconstructed = session
         .reconstruct_history_from_rollout_state(&turn_context, &reconstruction_state)
         .await;

@@ -191,6 +191,7 @@ struct ConnectionContext {
 #[derive(Debug, Serialize)]
 struct Healthz {
     ok: bool,
+    version: &'static str,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -243,7 +244,10 @@ pub async fn run_main(listen: &str) -> Result<()> {
 }
 
 async fn healthz() -> Json<Healthz> {
-    Json(Healthz { ok: true })
+    Json(Healthz {
+        ok: true,
+        version: env!("CARGO_PKG_VERSION"),
+    })
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {

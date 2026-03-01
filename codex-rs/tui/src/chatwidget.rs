@@ -9123,6 +9123,14 @@ async fn connect_and_auth(endpoint: &str) -> anyhow::Result<TogetherRpcClient> {
 }
 
 #[derive(Debug, serde::Deserialize)]
+struct TogetherHealthzResponse {
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    version: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct NgrokTunnelsResponse {
     #[serde(default)]
     tunnels: Vec<NgrokTunnel>,
@@ -9301,43 +9309,173 @@ async fn ensure_local_together_server_running(endpoint: &str) -> anyhow::Result<
         return Ok(());
     }
     let healthz_url = healthz_url_from_ws_endpoint(endpoint)?;
-    if together_server_healthy(&healthz_url).await {
-        return Ok(());
+    let expected_version = env!("CARGO_PKG_VERSION");
+    let mut must_spawn = true;
+    if let Some(health) = together_server_health(&healthz_url).await {
+        if health.ok && health.version.as_deref() == Some(expected_version) {
+            return Ok(());
+        }
+        if health.ok {
+            stop_local_together_server().await?;
+        }
+        must_spawn = !health.ok || health.version.as_deref() != Some(expected_version);
     }
 
     let listen_url = listen_url_for_local_endpoint(endpoint)?;
-    let exe = std::env::current_exe().map_err(|err| {
-        anyhow::anyhow!("failed to locate current codex binary for together-server spawn: {err}")
-    })?;
-    std::process::Command::new(&exe)
-        .arg("together-server")
-        .arg("--listen")
-        .arg(&listen_url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|err| {
+    if must_spawn {
+        let exe = std::env::current_exe().map_err(|err| {
             anyhow::anyhow!(
-                "failed to launch `{}` together-server: {err}",
-                exe.display()
+                "failed to locate current codex binary for together-server spawn: {err}"
             )
         })?;
+        std::process::Command::new(&exe)
+            .arg("together-server")
+            .arg("--listen")
+            .arg(&listen_url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "failed to launch `{}` together-server: {err}",
+                    exe.display()
+                )
+            })?;
+    }
 
     for _ in 0..30 {
-        if together_server_healthy(&healthz_url).await {
+        if let Some(health) = together_server_health(&healthz_url).await
+            && health.ok
+            && health.version.as_deref() == Some(expected_version)
+        {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
-    anyhow::bail!("timed out waiting for together-server at `{listen_url}` to become healthy");
+    let reported = together_server_health(&healthz_url)
+        .await
+        .and_then(|health| health.version);
+    if let Some(version) = reported {
+        anyhow::bail!(
+            "timed out waiting for together-server at `{listen_url}` to report version `{expected_version}`; got `{version}`"
+        );
+    }
+    anyhow::bail!(
+        "timed out waiting for together-server at `{listen_url}` to become healthy (expected version `{expected_version}`)"
+    );
 }
 
-async fn together_server_healthy(healthz_url: &str) -> bool {
+async fn together_server_health(healthz_url: &str) -> Option<TogetherHealthzResponse> {
     match reqwest::get(healthz_url).await {
-        Ok(response) => response.status().is_success(),
-        Err(_) => false,
+        Ok(response) if response.status().is_success() => {
+            response.json::<TogetherHealthzResponse>().await.ok()
+        }
+        _ => None,
     }
+}
+
+async fn stop_local_together_server() -> anyhow::Result<()> {
+    let Some(lock_path) = together_lock_path() else {
+        return Ok(());
+    };
+    let Some(pid) = together_lock_pid(&lock_path) else {
+        remove_lock_if_stale(&lock_path);
+        return Ok(());
+    };
+
+    if !is_pid_running(pid) {
+        remove_lock_if_stale(&lock_path);
+        return Ok(());
+    }
+
+    if !terminate_pid(pid, false) {
+        anyhow::bail!("failed to stop stale together-server process {pid}");
+    }
+
+    for _ in 0..20 {
+        if !is_pid_running(pid) {
+            remove_lock_if_stale(&lock_path);
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    if !terminate_pid(pid, true) {
+        anyhow::bail!("failed to force-stop stale together-server process {pid}");
+    }
+
+    for _ in 0..10 {
+        if !is_pid_running(pid) {
+            remove_lock_if_stale(&lock_path);
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    anyhow::bail!("stale together-server process {pid} is still running")
+}
+
+fn together_lock_path() -> Option<PathBuf> {
+    codex_core::config::find_codex_home()
+        .ok()
+        .map(|path| path.join("together").join("session.lock"))
+}
+
+fn together_lock_pid(lock_path: &Path) -> Option<u32> {
+    let content = std::fs::read_to_string(lock_path).ok()?;
+    content.lines().next()?.trim().parse::<u32>().ok()
+}
+
+fn remove_lock_if_stale(lock_path: &Path) {
+    match std::fs::remove_file(lock_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            warn!(
+                error = %err,
+                path = %lock_path.display(),
+                "failed to remove stale together lock file"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+fn is_pid_running(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    if rc == 0 {
+        return true;
+    }
+
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(code) if code == libc::EPERM => true,
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn is_pid_running(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn terminate_pid(pid: u32, force: bool) -> bool {
+    let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+    let rc = unsafe { libc::kill(pid as i32, signal) };
+    if rc == 0 {
+        return true;
+    }
+
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(code) if code == libc::ESRCH => true,
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_pid(_pid: u32, _force: bool) -> bool {
+    false
 }
 
 fn listen_url_for_local_endpoint(endpoint: &str) -> anyhow::Result<String> {

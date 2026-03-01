@@ -14,7 +14,9 @@ pub const METHOD_TOGETHER_MEMBER_REMOVE: &str = "together/member/remove";
 pub const METHOD_TOGETHER_SERVER_INFO: &str = "together/server/info";
 pub const METHOD_TOGETHER_THREAD_SHARE: &str = "together/thread/share";
 pub const METHOD_TOGETHER_THREAD_CHECKOUT: &str = "together/thread/checkout";
+pub const METHOD_TOGETHER_THREAD_READ: &str = "together/thread/read";
 pub const METHOD_TOGETHER_THREAD_FORK: &str = "together/thread/fork";
+pub const METHOD_TOGETHER_THREAD_DELETE: &str = "together/thread/delete";
 pub const METHOD_TOGETHER_THREAD_LIST: &str = "together/thread/list";
 pub const METHOD_TOGETHER_HISTORY_LINEAGE: &str = "together/history/lineage";
 pub const METHOD_TOGETHER_JOIN: &str = "together/join";
@@ -207,6 +209,35 @@ pub struct TogetherThreadCheckoutResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TogetherThreadReadRequest {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TogetherReplayRole {
+    User,
+    Assistant,
+    System,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TogetherReplayMessage {
+    pub role: TogetherReplayRole,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TogetherThreadReadResponse {
+    pub thread_id: String,
+    pub owner_email: String,
+    pub messages: Vec<TogetherReplayMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TogetherThreadForkRequest {
     pub thread_id: String,
     #[serde(default)]
@@ -219,6 +250,19 @@ pub struct TogetherThreadForkResponse {
     pub parent_thread_id: String,
     pub child_thread_id: String,
     pub writable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TogetherThreadDeleteRequest {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TogetherThreadDeleteResponse {
+    pub thread_id: String,
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

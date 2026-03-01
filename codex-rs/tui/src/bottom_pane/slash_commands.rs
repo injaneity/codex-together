@@ -17,6 +17,11 @@ pub(crate) fn builtins_for_input(
     audio_device_selection_enabled: bool,
     allow_elevate_sandbox: bool,
 ) -> Vec<(&'static str, SlashCommand)> {
+    let status = std::env::var("CODEX_TOGETHER_STATUS")
+        .unwrap_or_else(|_| "disconnected".to_string())
+        .to_ascii_lowercase();
+    let connected = !status.trim().is_empty() && status != "disconnected";
+
     built_in_slash_commands()
         .into_iter()
         .filter(|(_, cmd)| allow_elevate_sandbox || *cmd != SlashCommand::ElevateSandbox)
@@ -28,6 +33,10 @@ pub(crate) fn builtins_for_input(
         .filter(|(_, cmd)| personality_command_enabled || *cmd != SlashCommand::Personality)
         .filter(|(_, cmd)| realtime_conversation_enabled || *cmd != SlashCommand::Realtime)
         .filter(|(_, cmd)| audio_device_selection_enabled || *cmd != SlashCommand::Settings)
+        .filter(|(_, cmd)| !connected || *cmd != SlashCommand::Host)
+        .filter(|(_, cmd)| {
+            connected || !matches!(cmd, SlashCommand::Threads | SlashCommand::History)
+        })
         .collect()
 }
 
@@ -115,6 +124,50 @@ mod tests {
     fn settings_command_is_hidden_when_audio_device_selection_is_disabled() {
         assert_eq!(
             find_builtin_command("settings", true, true, true, true, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn threads_hidden_when_disconnected() {
+        unsafe {
+            std::env::set_var("CODEX_TOGETHER_STATUS", "disconnected");
+        }
+        assert_eq!(
+            find_builtin_command("threads", true, true, true, false, true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn threads_visible_when_connected() {
+        unsafe {
+            std::env::set_var("CODEX_TOGETHER_STATUS", "together @owner@local");
+        }
+        assert_eq!(
+            find_builtin_command("threads", true, true, true, false, true, false),
+            Some(SlashCommand::Threads)
+        );
+    }
+
+    #[test]
+    fn host_visible_when_disconnected() {
+        unsafe {
+            std::env::set_var("CODEX_TOGETHER_STATUS", "disconnected");
+        }
+        assert_eq!(
+            find_builtin_command("host", true, true, true, false, true, false),
+            Some(SlashCommand::Host)
+        );
+    }
+
+    #[test]
+    fn host_hidden_when_connected() {
+        unsafe {
+            std::env::set_var("CODEX_TOGETHER_STATUS", "together @owner@local");
+        }
+        assert_eq!(
+            find_builtin_command("host", true, true, true, false, true, false),
             None
         );
     }

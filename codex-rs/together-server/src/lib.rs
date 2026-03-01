@@ -34,8 +34,11 @@ use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
+use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
+use codex_app_server_protocol::Turn;
+use codex_app_server_protocol::UserInput;
 use codex_core::config::find_codex_home;
 use codex_state::StateRuntime;
 use codex_state::TogetherClientMode as StateTogetherClientMode;
@@ -64,8 +67,10 @@ use codex_together_protocol::METHOD_TOGETHER_SERVER_CLOSE;
 use codex_together_protocol::METHOD_TOGETHER_SERVER_CREATE;
 use codex_together_protocol::METHOD_TOGETHER_SERVER_INFO;
 use codex_together_protocol::METHOD_TOGETHER_THREAD_CHECKOUT;
+use codex_together_protocol::METHOD_TOGETHER_THREAD_DELETE;
 use codex_together_protocol::METHOD_TOGETHER_THREAD_FORK;
 use codex_together_protocol::METHOD_TOGETHER_THREAD_LIST;
+use codex_together_protocol::METHOD_TOGETHER_THREAD_READ;
 use codex_together_protocol::METHOD_TOGETHER_THREAD_SHARE;
 use codex_together_protocol::NOTIFY_TOGETHER_CONNECTION_REVOKED;
 use codex_together_protocol::NOTIFY_TOGETHER_MEMBER_UPDATED;
@@ -81,6 +86,8 @@ use codex_together_protocol::TogetherJoinResponse;
 use codex_together_protocol::TogetherLeaveResponse;
 use codex_together_protocol::TogetherMemberUpdateRequest;
 use codex_together_protocol::TogetherMemberUpdateResponse;
+use codex_together_protocol::TogetherReplayMessage;
+use codex_together_protocol::TogetherReplayRole;
 use codex_together_protocol::TogetherRole;
 use codex_together_protocol::TogetherServerCloseResponse;
 use codex_together_protocol::TogetherServerCreateRequest;
@@ -88,10 +95,14 @@ use codex_together_protocol::TogetherServerCreateResponse;
 use codex_together_protocol::TogetherServerInfoResponse;
 use codex_together_protocol::TogetherThreadCheckoutRequest;
 use codex_together_protocol::TogetherThreadCheckoutResponse;
+use codex_together_protocol::TogetherThreadDeleteRequest;
+use codex_together_protocol::TogetherThreadDeleteResponse;
 use codex_together_protocol::TogetherThreadForkRequest;
 use codex_together_protocol::TogetherThreadForkResponse;
 use codex_together_protocol::TogetherThreadListRequest;
 use codex_together_protocol::TogetherThreadListResponse;
+use codex_together_protocol::TogetherThreadReadRequest;
+use codex_together_protocol::TogetherThreadReadResponse;
 use codex_together_protocol::TogetherThreadShareRequest;
 use codex_together_protocol::TogetherThreadShareResponse;
 use codex_together_protocol::TogetherThreadSummary;
@@ -349,7 +360,9 @@ async fn handle_request(
         METHOD_TOGETHER_SERVER_INFO => together_server_info(state, ctx, req).await,
         METHOD_TOGETHER_THREAD_SHARE => together_thread_share(state, ctx, req).await,
         METHOD_TOGETHER_THREAD_CHECKOUT => together_thread_checkout(state, ctx, req).await,
+        METHOD_TOGETHER_THREAD_READ => together_thread_read(state, ctx, req).await,
         METHOD_TOGETHER_THREAD_FORK => together_thread_fork(state, ctx, req).await,
+        METHOD_TOGETHER_THREAD_DELETE => together_thread_delete(state, ctx, req).await,
         METHOD_TOGETHER_THREAD_LIST => together_thread_list(state, ctx, req).await,
         METHOD_TOGETHER_HISTORY_LINEAGE => together_history_lineage(state, ctx, req).await,
         METHOD_TOGETHER_JOIN => together_join(state, ctx, req).await,
@@ -873,6 +886,58 @@ async fn together_thread_checkout(
     .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
 }
 
+async fn together_thread_read(
+    state: &AppState,
+    ctx: &ConnectionContext,
+    req: JsonRpcRequest,
+) -> JsonRpcResponse {
+    let payload: TogetherThreadReadRequest = match serde_json::from_value(req.params) {
+        Ok(p) => p,
+        Err(_) => return rpc_error(req.id, -32602, "invalid params"),
+    };
+    let email = ctx
+        .email
+        .clone()
+        .unwrap_or_else(|| "guest@local".to_string());
+
+    let owner_email = {
+        let guard = state.inner.lock().await;
+        let Some(hosted) = guard.hosted.as_ref() else {
+            return rpc_error(req.id, RPC_ERR_NOT_CONNECTED, "TOGETHER_NOT_CONNECTED");
+        };
+        if member_role(hosted, &email).is_none() {
+            return rpc_error(
+                req.id,
+                RPC_ERR_MEMBER_NOT_ALLOWED,
+                "TOGETHER_MEMBER_NOT_ALLOWED",
+            );
+        }
+
+        let Some(thread) = hosted.threads.get(&payload.thread_id) else {
+            return rpc_error(req.id, -32602, "thread not shared");
+        };
+        thread.owner_email.clone()
+    };
+
+    let thread_read = {
+        let mut bridge = state.app_server.lock().await;
+        match bridge.thread_read(payload.thread_id.clone(), true).await {
+            Ok(response) => response,
+            Err(err) => return app_server_error_response(req.id, err),
+        }
+    };
+
+    JsonRpcResponse::ok(
+        req.id,
+        TogetherThreadReadResponse {
+            thread_id: payload.thread_id,
+            owner_email,
+            messages: replay_messages_from_turns(&thread_read.thread.turns),
+        },
+    )
+    .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
+}
+
 async fn together_thread_fork(
     state: &AppState,
     ctx: &ConnectionContext,
@@ -1013,6 +1078,61 @@ async fn together_thread_fork(
             parent_thread_id: payload.thread_id,
             child_thread_id,
             writable: true,
+        },
+    )
+    .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
+}
+
+async fn together_thread_delete(
+    state: &AppState,
+    ctx: &ConnectionContext,
+    req: JsonRpcRequest,
+) -> JsonRpcResponse {
+    let payload: TogetherThreadDeleteRequest = match serde_json::from_value(req.params) {
+        Ok(p) => p,
+        Err(_) => return rpc_error(req.id, -32602, "invalid params"),
+    };
+    let caller_email = ctx
+        .email
+        .clone()
+        .unwrap_or_else(|| "guest@local".to_string());
+
+    let deleted = {
+        let mut guard = state.inner.lock().await;
+        let Some(hosted) = guard.hosted.as_mut() else {
+            return rpc_error(req.id, RPC_ERR_NOT_CONNECTED, "TOGETHER_NOT_CONNECTED");
+        };
+        if member_role(hosted, &caller_email).is_none() {
+            return rpc_error(
+                req.id,
+                RPC_ERR_MEMBER_NOT_ALLOWED,
+                "TOGETHER_MEMBER_NOT_ALLOWED",
+            );
+        }
+
+        let Some(thread) = hosted.threads.get(&payload.thread_id) else {
+            return rpc_error(req.id, -32602, "thread not shared");
+        };
+        if thread.owner_email != caller_email {
+            return rpc_error(req.id, RPC_ERR_FORBIDDEN, "TOGETHER_FORBIDDEN");
+        }
+
+        if hosted.threads.remove(&payload.thread_id).is_some() {
+            hosted.forks.retain(|edge| {
+                edge.parent_thread_id != payload.thread_id
+                    && edge.child_thread_id != payload.thread_id
+            });
+            true
+        } else {
+            false
+        }
+    };
+
+    JsonRpcResponse::ok(
+        req.id,
+        TogetherThreadDeleteResponse {
+            thread_id: payload.thread_id,
+            deleted,
         },
     )
     .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
@@ -1393,6 +1513,67 @@ fn lineage_edges(hosted: &HostedServer, root: &str) -> Vec<LineageEdge> {
             .then_with(|| a.child_thread_id.cmp(&b.child_thread_id))
     });
     out
+}
+
+fn replay_messages_from_turns(turns: &[Turn]) -> Vec<TogetherReplayMessage> {
+    let mut out = Vec::new();
+    for turn in turns {
+        for item in &turn.items {
+            match item {
+                ThreadItem::UserMessage { content, .. } => {
+                    if let Some(text) = replay_user_message_text(content) {
+                        out.push(TogetherReplayMessage {
+                            role: TogetherReplayRole::User,
+                            text,
+                        });
+                    }
+                }
+                ThreadItem::AgentMessage { text, .. } => {
+                    if let Some(text) = non_empty_string(text.clone()) {
+                        out.push(TogetherReplayMessage {
+                            role: TogetherReplayRole::Assistant,
+                            text,
+                        });
+                    }
+                }
+                ThreadItem::Plan { text, .. } => {
+                    if let Some(text) = non_empty_string(text.clone()) {
+                        out.push(TogetherReplayMessage {
+                            role: TogetherReplayRole::System,
+                            text: format!("Plan update:\n{text}"),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+fn replay_user_message_text(content: &[UserInput]) -> Option<String> {
+    let mut parts = Vec::new();
+    for entry in content {
+        match entry {
+            UserInput::Text { text, .. } => {
+                if let Some(value) = non_empty_string(text.clone()) {
+                    parts.push(value);
+                }
+            }
+            UserInput::Image { url } => parts.push(format!("[image] {url}")),
+            UserInput::LocalImage { path } => {
+                parts.push(format!("[local image] {}", path.display()))
+            }
+            UserInput::Skill { name, .. } => parts.push(format!("[skill] {name}")),
+            UserInput::Mention { name, .. } => parts.push(format!("@{name}")),
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
 }
 
 fn non_empty_string(value: String) -> Option<String> {

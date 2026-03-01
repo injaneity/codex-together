@@ -93,11 +93,24 @@ pub(crate) fn side_by_side_layout_widths(
 /// One selectable item in the generic selection list.
 pub(crate) type SelectionAction = Box<dyn Fn(&AppEventSender) + Send + Sync>;
 
+/// Callback for custom single-character key actions while the list is open.
+///
+/// Receives `(pressed_char, selected_item_actual_index, app_event_tx)` and
+/// returns `true` when the key was consumed.
+pub(crate) type OnSelectionCharKeyCallback =
+    Option<Box<dyn Fn(char, usize, &AppEventSender) -> bool + Send + Sync>>;
+
 /// Callback invoked whenever the highlighted item changes (arrow keys, search
 /// filter, number-key jump).  Receives the *actual* index into the unfiltered
 /// `items` list and the event sender.  Used by the theme picker for live preview.
 pub(crate) type OnSelectionChangedCallback =
     Option<Box<dyn Fn(usize, &AppEventSender) + Send + Sync>>;
+
+/// Callback used to compute footer hint content for the currently selected row.
+///
+/// Receives the *actual* index into `items` and returns the footer line.
+pub(crate) type OnSelectionFooterHintCallback =
+    Option<Box<dyn Fn(usize) -> Line<'static> + Send + Sync>>;
 
 /// Callback invoked when the picker is dismissed without accepting (Esc or
 /// Ctrl+C).  Used by the theme picker to restore the pre-open theme.
@@ -173,6 +186,13 @@ pub(crate) struct SelectionViewParams {
 
     /// Called when the picker is dismissed via Esc/Ctrl+C without selecting.
     pub on_cancel: OnCancelCallback,
+
+    /// Optional callback used to derive footer-hint text from current selection.
+    pub on_selection_footer_hint: OnSelectionFooterHintCallback,
+
+    /// Optional callback to handle single-character key actions (for example
+    /// `f` for fork in together thread lists).
+    pub on_char_key: OnSelectionCharKeyCallback,
 }
 
 impl Default for SelectionViewParams {
@@ -196,6 +216,8 @@ impl Default for SelectionViewParams {
             preserve_side_content_bg: false,
             on_selection_changed: None,
             on_cancel: None,
+            on_selection_footer_hint: None,
+            on_char_key: None,
         }
     }
 }
@@ -232,6 +254,12 @@ pub(crate) struct ListSelectionView {
 
     /// Called when the picker is dismissed via Esc/Ctrl+C without selecting.
     on_cancel: OnCancelCallback,
+
+    /// Optional callback used to compute footer-hint text from current selection.
+    on_selection_footer_hint: OnSelectionFooterHintCallback,
+
+    /// Optional callback for custom single-character key actions.
+    on_char_key: OnSelectionCharKeyCallback,
 }
 
 impl ListSelectionView {
@@ -280,6 +308,8 @@ impl ListSelectionView {
             preserve_side_content_bg: params.preserve_side_content_bg,
             on_selection_changed: params.on_selection_changed,
             on_cancel: params.on_cancel,
+            on_selection_footer_hint: params.on_selection_footer_hint,
+            on_char_key: params.on_char_key,
         };
         s.apply_filter();
         s
@@ -352,6 +382,7 @@ impl ListSelectionView {
         if new_actual != previously_selected {
             self.fire_selection_changed();
         }
+        self.update_footer_hint_for_selection();
     }
 
     fn build_rows(&self) -> Vec<GenericDisplayRow> {
@@ -414,6 +445,7 @@ impl ListSelectionView {
         self.skip_disabled_up();
         if self.selected_actual_idx() != before {
             self.fire_selection_changed();
+            self.update_footer_hint_for_selection();
         }
     }
 
@@ -426,6 +458,7 @@ impl ListSelectionView {
         self.skip_disabled_down();
         if self.selected_actual_idx() != before {
             self.fire_selection_changed();
+            self.update_footer_hint_for_selection();
         }
     }
 
@@ -434,6 +467,12 @@ impl ListSelectionView {
             && let Some(actual) = self.selected_actual_idx()
         {
             cb(actual, &self.app_event_tx);
+        }
+    }
+
+    fn update_footer_hint_for_selection(&mut self) {
+        if let Some(cb) = &self.on_selection_footer_hint {
+            self.footer_hint = self.selected_actual_idx().map(|idx| cb(idx));
         }
     }
 
@@ -574,6 +613,20 @@ impl ListSelectionView {
 
 impl BottomPaneView for ListSelectionView {
     fn handle_key_event(&mut self, key_event: KeyEvent) {
+        if let KeyEvent {
+            code: KeyCode::Char(c),
+            modifiers,
+            ..
+        } = key_event
+            && !modifiers.contains(KeyModifiers::CONTROL)
+            && !modifiers.contains(KeyModifiers::ALT)
+            && let Some(cb) = &self.on_char_key
+            && let Some(actual_idx) = self.selected_actual_idx()
+            && cb(c, actual_idx, &self.app_event_tx)
+        {
+            return;
+        }
+
         match key_event {
             // Some terminals (or configurations) send Control key chords as
             // C0 control characters without reporting the CONTROL modifier.

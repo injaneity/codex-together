@@ -12,6 +12,7 @@ use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ExternalEditorState;
+use crate::chatwidget::fork_thread_via_together;
 use crate::cwd_prompt::CwdPromptAction;
 use crate::diff_render::DiffSummary;
 use crate::exec_command::strip_bash_lc_and_escape;
@@ -49,6 +50,7 @@ use codex_core::config::edit::ConfigEditsBuilder;
 use codex_core::config::types::ModelAvailabilityNuxConfig;
 use codex_core::config_loader::ConfigLayerStackOrdering;
 use codex_core::features::Feature;
+use codex_core::find_thread_path_by_id_str;
 use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_core::models_manager::manager::RefreshStrategy;
 use codex_core::models_manager::model_presets::HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG;
@@ -2026,46 +2028,167 @@ impl App {
                 );
                 self.chat_widget
                     .add_plain_history_lines(vec!["/fork".magenta().into()]);
-                if let Some(path) = self.chat_widget.rollout_path() {
-                    // Fresh threads expose a precomputed path, but the file is
-                    // materialized lazily on first user message.
-                    if path.exists() {
-                        match self
-                            .server
-                            .fork_thread(usize::MAX, self.config.clone(), path.clone(), false)
+                let together_connected = std::env::var("CODEX_TOGETHER_STATUS")
+                    .ok()
+                    .map(|status| {
+                        let normalized = status.trim().to_ascii_lowercase();
+                        !normalized.is_empty() && normalized != "disconnected"
+                    })
+                    .unwrap_or(false);
+                let mut handled_via_together = false;
+
+                if together_connected {
+                    if let Some(current_thread_id) =
+                        self.chat_widget.thread_id().map(|id| id.to_string())
+                    {
+                        match fork_thread_via_together(current_thread_id, self.config.cwd.clone())
                             .await
                         {
                             Ok(forked) => {
-                                self.shutdown_current_thread().await;
-                                let init = self.chatwidget_init_for_forked_or_resumed_thread(
-                                    tui,
-                                    self.config.clone(),
-                                );
-                                self.chat_widget = ChatWidget::new_from_existing(
-                                    init,
-                                    forked.thread,
-                                    forked.session_configured,
-                                );
-                                self.reset_thread_event_state();
-                                if let Some(summary) = summary {
-                                    let mut lines: Vec<Line<'static>> =
-                                        vec![summary.usage_line.clone().into()];
-                                    if let Some(command) = summary.resume_command {
-                                        let spans = vec![
-                                            "To continue this session, run ".into(),
-                                            command.cyan(),
-                                        ];
-                                        lines.push(spans.into());
+                                let child_thread_id = forked.child_thread_id.clone();
+                                match find_thread_path_by_id_str(
+                                    self.config.codex_home.as_path(),
+                                    &child_thread_id,
+                                )
+                                .await
+                                {
+                                    Ok(Some(path)) => {
+                                        match self
+                                            .server
+                                            .resume_thread_from_rollout(
+                                                self.config.clone(),
+                                                path.clone(),
+                                                self.auth_manager.clone(),
+                                            )
+                                            .await
+                                        {
+                                            Ok(resumed) => {
+                                                self.shutdown_current_thread().await;
+                                                let init = self
+                                                    .chatwidget_init_for_forked_or_resumed_thread(
+                                                        tui,
+                                                        self.config.clone(),
+                                                    );
+                                                self.chat_widget = ChatWidget::new_from_existing(
+                                                    init,
+                                                    resumed.thread,
+                                                    resumed.session_configured,
+                                                );
+                                                self.reset_thread_event_state();
+                                                if let Some(summary) = summary.as_ref() {
+                                                    let mut lines: Vec<Line<'static>> =
+                                                        vec![summary.usage_line.clone().into()];
+                                                    if let Some(command) =
+                                                        summary.resume_command.as_ref()
+                                                    {
+                                                        let spans = vec![
+                                                            "To continue this session, run ".into(),
+                                                            command.clone().cyan(),
+                                                        ];
+                                                        lines.push(spans.into());
+                                                    }
+                                                    self.chat_widget.add_plain_history_lines(lines);
+                                                }
+                                            }
+                                            Err(err) => {
+                                                let path_display = path.display();
+                                                self.chat_widget.add_error_message(format!(
+                                                    "Forked via together ({child_thread_id}) but failed to open it from {path_display}: {err}"
+                                                ));
+                                                self.chat_widget.add_info_message(
+                                                    format!("Resume it manually: codex resume {child_thread_id}"),
+                                                    None,
+                                                );
+                                            }
+                                        }
                                     }
-                                    self.chat_widget.add_plain_history_lines(lines);
+                                    Ok(None) => {
+                                        self.chat_widget.add_info_message(
+                                            format!(
+                                                "Forked via together: {} -> {}. Resume with: codex resume {}",
+                                                forked.parent_thread_id,
+                                                child_thread_id,
+                                                child_thread_id
+                                            ),
+                                            None,
+                                        );
+                                    }
+                                    Err(err) => {
+                                        self.chat_widget.add_error_message(format!(
+                                            "Forked via together, but failed to locate child thread {child_thread_id}: {err}"
+                                        ));
+                                        self.chat_widget.add_info_message(
+                                            format!(
+                                                "Resume it manually: codex resume {child_thread_id}"
+                                            ),
+                                            None,
+                                        );
+                                    }
                                 }
+                                handled_via_together = true;
                             }
                             Err(err) => {
-                                let path_display = path.display();
-                                self.chat_widget.add_error_message(format!(
-                                    "Failed to fork current session from {path_display}: {err}"
-                                ));
+                                self.chat_widget.add_info_message(
+                                    format!("Together fork unavailable; falling back to local /fork ({err})"),
+                                    None,
+                                );
                             }
+                        }
+                    } else {
+                        self.chat_widget.add_error_message(
+                            "Current thread id is unavailable; cannot fork via together."
+                                .to_string(),
+                        );
+                    }
+                }
+
+                if !handled_via_together {
+                    if let Some(path) = self.chat_widget.rollout_path() {
+                        // Fresh threads expose a precomputed path, but the file is
+                        // materialized lazily on first user message.
+                        if path.exists() {
+                            match self
+                                .server
+                                .fork_thread(usize::MAX, self.config.clone(), path.clone(), false)
+                                .await
+                            {
+                                Ok(forked) => {
+                                    self.shutdown_current_thread().await;
+                                    let init = self.chatwidget_init_for_forked_or_resumed_thread(
+                                        tui,
+                                        self.config.clone(),
+                                    );
+                                    self.chat_widget = ChatWidget::new_from_existing(
+                                        init,
+                                        forked.thread,
+                                        forked.session_configured,
+                                    );
+                                    self.reset_thread_event_state();
+                                    if let Some(summary) = summary.as_ref() {
+                                        let mut lines: Vec<Line<'static>> =
+                                            vec![summary.usage_line.clone().into()];
+                                        if let Some(command) = summary.resume_command.as_ref() {
+                                            let spans = vec![
+                                                "To continue this session, run ".into(),
+                                                command.clone().cyan(),
+                                            ];
+                                            lines.push(spans.into());
+                                        }
+                                        self.chat_widget.add_plain_history_lines(lines);
+                                    }
+                                }
+                                Err(err) => {
+                                    let path_display = path.display();
+                                    self.chat_widget.add_error_message(format!(
+                                        "Failed to fork current session from {path_display}: {err}"
+                                    ));
+                                }
+                            }
+                        } else {
+                            self.chat_widget.add_error_message(
+                                "A thread must contain at least one turn before it can be forked."
+                                    .to_string(),
+                            );
                         }
                     } else {
                         self.chat_widget.add_error_message(
@@ -2073,11 +2196,6 @@ impl App {
                                 .to_string(),
                         );
                     }
-                } else {
-                    self.chat_widget.add_error_message(
-                        "A thread must contain at least one turn before it can be forked."
-                            .to_string(),
-                    );
                 }
 
                 tui.frame_requester().schedule_frame();
@@ -3053,16 +3171,21 @@ impl App {
             AppEvent::OpenReviewCustomPrompt => {
                 self.chat_widget.show_review_custom_prompt();
             }
-            AppEvent::OpenTogetherPrompt {
-                title,
-                prompt,
-                command_prefix,
-            } => {
-                self.chat_widget
-                    .show_together_prompt(title, prompt, command_prefix);
-            }
             AppEvent::RunTogetherCommand { args } => {
                 self.chat_widget.run_together_command(args);
+            }
+            AppEvent::OpenTogetherThreadsView { threads } => {
+                self.chat_widget.show_together_threads_view(threads);
+            }
+            AppEvent::OpenTogetherHistoryView { lineage } => {
+                self.chat_widget.show_together_history_view(lineage);
+            }
+            AppEvent::ReplayTogetherThread {
+                thread_id,
+                messages,
+            } => {
+                self.chat_widget
+                    .replay_together_thread_messages(thread_id, messages);
             }
             AppEvent::SubmitUserMessageWithMode {
                 text,

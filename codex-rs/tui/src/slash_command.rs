@@ -37,6 +37,10 @@ pub enum SlashCommand {
     Copy,
     Mention,
     Status,
+    Host,
+    Join,
+    Threads,
+    History,
     DebugConfig,
     Statusline,
     Theme,
@@ -81,6 +85,10 @@ impl SlashCommand {
             SlashCommand::Mention => "mention a file",
             SlashCommand::Skills => "use skills to improve how Codex performs specific tasks",
             SlashCommand::Status => "show current session configuration and token usage",
+            SlashCommand::Host => "start a codex-together app server",
+            SlashCommand::Join => "join a codex-together app server",
+            SlashCommand::Threads => "browse shared threads and checkout/fork/delete",
+            SlashCommand::History => "browse lineage for the current thread",
             SlashCommand::DebugConfig => "show config layers and requirement sources for debugging",
             SlashCommand::Statusline => "configure which items appear in the status line",
             SlashCommand::Theme => "choose a syntax highlighting theme",
@@ -124,7 +132,7 @@ impl SlashCommand {
             SlashCommand::Review
                 | SlashCommand::Rename
                 | SlashCommand::Plan
-                | SlashCommand::Together
+                | SlashCommand::Join
                 | SlashCommand::SandboxReadRoot
         )
     }
@@ -157,6 +165,10 @@ impl SlashCommand {
             | SlashCommand::Mention
             | SlashCommand::Skills
             | SlashCommand::Status
+            | SlashCommand::Host
+            | SlashCommand::Join
+            | SlashCommand::Threads
+            | SlashCommand::History
             | SlashCommand::DebugConfig
             | SlashCommand::Ps
             | SlashCommand::Clean

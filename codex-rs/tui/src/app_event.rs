@@ -16,6 +16,9 @@ use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::RateLimitSnapshot;
+use codex_together_protocol::TogetherHistoryLineageResponse;
+use codex_together_protocol::TogetherReplayMessage;
+use codex_together_protocol::TogetherThreadSummary;
 use codex_utils_approval_presets::ApprovalPreset;
 
 use crate::bottom_pane::ApprovalRequest;
@@ -407,16 +410,25 @@ pub(crate) enum AppEvent {
     /// Open the custom prompt option from the review popup.
     OpenReviewCustomPrompt,
 
-    /// Open a custom prompt that executes a `/together <command_prefix> ...` action.
-    OpenTogetherPrompt {
-        title: String,
-        prompt: String,
-        command_prefix: String,
-    },
-
     /// Execute a parsed `/together` command.
     RunTogetherCommand {
         args: String,
+    },
+
+    /// Open an interactive shared-threads list for together operations.
+    OpenTogetherThreadsView {
+        threads: Vec<TogetherThreadSummary>,
+    },
+
+    /// Open an interactive lineage list for together history operations.
+    OpenTogetherHistoryView {
+        lineage: TogetherHistoryLineageResponse,
+    },
+
+    /// Replay a checked-out together thread using the same UI replay flow as resume.
+    ReplayTogetherThread {
+        thread_id: String,
+        messages: Vec<TogetherReplayMessage>,
     },
 
     /// Submit a user message with an explicit collaboration mask.

@@ -24,44 +24,60 @@ struct RolloutIndex(i64);
 
 #[derive(Clone, Debug)]
 struct InMemoryReverseRolloutSource {
-    rollout_items: Arc<[RolloutItem]>,
+    rollout_items: Vec<RolloutItem>,
     startup_rollout_len: i64,
-    loaded_start_index: RolloutIndex,
+    // Exclusive end of the currently visible rollout suffix. Backtracking moves this boundary
+    // left when the newest surviving visible user turn is dropped.
+    visible_end_index: RolloutIndex,
 }
 
 impl InMemoryReverseRolloutSource {
     fn new(rollout_items: Vec<RolloutItem>) -> Self {
-        let rollout_items = Arc::<[RolloutItem]>::from(rollout_items);
         let startup_rollout_len =
             i64::try_from(rollout_items.len()).expect("rollout length should fit in i64");
         Self {
             rollout_items,
             startup_rollout_len,
-            loaded_start_index: RolloutIndex(0),
+            visible_end_index: RolloutIndex(0),
         }
     }
 
-    fn loaded_start_index(&self) -> RolloutIndex {
-        self.loaded_start_index
+    fn start_index(&self) -> RolloutIndex {
+        RolloutIndex(-self.startup_rollout_len)
     }
 
-    fn items_between(&self, start: RolloutIndex, end: RolloutIndex) -> &[RolloutItem] {
+    fn iter_forward_from(
+        &self,
+        start: RolloutIndex,
+    ) -> impl Iterator<Item = (RolloutIndex, &RolloutItem)> + '_ {
         let start = self.actual_index_from_rollout_index(start);
-        let end = self.actual_index_from_rollout_index(end);
-        &self.rollout_items[start..end]
+        let end = self.actual_index_from_rollout_index(self.visible_end_index);
+        self.rollout_items[start..end]
+            .iter()
+            .enumerate()
+            .map(move |(offset, item)| {
+                let offset = i64::try_from(offset).expect("offset should fit in i64");
+                (
+                    RolloutIndex(start as i64 + offset - self.startup_rollout_len),
+                    item,
+                )
+            })
     }
 
-    fn pop_older(&mut self) -> Option<(RolloutIndex, RolloutItem)> {
-        if self.actual_index_from_rollout_index(self.loaded_start_index) == 0 {
-            return None;
-        }
-
-        self.loaded_start_index.0 -= 1;
-        let actual_index = self.actual_index_from_rollout_index(self.loaded_start_index);
-        Some((
-            self.loaded_start_index,
-            self.rollout_items[actual_index].clone(),
-        ))
+    fn iter_reverse_from(
+        &self,
+        end: RolloutIndex,
+    ) -> impl Iterator<Item = (RolloutIndex, &RolloutItem)> + '_ {
+        let end = self.actual_index_from_rollout_index(end);
+        self.rollout_items[..end]
+            .iter()
+            .enumerate()
+            .rev()
+            .map(move |(actual_index, item)| {
+                let actual_index =
+                    i64::try_from(actual_index).expect("actual index should fit in i64");
+                (RolloutIndex(actual_index - self.startup_rollout_len), item)
+            })
     }
 
     fn actual_index_from_rollout_index(&self, rollout_index: RolloutIndex) -> usize {
@@ -86,21 +102,15 @@ enum HistoryBase {
 pub(super) struct RolloutReconstructionState {
     source: InMemoryReverseRolloutSource,
     history_base: HistoryBase,
-    // Exclusive end of the currently visible rollout suffix. Backtracking moves this boundary
-    // left so later replay runs operate relative to the current visible history instead of the
-    // newest loaded rollout items.
-    rollout_suffix_end: RolloutIndex,
     previous_model: Option<String>,
     reference_context_item: Option<TurnContextItem>,
 }
 
 impl RolloutReconstructionState {
     pub(super) fn new(rollout_items: Vec<RolloutItem>) -> Self {
-        let rollout_suffix_end = RolloutIndex(0);
         let mut reconstruction_state = Self {
             source: InMemoryReverseRolloutSource::new(rollout_items),
             history_base: HistoryBase::StartOfFile,
-            rollout_suffix_end,
             previous_model: None,
             reference_context_item: None,
         };
@@ -113,25 +123,20 @@ impl RolloutReconstructionState {
     }
 
     fn rebuild(&mut self, additional_user_turns: u32) {
-        // Re-canonicalize the replay state from the reverse source's currently loaded window plus
-        // any older rollout items we still need to load. Additional rollback is applied here
-        // directly, so the durable state never stores a "pending rollback count".
-        // Start from the current visible end, not the end of the loaded source, so repeated
-        // backtracking drops the newest surviving visible user turn each time.
-        let mut replay_index = self.rollout_suffix_end;
+        // Re-canonicalize the replay state from the currently visible rollout suffix plus any
+        // older items needed to recover metadata or an earlier compaction base. Starting the
+        // reverse scan from the current visible end makes repeated backtracking relative to the
+        // current reconstructed history instead of the newest startup rollout rows.
         let mut new_history_base = None;
-        let mut rollout_suffix_end = self.rollout_suffix_end;
+        let mut visible_end_index = self.source.visible_end_index;
         let mut previous_model = None;
         let mut reference_context_item = TurnReferenceContextItem::NeverSet;
         let mut pending_rollback_turns =
             usize::try_from(additional_user_turns).unwrap_or(usize::MAX);
         let mut active_segment: Option<ActiveReplaySegment> = None;
 
-        loop {
-            let already_loaded_window_is_consumed =
-                replay_index == self.source.loaded_start_index();
-            if already_loaded_window_is_consumed
-                && active_segment.is_none()
+        for (item_index, item) in self.source.iter_reverse_from(self.source.visible_end_index) {
+            if active_segment.is_none()
                 && pending_rollback_turns == 0
                 && new_history_base.is_some()
                 && previous_model.is_some()
@@ -140,27 +145,11 @@ impl RolloutReconstructionState {
                 break;
             }
 
-            let next_item = if replay_index.0 > self.source.loaded_start_index().0 {
-                replay_index.0 -= 1;
-                let actual_index = self.source.actual_index_from_rollout_index(replay_index);
-                Some((
-                    replay_index,
-                    self.source.rollout_items[actual_index].clone(),
-                ))
-            } else {
-                self.source.pop_older()
-            };
-
-            let Some((item_index, item)) = next_item else {
-                break;
-            };
-            replay_index = item_index;
-
-            match &item {
+            match item {
                 RolloutItem::SessionMeta(_) => {}
                 RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
                     // Historical rollback markers are applied eagerly while rebuilding state and
-                    // are not retained in the canonical loaded window.
+                    // are replayed from the same source as every other rollout item.
                     pending_rollback_turns = pending_rollback_turns
                         .saturating_add(usize::try_from(rollback.num_turns).unwrap_or(usize::MAX));
                 }
@@ -175,7 +164,7 @@ impl RolloutReconstructionState {
                             finalize_active_segment(
                                 active_segment,
                                 &mut new_history_base,
-                                &mut rollout_suffix_end,
+                                &mut visible_end_index,
                                 &mut previous_model,
                                 &mut reference_context_item,
                                 &mut pending_rollback_turns,
@@ -193,7 +182,7 @@ impl RolloutReconstructionState {
                         active_segment.newest_rollout_index = Some(item_index);
                     }
                     active_segment.oldest_rollout_index = Some(item_index);
-                    match &item {
+                    match item {
                         RolloutItem::Compacted(compacted) => {
                             if matches!(
                                 active_segment.reference_context_item,
@@ -257,7 +246,7 @@ impl RolloutReconstructionState {
             finalize_active_segment(
                 active_segment,
                 &mut new_history_base,
-                &mut rollout_suffix_end,
+                &mut visible_end_index,
                 &mut previous_model,
                 &mut reference_context_item,
                 &mut pending_rollback_turns,
@@ -273,7 +262,7 @@ impl RolloutReconstructionState {
         };
 
         self.history_base = history_base;
-        self.rollout_suffix_end = rollout_suffix_end;
+        self.source.visible_end_index = visible_end_index;
         self.previous_model = previous_model;
         self.reference_context_item = reference_context_item;
     }
@@ -314,7 +303,7 @@ fn turn_ids_are_compatible(active_turn_id: Option<&str>, item_turn_id: Option<&s
 fn finalize_active_segment(
     active_segment: ActiveReplaySegment,
     history_base: &mut Option<HistoryBase>,
-    rollout_suffix_end: &mut RolloutIndex,
+    visible_end_index: &mut RolloutIndex,
     previous_model: &mut Option<String>,
     reference_context_item: &mut TurnReferenceContextItem,
     pending_rollback_turns: &mut usize,
@@ -328,7 +317,7 @@ fn finalize_active_segment(
             let oldest_rollout_index = active_segment
                 .oldest_rollout_index
                 .expect("active replay segment should contain rollout items");
-            *rollout_suffix_end = oldest_rollout_index;
+            *visible_end_index = oldest_rollout_index;
         }
         return;
     }
@@ -393,7 +382,7 @@ impl Session {
         let mut saw_legacy_compaction_without_replacement_history = false;
 
         let rollout_suffix_start = match &reconstruction_state.history_base {
-            HistoryBase::StartOfFile => reconstruction_state.source.loaded_start_index(),
+            HistoryBase::StartOfFile => reconstruction_state.source.start_index(),
             HistoryBase::CompactionReplacement {
                 replacement_history,
                 rollout_suffix_start,
@@ -404,10 +393,10 @@ impl Session {
             }
         };
 
-        for item in reconstruction_state.source.items_between(
-            rollout_suffix_start,
-            reconstruction_state.rollout_suffix_end,
-        ) {
+        for (_, item) in reconstruction_state
+            .source
+            .iter_forward_from(rollout_suffix_start)
+        {
             match item {
                 RolloutItem::ResponseItem(response_item) => {
                     history.record_items(
@@ -437,6 +426,9 @@ impl Session {
                         );
                         history.replace(rebuilt);
                     }
+                }
+                RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
+                    history.drop_last_n_user_turns(rollback.num_turns);
                 }
                 RolloutItem::EventMsg(_)
                 | RolloutItem::TurnContext(_)

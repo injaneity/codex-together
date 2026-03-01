@@ -17,6 +17,10 @@ pub(super) struct RolloutReconstruction {
 struct InMemoryReverseRolloutSource {
     rollout_items: Arc<[RolloutItem]>,
     next_older_index: usize,
+    // Rollout items already pulled from the reverse source but currently hidden behind the active
+    // `history_base`. The eventual file-backed source should own the same "already loaded but not
+    // currently materialized" window so replay state only needs to track semantic history state.
+    loaded_prefix: Vec<RolloutItem>,
 }
 
 impl InMemoryReverseRolloutSource {
@@ -26,6 +30,7 @@ impl InMemoryReverseRolloutSource {
         Self {
             rollout_items,
             next_older_index,
+            loaded_prefix: Vec::new(),
         }
     }
 
@@ -54,10 +59,6 @@ enum HistoryBase {
 #[derive(Clone, Debug)]
 pub(super) struct RolloutReconstructionState {
     source: InMemoryReverseRolloutSource,
-    // Loaded rollout items older than the current `history_base`. They are not materialized in
-    // the current history view, but stay in memory so later backtracking can move the visible
-    // boundary farther back without re-reading from the newest rollout items again.
-    loaded_prefix: Vec<RolloutItem>,
     history_base: HistoryBase,
     // Loaded rollout items newer than the current `history_base`, in rollout order.
     rollout_suffix: Vec<RolloutItem>,
@@ -69,7 +70,6 @@ impl RolloutReconstructionState {
     pub(super) fn new(rollout_items: Vec<RolloutItem>) -> Self {
         let mut reconstruction_state = Self {
             source: InMemoryReverseRolloutSource::new(rollout_items),
-            loaded_prefix: Vec::new(),
             history_base: HistoryBase::StartOfFile,
             rollout_suffix: Vec::new(),
             previous_model: None,
@@ -87,7 +87,7 @@ impl RolloutReconstructionState {
         // Re-canonicalize the loaded replay state from the currently loaded window plus any older
         // rollout items we still need from the source. Additional rollback is applied here
         // directly, so the durable state never stores a "pending rollback count".
-        let mut loaded_rollout_items = self.loaded_prefix.clone();
+        let mut loaded_rollout_items = self.source.loaded_prefix.clone();
         if let HistoryBase::CompactionReplacement {
             compaction_active_segment,
             ..
@@ -250,7 +250,7 @@ impl RolloutReconstructionState {
             }
         };
 
-        self.loaded_prefix = new_loaded_prefix_rev.into_iter().rev().collect();
+        self.source.loaded_prefix = new_loaded_prefix_rev.into_iter().rev().collect();
         self.history_base = history_base;
         self.rollout_suffix = new_rollout_suffix_rev.into_iter().rev().collect();
         self.previous_model = previous_model;

@@ -827,6 +827,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b52af3cb4058c895d37317bb27508dccc8e5f2d39454016b297bf4a400597b8"
 dependencies = [
  "axum-core",
+ "base64 0.22.1",
  "bytes",
  "form_urlencoded",
  "futures-util",
@@ -845,8 +846,10 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
+ "sha1",
  "sync_wrapper",
  "tokio",
+ "tokio-tungstenite",
  "tower",
  "tower-layer",
  "tower-service",
@@ -1605,6 +1608,7 @@ dependencies = [
  "codex-rmcp-client",
  "codex-state",
  "codex-stdio-to-uds",
+ "codex-together-server",
  "codex-tui",
  "codex-utils-cargo-bin",
  "codex-utils-cli",
@@ -2370,6 +2374,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-together-client"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "codex-together-protocol",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
+name = "codex-together-protocol"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "codex-together-server"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "codex-app-server-protocol",
+ "codex-core",
+ "codex-state",
+ "codex-together-protocol",
+ "futures",
+ "libc",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "codex-tui"
 version = "0.0.0"
 dependencies = [
@@ -2394,6 +2441,8 @@ dependencies = [
  "codex-protocol",
  "codex-shell-command",
  "codex-state",
+ "codex-together-client",
+ "codex-together-protocol",
  "codex-utils-absolute-path",
  "codex-utils-approval-presets",
  "codex-utils-cargo-bin",
@@ -2413,6 +2462,7 @@ dependencies = [
  "diffy",
  "dirs",
  "dunce",
+ "futures",
  "hound",
  "image",
  "insta",
@@ -2441,6 +2491,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite",
  "tokio-util",
  "toml 0.9.11+spec-1.1.0",
  "tracing",

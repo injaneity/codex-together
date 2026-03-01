@@ -31,6 +31,7 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -285,15 +286,63 @@ use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SandboxPolicy;
+use codex_together_client::decode_invite;
+use codex_together_client::status_env_key;
+use codex_together_protocol::CheckoutReason;
+use codex_together_protocol::JsonRpcRequest as TogetherJsonRpcRequest;
+use codex_together_protocol::JsonRpcResponse as TogetherJsonRpcResponse;
+use codex_together_protocol::METHOD_INITIALIZE;
+use codex_together_protocol::METHOD_INITIALIZED;
+use codex_together_protocol::METHOD_TOGETHER_AUTH;
+use codex_together_protocol::METHOD_TOGETHER_HISTORY_LINEAGE;
+use codex_together_protocol::METHOD_TOGETHER_JOIN;
+use codex_together_protocol::METHOD_TOGETHER_LEAVE;
+use codex_together_protocol::METHOD_TOGETHER_MEMBER_ADD;
+use codex_together_protocol::METHOD_TOGETHER_MEMBER_REMOVE;
+use codex_together_protocol::METHOD_TOGETHER_SERVER_CLOSE;
+use codex_together_protocol::METHOD_TOGETHER_SERVER_CREATE;
+use codex_together_protocol::METHOD_TOGETHER_SERVER_INFO;
+use codex_together_protocol::METHOD_TOGETHER_THREAD_CHECKOUT;
+use codex_together_protocol::METHOD_TOGETHER_THREAD_FORK;
+use codex_together_protocol::METHOD_TOGETHER_THREAD_LIST;
+use codex_together_protocol::METHOD_TOGETHER_THREAD_SHARE;
+use codex_together_protocol::TogetherAuthRequest;
+use codex_together_protocol::TogetherHistoryLineageRequest;
+use codex_together_protocol::TogetherHistoryLineageResponse;
+use codex_together_protocol::TogetherJoinRequest;
+use codex_together_protocol::TogetherJoinResponse;
+use codex_together_protocol::TogetherMemberUpdateRequest;
+use codex_together_protocol::TogetherRole;
+use codex_together_protocol::TogetherServerCloseResponse;
+use codex_together_protocol::TogetherServerCreateRequest;
+use codex_together_protocol::TogetherServerCreateResponse;
+use codex_together_protocol::TogetherServerInfoResponse;
+use codex_together_protocol::TogetherThreadCheckoutRequest;
+use codex_together_protocol::TogetherThreadCheckoutResponse;
+use codex_together_protocol::TogetherThreadForkRequest;
+use codex_together_protocol::TogetherThreadForkResponse;
+use codex_together_protocol::TogetherThreadListRequest;
+use codex_together_protocol::TogetherThreadListResponse;
+use codex_together_protocol::TogetherThreadShareRequest;
+use codex_together_protocol::TogetherThreadShareResponse;
 use codex_utils_approval_presets::ApprovalPreset;
 use codex_utils_approval_presets::builtin_approval_presets;
+use futures::SinkExt;
+use futures::StreamExt;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 use strum::IntoEnumIterator;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
+use url::Url;
 
 const USER_SHELL_COMMAND_HELP_TITLE: &str = "Prefix a command with ! to run it locally";
 const USER_SHELL_COMMAND_HELP_HINT: &str = "Example: !ls";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_STATUS_LINE_ITEMS: [&str; 3] =
     ["model-with-reasoning", "context-remaining", "current-dir"];
+const TOGETHER_DEFAULT_ENDPOINT_URL: &str = "ws://127.0.0.1:8788/ws";
+const TOGETHER_ENDPOINT_ENV_KEY: &str = "CODEX_TOGETHER_ENDPOINT";
 // Track information about an in-flight exec command.
 struct RunningCommand {
     command: Vec<String>,
@@ -856,6 +905,10 @@ enum ReplayKind {
 }
 
 impl ChatWidget {
+    fn together_enabled(&self) -> bool {
+        self.config.features.enabled(Feature::Together)
+    }
+
     fn realtime_conversation_enabled(&self) -> bool {
         self.config.features.enabled(Feature::RealtimeConversation)
             && cfg!(not(target_os = "linux"))
@@ -3603,6 +3656,16 @@ impl ChatWidget {
                 }
                 self.open_collaboration_modes_popup();
             }
+            SlashCommand::Together => {
+                if !self.together_enabled() {
+                    self.add_info_message(
+                        "Codex Together is disabled.".to_string(),
+                        Some("Enable the together feature in /experimental first.".to_string()),
+                    );
+                    return;
+                }
+                self.open_together_menu();
+            }
             SlashCommand::Agent => {
                 self.app_event_tx.send(AppEvent::OpenAgentPicker);
             }
@@ -3913,6 +3976,22 @@ impl ChatWidget {
                     .send(AppEvent::BeginWindowsSandboxGrantReadRoot {
                         path: prepared_args,
                     });
+                self.bottom_pane.drain_pending_submission_state();
+            }
+            SlashCommand::Together if !trimmed.is_empty() => {
+                if !self.together_enabled() {
+                    self.add_info_message(
+                        "Codex Together is disabled.".to_string(),
+                        Some("Enable the together feature in /experimental first.".to_string()),
+                    );
+                    return;
+                }
+                let Some((prepared_args, _prepared_elements)) =
+                    self.bottom_pane.prepare_inline_args_submission(false)
+                else {
+                    return;
+                };
+                self.run_together_command(prepared_args);
                 self.bottom_pane.drain_pending_submission_state();
             }
             _ => self.dispatch_command(cmd),
@@ -4739,6 +4818,138 @@ impl ChatWidget {
         self.bottom_pane.show_view(Box::new(view));
     }
 
+    fn open_together_menu(&mut self) {
+        let together_status = std::env::var(status_env_key())
+            .unwrap_or_else(|_| "disconnected".to_string())
+            .to_ascii_lowercase();
+        let is_host = together_status.contains("host:");
+
+        let run_item = |name: &str, description: &str, args: &str| -> SelectionItem {
+            let args = args.to_string();
+            SelectionItem {
+                name: name.to_string(),
+                description: Some(description.to_string()),
+                actions: vec![Box::new(move |tx: &AppEventSender| {
+                    tx.send(AppEvent::RunTogetherCommand { args: args.clone() });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            }
+        };
+
+        let prompt_item = |name: &str,
+                           description: &str,
+                           title: &str,
+                           prompt: &str,
+                           command_prefix: &str|
+         -> SelectionItem {
+            let title = title.to_string();
+            let prompt = prompt.to_string();
+            let command_prefix = command_prefix.to_string();
+            SelectionItem {
+                name: name.to_string(),
+                description: Some(description.to_string()),
+                actions: vec![Box::new(move |tx: &AppEventSender| {
+                    tx.send(AppEvent::OpenTogetherPrompt {
+                        title: title.clone(),
+                        prompt: prompt.clone(),
+                        command_prefix: command_prefix.clone(),
+                    });
+                })],
+                dismiss_on_select: false,
+                ..Default::default()
+            }
+        };
+
+        let mut items = Vec::new();
+        if !is_host {
+            items.push(prompt_item(
+                "Create app server",
+                "Start a local together host process and generate invite links.",
+                "Create app server",
+                "Enter public ngrok base URL and press Enter",
+                "create",
+            ));
+        } else {
+            items.push(run_item(
+                "Close app server",
+                "Shut down your hosted together server for all members.",
+                "close",
+            ));
+            items.push(prompt_item(
+                "Add user",
+                "Allow a new email to join this together server.",
+                "Add user",
+                "Enter collaborator email and press Enter",
+                "add-user",
+            ));
+            items.push(prompt_item(
+                "Remove user",
+                "Revoke a member from this together server.",
+                "Remove user",
+                "Enter collaborator email and press Enter",
+                "remove-user",
+            ));
+        }
+
+        items.push(prompt_item(
+            "Join app server by invite",
+            "Connect to a shared codex-together invite link.",
+            "Join app server",
+            "Paste invite token or link and press Enter",
+            "join",
+        ));
+        items.push(run_item(
+            "Share thread",
+            "Publish current thread to together ACL.",
+            "share",
+        ));
+        items.push(prompt_item(
+            "Checkout thread",
+            "Read-only checkout for non-owners.",
+            "Checkout thread",
+            "Enter thread id and press Enter",
+            "checkout",
+        ));
+        items.push(prompt_item(
+            "Fork thread",
+            "Fork selected shared thread and continue on child.",
+            "Fork thread",
+            "Enter parent thread id and press Enter",
+            "fork",
+        ));
+        items.push(prompt_item(
+            "View thread history",
+            "Lazygit-style lineage tree (up/down + enter checkout).",
+            "View thread history",
+            "Enter root thread id and press Enter",
+            "lineage",
+        ));
+        items.push(run_item(
+            "List shared threads",
+            "Show threads shared on the active together server.",
+            "list",
+        ));
+        items.push(run_item(
+            "Status",
+            "Show active together server info and your role.",
+            "status",
+        ));
+        items.push(run_item("Help", "Show together workflow summary.", "help"));
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Codex Together".to_string()),
+            subtitle: Some(if is_host {
+                "Owner + member actions".to_string()
+            } else {
+                "Member actions".to_string()
+            }),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
     fn open_theme_picker(&mut self) {
         let codex_home = codex_core::config::find_codex_home().ok();
         let terminal_width = self
@@ -4914,7 +5125,17 @@ impl ChatWidget {
                 format_tokens_compact(self.status_line_total_usage().output_tokens)
             )),
             StatusLineItem::SessionId => self.thread_id.map(|id| id.to_string()),
+            StatusLineItem::Together => Self::status_line_together_value(),
         }
+    }
+
+    fn status_line_together_value() -> Option<String> {
+        let raw = std::env::var("CODEX_TOGETHER_STATUS").ok()?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("disconnected") {
+            return None;
+        }
+        Some(trimmed.to_string())
     }
 
     fn status_line_context_window_size(&self) -> Option<i64> {
@@ -7842,6 +8063,59 @@ impl ChatWidget {
         self.bottom_pane.show_view(Box::new(view));
     }
 
+    pub(crate) fn show_together_prompt(
+        &mut self,
+        title: String,
+        prompt: String,
+        command_prefix: String,
+    ) {
+        let tx = self.app_event_tx.clone();
+        let view = CustomPromptView::new(
+            title,
+            prompt,
+            None,
+            Box::new(move |value: String| {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    return;
+                }
+                tx.send(AppEvent::RunTogetherCommand {
+                    args: format!("{command_prefix} {trimmed}"),
+                });
+            }),
+        );
+        self.bottom_pane.show_view(Box::new(view));
+    }
+
+    pub(crate) fn run_together_command(&mut self, args: String) {
+        let trimmed = args.trim().to_string();
+        if trimmed.is_empty() {
+            self.add_info_message(
+                "Codex Together commands".to_string(),
+                Some(together_usage_hint()),
+            );
+            return;
+        }
+
+        let thread_id = self.thread_id.map(|id| id.to_string());
+        let cwd = self.config.cwd.clone();
+        let tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            match execute_together_command(trimmed, thread_id, cwd).await {
+                Ok(output) => {
+                    tx.send(AppEvent::InsertHistoryCell(Box::new(
+                        history_cell::new_info_event(output.message, output.hint),
+                    )));
+                }
+                Err(err) => {
+                    tx.send(AppEvent::InsertHistoryCell(Box::new(
+                        history_cell::new_error_event(format!("Together command failed: {err}")),
+                    )));
+                }
+            }
+        });
+    }
+
     pub(crate) fn token_usage(&self) -> TokenUsage {
         self.token_info
             .as_ref()
@@ -7942,6 +8216,761 @@ impl ChatWidget {
         self.bottom_pane.remove_transcription_placeholder(id);
         // Ensure the UI redraws to reflect placeholder removal.
         self.request_redraw();
+    }
+}
+
+#[derive(Debug)]
+struct TogetherCommandOutput {
+    message: String,
+    hint: Option<String>,
+}
+
+type TogetherSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+struct TogetherRpcClient {
+    writer: futures::stream::SplitSink<TogetherSocket, WebSocketMessage>,
+    reader: futures::stream::SplitStream<TogetherSocket>,
+    next_request_id: i64,
+}
+
+impl TogetherRpcClient {
+    async fn connect(endpoint: &str) -> anyhow::Result<Self> {
+        let parsed = Url::parse(endpoint)
+            .map_err(|err| anyhow::anyhow!("invalid together endpoint `{endpoint}`: {err}"))?;
+        let (socket, _) = connect_async(parsed.as_str()).await.map_err(|err| {
+            anyhow::anyhow!("failed to connect to together server at `{endpoint}`: {err}")
+        })?;
+        let (writer, reader) = socket.split();
+        Ok(Self {
+            writer,
+            reader,
+            next_request_id: 1,
+        })
+    }
+
+    async fn initialize(&mut self) -> anyhow::Result<()> {
+        let _: Value = self
+            .call(
+                METHOD_INITIALIZE,
+                serde_json::json!({
+                    "clientInfo": {
+                        "name": "codex-tui",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "capabilities": {
+                        "experimentalApi": true
+                    }
+                }),
+            )
+            .await?;
+        self.notify(METHOD_INITIALIZED, serde_json::json!({}))
+            .await?;
+        Ok(())
+    }
+
+    async fn authenticate(&mut self) -> anyhow::Result<()> {
+        let _: codex_together_protocol::TogetherAuthResponse = self
+            .call(
+                METHOD_TOGETHER_AUTH,
+                TogetherAuthRequest {
+                    email: "codex@local".to_string(),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn notify(&mut self, method: &str, params: Value) -> anyhow::Result<()> {
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        self.writer
+            .send(WebSocketMessage::Text(payload.to_string().into()))
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("failed to send together notification `{method}`: {err}")
+            })
+    }
+
+    async fn call<T, P>(&mut self, method: &str, params: P) -> anyhow::Result<T>
+    where
+        T: DeserializeOwned,
+        P: serde::Serialize,
+    {
+        let id = Value::from(self.next_request_id);
+        self.next_request_id += 1;
+        let params_value = serde_json::to_value(params).map_err(|err| {
+            anyhow::anyhow!("failed to serialize params for together `{method}`: {err}")
+        })?;
+        let request = TogetherJsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: id.clone(),
+            method: method.to_string(),
+            params: params_value,
+        };
+
+        self.writer
+            .send(WebSocketMessage::Text(
+                serde_json::to_string(&request)
+                    .map_err(|err| anyhow::anyhow!("failed to encode together request: {err}"))?
+                    .into(),
+            ))
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to send together request `{method}`: {err}"))?;
+
+        loop {
+            let Some(message) = self.reader.next().await else {
+                anyhow::bail!("together server closed websocket connection");
+            };
+            let message = message.map_err(|err| {
+                anyhow::anyhow!("failed to read together websocket message: {err}")
+            })?;
+            match message {
+                WebSocketMessage::Text(text) => {
+                    let value: Value = serde_json::from_str(text.as_str()).map_err(|err| {
+                        anyhow::anyhow!("invalid together JSON-RPC payload: {err}")
+                    })?;
+                    if value.get("id").is_none() {
+                        continue;
+                    }
+                    let response: TogetherJsonRpcResponse =
+                        serde_json::from_value(value).map_err(|err| {
+                            anyhow::anyhow!("invalid together JSON-RPC response: {err}")
+                        })?;
+                    if response.id != id {
+                        continue;
+                    }
+                    if let Some(error) = response.error {
+                        anyhow::bail!("{} ({})", error.message, error.code);
+                    }
+                    let result = response
+                        .result
+                        .ok_or_else(|| anyhow::anyhow!("together response missing result"))?;
+                    return serde_json::from_value(result).map_err(|err| {
+                        anyhow::anyhow!("failed to decode together response for `{method}`: {err}")
+                    });
+                }
+                WebSocketMessage::Ping(payload) => {
+                    self.writer
+                        .send(WebSocketMessage::Pong(payload))
+                        .await
+                        .map_err(|err| {
+                            anyhow::anyhow!(
+                                "failed to reply to together websocket ping message: {err}"
+                            )
+                        })?;
+                }
+                WebSocketMessage::Pong(_) => {}
+                WebSocketMessage::Close(_) => {
+                    anyhow::bail!("together websocket connection closed");
+                }
+                WebSocketMessage::Binary(_) => {}
+                _ => {}
+            }
+        }
+    }
+}
+
+async fn execute_together_command(
+    args: String,
+    current_thread_id: Option<String>,
+    cwd: PathBuf,
+) -> anyhow::Result<TogetherCommandOutput> {
+    let argv = shlex::split(&args)
+        .ok_or_else(|| anyhow::anyhow!("invalid shell-like quoting in `/together {args}`"))?;
+    let Some(command) = argv.first().map(|s| s.to_ascii_lowercase()) else {
+        return Ok(TogetherCommandOutput {
+            message: "Codex Together commands".to_string(),
+            hint: Some(together_usage_hint()),
+        });
+    };
+    let rest = &argv[1..];
+
+    match command.as_str() {
+        "help" => Ok(TogetherCommandOutput {
+            message: "Codex Together commands".to_string(),
+            hint: Some(together_usage_hint()),
+        }),
+        "create" => {
+            let Some(public_base_url) = rest.first() else {
+                anyhow::bail!("usage: /together create <public-base-url>");
+            };
+            let endpoint = TOGETHER_DEFAULT_ENDPOINT_URL.to_string();
+            ensure_local_together_server_running(&endpoint).await?;
+            let mut client = connect_and_auth(&endpoint).await?;
+            let response: TogetherServerCreateResponse = client
+                .call(
+                    METHOD_TOGETHER_SERVER_CREATE,
+                    TogetherServerCreateRequest {
+                        public_base_url: public_base_url.clone(),
+                        display_name: None,
+                    },
+                )
+                .await?;
+
+            set_together_endpoint(Some(endpoint));
+            set_together_status(Some(format!(
+                "together host:{}",
+                short_server_id(&response.server_id)
+            )));
+
+            Ok(TogetherCommandOutput {
+                message: format!(
+                    "Together server created: {}",
+                    short_server_id(&response.server_id)
+                ),
+                hint: Some(format!(
+                    "Invite link: {}\nInvite token: {}\nRemote websocket transport is experimental in v1.",
+                    response.invite_link, response.invite_token
+                )),
+            })
+        }
+        "close" => {
+            let endpoint = current_together_endpoint();
+            let mut client = connect_and_auth(&endpoint).await?;
+            let _: TogetherServerCloseResponse = client
+                .call(METHOD_TOGETHER_SERVER_CLOSE, serde_json::json!({}))
+                .await?;
+            set_together_status(Some("disconnected".to_string()));
+            clear_together_endpoint();
+            Ok(TogetherCommandOutput {
+                message: "Together server closed.".to_string(),
+                hint: None,
+            })
+        }
+        "join" => {
+            let Some(invite) = rest.first() else {
+                anyhow::bail!("usage: /together join <invite-token-or-link>");
+            };
+            let invite_payload = decode_invite(invite)
+                .map_err(|err| anyhow::anyhow!("failed to decode invite token: {err}"))?;
+            let endpoint = normalize_together_ws_endpoint(&invite_payload.endpoint)?;
+            let mut client = connect_and_auth(&endpoint).await?;
+            let response: TogetherJoinResponse = client
+                .call(
+                    METHOD_TOGETHER_JOIN,
+                    TogetherJoinRequest {
+                        invite: invite.clone(),
+                    },
+                )
+                .await?;
+            set_together_endpoint(Some(endpoint.clone()));
+            set_together_status(Some(status_label_for_role(
+                response.role,
+                &response.owner_email,
+                &response.server_id,
+            )));
+            Ok(TogetherCommandOutput {
+                message: format!(
+                    "Joined together server {}",
+                    short_server_id(&response.server_id)
+                ),
+                hint: Some(format!(
+                    "Owner: {}\nEndpoint: {}\nRole: {}",
+                    response.owner_email,
+                    response.endpoint,
+                    together_role_label(response.role)
+                )),
+            })
+        }
+        "leave" => {
+            let endpoint = current_together_endpoint();
+            let mut client = connect_and_auth(&endpoint).await?;
+            let _: codex_together_protocol::TogetherLeaveResponse = client
+                .call(METHOD_TOGETHER_LEAVE, serde_json::json!({}))
+                .await?;
+            set_together_status(Some("disconnected".to_string()));
+            clear_together_endpoint();
+            Ok(TogetherCommandOutput {
+                message: "Left together server.".to_string(),
+                hint: None,
+            })
+        }
+        "add-user" => {
+            let Some(email) = rest.first() else {
+                anyhow::bail!("usage: /together add-user <email>");
+            };
+            let endpoint = current_together_endpoint();
+            let mut client = connect_and_auth(&endpoint).await?;
+            let response: codex_together_protocol::TogetherMemberUpdateResponse = client
+                .call(
+                    METHOD_TOGETHER_MEMBER_ADD,
+                    TogetherMemberUpdateRequest {
+                        email: email.clone(),
+                    },
+                )
+                .await?;
+            Ok(TogetherCommandOutput {
+                message: format!("Member add result: {}", response.updated),
+                hint: Some(format!("Email: {email}")),
+            })
+        }
+        "remove-user" => {
+            let Some(email) = rest.first() else {
+                anyhow::bail!("usage: /together remove-user <email>");
+            };
+            let endpoint = current_together_endpoint();
+            let mut client = connect_and_auth(&endpoint).await?;
+            let response: codex_together_protocol::TogetherMemberUpdateResponse = client
+                .call(
+                    METHOD_TOGETHER_MEMBER_REMOVE,
+                    TogetherMemberUpdateRequest {
+                        email: email.clone(),
+                    },
+                )
+                .await?;
+            Ok(TogetherCommandOutput {
+                message: format!("Member remove result: {}", response.updated),
+                hint: Some(format!("Email: {email}")),
+            })
+        }
+        "share" => {
+            let thread_id = rest
+                .first()
+                .cloned()
+                .or(current_thread_id)
+                .ok_or_else(|| anyhow::anyhow!("usage: /together share <thread-id>"))?;
+            let endpoint = current_together_endpoint();
+            let mut client = connect_and_auth(&endpoint).await?;
+            let response: TogetherThreadShareResponse = client
+                .call(
+                    METHOD_TOGETHER_THREAD_SHARE,
+                    TogetherThreadShareRequest {
+                        thread_id: thread_id.clone(),
+                    },
+                )
+                .await?;
+            Ok(TogetherCommandOutput {
+                message: format!("Shared thread {}", response.thread_id),
+                hint: Some(format!(
+                    "Owner: {}\nShared at: {}",
+                    response.owner_email, response.shared_at
+                )),
+            })
+        }
+        "checkout" => {
+            let Some(thread_id) = rest.first() else {
+                anyhow::bail!("usage: /together checkout <thread-id>");
+            };
+            let endpoint = current_together_endpoint();
+            let mut client = connect_and_auth(&endpoint).await?;
+            let response: TogetherThreadCheckoutResponse = client
+                .call(
+                    METHOD_TOGETHER_THREAD_CHECKOUT,
+                    TogetherThreadCheckoutRequest {
+                        thread_id: thread_id.clone(),
+                    },
+                )
+                .await?;
+            let mode = if response.writable {
+                "writable"
+            } else {
+                "read-only"
+            };
+            let reason = match response.reason {
+                Some(CheckoutReason::NonOwnerMustFork) => {
+                    "Reason: non-owner must fork before writing.".to_string()
+                }
+                None => "Reason: thread owner match.".to_string(),
+            };
+            Ok(TogetherCommandOutput {
+                message: format!("Checked out thread {} ({mode})", response.thread_id),
+                hint: Some(format!("Owner: {}\n{reason}", response.owner_email)),
+            })
+        }
+        "fork" => {
+            let Some(thread_id) = rest.first() else {
+                anyhow::bail!("usage: /together fork <thread-id>");
+            };
+            let endpoint = current_together_endpoint();
+            let mut client = connect_and_auth(&endpoint).await?;
+            let response: TogetherThreadForkResponse = client
+                .call(
+                    METHOD_TOGETHER_THREAD_FORK,
+                    TogetherThreadForkRequest {
+                        thread_id: thread_id.clone(),
+                        cwd: Some(cwd.display().to_string()),
+                    },
+                )
+                .await?;
+            Ok(TogetherCommandOutput {
+                message: format!(
+                    "Forked thread {} -> {}",
+                    response.parent_thread_id, response.child_thread_id
+                ),
+                hint: Some(format!(
+                    "Resume child with: codex resume {}",
+                    response.child_thread_id
+                )),
+            })
+        }
+        "list" => {
+            let endpoint = current_together_endpoint();
+            let mut client = connect_and_auth(&endpoint).await?;
+            let search_term = if rest.is_empty() {
+                None
+            } else {
+                Some(rest.join(" "))
+            };
+            let response: TogetherThreadListResponse = client
+                .call(
+                    METHOD_TOGETHER_THREAD_LIST,
+                    TogetherThreadListRequest {
+                        cursor: None,
+                        limit: Some(100),
+                        search_term,
+                    },
+                )
+                .await?;
+            if response.data.is_empty() {
+                return Ok(TogetherCommandOutput {
+                    message: "No shared threads found.".to_string(),
+                    hint: None,
+                });
+            }
+            let mut lines = Vec::with_capacity(response.data.len() + 1);
+            lines.push(format!("{} shared thread(s):", response.data.len()));
+            for row in &response.data {
+                let preview = row.preview.as_deref().unwrap_or("no preview");
+                lines.push(format!(
+                    "- {}  owner={}  preview={}",
+                    row.thread_id, row.owner_email, preview
+                ));
+            }
+            Ok(TogetherCommandOutput {
+                message: "Shared threads".to_string(),
+                hint: Some(lines.join("\n")),
+            })
+        }
+        "lineage" | "history" => {
+            let Some(root_thread_id) = rest.first() else {
+                anyhow::bail!("usage: /together lineage <root-thread-id>");
+            };
+            let endpoint = current_together_endpoint();
+            let mut client = connect_and_auth(&endpoint).await?;
+            let response: TogetherHistoryLineageResponse = client
+                .call(
+                    METHOD_TOGETHER_HISTORY_LINEAGE,
+                    TogetherHistoryLineageRequest {
+                        root_thread_id: root_thread_id.clone(),
+                    },
+                )
+                .await?;
+            Ok(TogetherCommandOutput {
+                message: format!("Lineage for {}", response.root),
+                hint: Some(render_lineage_tree(&response)),
+            })
+        }
+        "status" => {
+            let endpoint = if let Some(raw) = rest.first() {
+                normalize_together_ws_endpoint(raw)?
+            } else {
+                current_together_endpoint()
+            };
+            let mut client = connect_and_auth(&endpoint).await?;
+            let response: TogetherServerInfoResponse = client
+                .call(METHOD_TOGETHER_SERVER_INFO, serde_json::json!({}))
+                .await?;
+            set_together_endpoint(Some(endpoint.clone()));
+            set_together_status(Some(status_label_for_role(
+                response.role,
+                &response.owner_email,
+                &response.server_id,
+            )));
+            let connected = response
+                .connected_members
+                .iter()
+                .map(|member| {
+                    format!(
+                        "{} ({})",
+                        member.email,
+                        together_role_label(member.role).to_lowercase()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Ok(TogetherCommandOutput {
+                message: format!("Together server {}", short_server_id(&response.server_id)),
+                hint: Some(format!(
+                    "Owner: {}\nRole: {}\nEndpoint: {}\nPublic URL: {}\nConnected: {}",
+                    response.owner_email,
+                    together_role_label(response.role),
+                    endpoint,
+                    response.public_base_url,
+                    connected
+                )),
+            })
+        }
+        _ => anyhow::bail!(
+            "unknown together command `{command}`\n{}",
+            together_usage_hint()
+        ),
+    }
+}
+
+async fn connect_and_auth(endpoint: &str) -> anyhow::Result<TogetherRpcClient> {
+    ensure_local_together_server_running(endpoint).await?;
+    let mut client = TogetherRpcClient::connect(endpoint).await?;
+    client.initialize().await?;
+    client.authenticate().await?;
+    Ok(client)
+}
+
+async fn ensure_local_together_server_running(endpoint: &str) -> anyhow::Result<()> {
+    if !is_local_endpoint(endpoint)? {
+        return Ok(());
+    }
+    let healthz_url = healthz_url_from_ws_endpoint(endpoint)?;
+    if together_server_healthy(&healthz_url).await {
+        return Ok(());
+    }
+
+    let listen_url = listen_url_for_local_endpoint(endpoint)?;
+    let exe = std::env::current_exe().map_err(|err| {
+        anyhow::anyhow!("failed to locate current codex binary for together-server spawn: {err}")
+    })?;
+    std::process::Command::new(&exe)
+        .arg("together-server")
+        .arg("--listen")
+        .arg(&listen_url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "failed to launch `{}` together-server: {err}",
+                exe.display()
+            )
+        })?;
+
+    for _ in 0..30 {
+        if together_server_healthy(&healthz_url).await {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    anyhow::bail!("timed out waiting for together-server at `{listen_url}` to become healthy");
+}
+
+async fn together_server_healthy(healthz_url: &str) -> bool {
+    match reqwest::get(healthz_url).await {
+        Ok(response) => response.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+fn listen_url_for_local_endpoint(endpoint: &str) -> anyhow::Result<String> {
+    let parsed = Url::parse(endpoint)
+        .map_err(|err| anyhow::anyhow!("invalid together endpoint `{endpoint}`: {err}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("together endpoint missing host: `{endpoint}`"))?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("together endpoint missing port: `{endpoint}`"))?;
+    Ok(format!("ws://{host}:{port}"))
+}
+
+fn healthz_url_from_ws_endpoint(endpoint: &str) -> anyhow::Result<String> {
+    let mut parsed = Url::parse(endpoint)
+        .map_err(|err| anyhow::anyhow!("invalid together endpoint `{endpoint}`: {err}"))?;
+    let target_scheme = match parsed.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        "http" => "http",
+        "https" => "https",
+        other => {
+            anyhow::bail!("unsupported together endpoint scheme `{other}`");
+        }
+    };
+    parsed.set_scheme(target_scheme).map_err(|()| {
+        anyhow::anyhow!("failed to convert together endpoint scheme for `{endpoint}`")
+    })?;
+    parsed.set_path("/healthz");
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Ok(parsed.to_string())
+}
+
+fn is_local_endpoint(endpoint: &str) -> anyhow::Result<bool> {
+    let parsed = Url::parse(endpoint)
+        .map_err(|err| anyhow::anyhow!("invalid together endpoint `{endpoint}`: {err}"))?;
+    let Some(host) = parsed.host_str() else {
+        return Ok(false);
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok(true);
+    }
+    Ok(host
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false))
+}
+
+fn normalize_together_ws_endpoint(raw: &str) -> anyhow::Result<String> {
+    let mut parsed = Url::parse(raw)
+        .map_err(|err| anyhow::anyhow!("invalid together endpoint `{raw}`: {err}"))?;
+    match parsed.scheme() {
+        "ws" | "wss" => {}
+        "http" => {
+            parsed.set_scheme("ws").map_err(|()| {
+                anyhow::anyhow!("failed to convert endpoint scheme from http to ws: `{raw}`")
+            })?;
+        }
+        "https" => {
+            parsed.set_scheme("wss").map_err(|()| {
+                anyhow::anyhow!("failed to convert endpoint scheme from https to wss: `{raw}`")
+            })?;
+        }
+        other => anyhow::bail!("unsupported together endpoint scheme `{other}`"),
+    }
+    if parsed.path().is_empty() || parsed.path() == "/" {
+        parsed.set_path("/ws");
+    }
+    Ok(parsed.to_string())
+}
+
+fn current_together_endpoint() -> String {
+    std::env::var(TOGETHER_ENDPOINT_ENV_KEY)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| TOGETHER_DEFAULT_ENDPOINT_URL.to_string())
+}
+
+fn set_together_status(value: Option<String>) {
+    unsafe {
+        match value {
+            Some(value) => std::env::set_var(status_env_key(), value),
+            None => std::env::remove_var(status_env_key()),
+        }
+    }
+}
+
+fn set_together_endpoint(value: Option<String>) {
+    unsafe {
+        match value {
+            Some(value) => std::env::set_var(TOGETHER_ENDPOINT_ENV_KEY, value),
+            None => std::env::remove_var(TOGETHER_ENDPOINT_ENV_KEY),
+        }
+    }
+}
+
+fn clear_together_endpoint() {
+    set_together_endpoint(None);
+}
+
+fn short_server_id(server_id: &str) -> String {
+    server_id.chars().take(12).collect()
+}
+
+fn together_role_label(role: TogetherRole) -> &'static str {
+    match role {
+        TogetherRole::Owner => "Owner",
+        TogetherRole::Member => "Member",
+    }
+}
+
+fn status_label_for_role(role: TogetherRole, owner_email: &str, server_id: &str) -> String {
+    match role {
+        TogetherRole::Owner => format!("together host:{}", short_server_id(server_id)),
+        TogetherRole::Member => format!("together @{owner_email}"),
+    }
+}
+
+fn together_usage_hint() -> String {
+    [
+        "/together create <public-base-url>",
+        "/together join <invite>",
+        "/together share [thread-id]",
+        "/together checkout <thread-id>",
+        "/together fork <thread-id>",
+        "/together list [search-term]",
+        "/together lineage <root-thread-id>",
+        "/together add-user <email>",
+        "/together remove-user <email>",
+        "/together status [endpoint]",
+        "/together close | leave | help",
+    ]
+    .join("\n")
+}
+
+fn render_lineage_tree(response: &TogetherHistoryLineageResponse) -> String {
+    use std::collections::BTreeMap;
+
+    let owners: HashMap<&str, &str> = response
+        .nodes
+        .iter()
+        .map(|node| (node.thread_id.as_str(), node.owner_email.as_str()))
+        .collect();
+
+    let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for edge in &response.edges {
+        children
+            .entry(edge.parent_thread_id.as_str())
+            .or_default()
+            .push(edge.child_thread_id.as_str());
+    }
+    for values in children.values_mut() {
+        values.sort_unstable();
+    }
+
+    let mut lines = Vec::new();
+    render_lineage_node(
+        response.root.as_str(),
+        "",
+        true,
+        &owners,
+        &children,
+        &mut lines,
+    );
+    if lines.is_empty() {
+        return "No lineage nodes found.".to_string();
+    }
+    lines.join("\n")
+}
+
+fn render_lineage_node<'a>(
+    thread_id: &'a str,
+    prefix: &str,
+    is_last: bool,
+    owners: &HashMap<&'a str, &'a str>,
+    children: &std::collections::BTreeMap<&'a str, Vec<&'a str>>,
+    out: &mut Vec<String>,
+) {
+    let owner = owners.get(thread_id).copied().unwrap_or("unknown");
+    let label = format!("{thread_id} ({owner})");
+    if prefix.is_empty() {
+        out.push(format!("* {label}"));
+    } else {
+        out.push(format!(
+            "{prefix}{} {label}",
+            if is_last { "`--" } else { "|--" }
+        ));
+    }
+
+    let Some(kids) = children.get(thread_id) else {
+        return;
+    };
+    let continuation = if prefix.is_empty() {
+        String::new()
+    } else if is_last {
+        format!("{prefix}   ")
+    } else {
+        format!("{prefix}|  ")
+    };
+    for (index, child) in kids.iter().enumerate() {
+        render_lineage_node(
+            child,
+            continuation.as_str(),
+            index + 1 == kids.len(),
+            owners,
+            children,
+            out,
+        );
     }
 }
 

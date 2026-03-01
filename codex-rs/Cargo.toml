@@ -40,6 +40,9 @@ members = [
     "stdio-to-uds",
     "otel",
     "tui",
+    "together-protocol",
+    "together-client",
+    "together-server",
     "utils/absolute-path",
     "utils/cargo-bin",
     "utils/git",
@@ -120,6 +123,9 @@ codex-skills = { path = "skills" }
 codex-state = { path = "state" }
 codex-stdio-to-uds = { path = "stdio-to-uds" }
 codex-test-macros = { path = "test-macros" }
+codex-together-client = { path = "together-client" }
+codex-together-protocol = { path = "together-protocol" }
+codex-together-server = { path = "together-server" }
 codex-tui = { path = "tui" }
 codex-utils-absolute-path = { path = "utils/absolute-path" }
 codex-utils-approval-presets = { path = "utils/approval-presets" }

@@ -1058,6 +1058,16 @@ pub(crate) fn new_session_info(
     );
     let mut parts: Vec<Box<dyn HistoryCell>> = vec![Box::new(header)];
 
+    let together_status = std::env::var("CODEX_TOGETHER_STATUS")
+        .ok()
+        .unwrap_or_else(|| "disconnected".to_string());
+    parts.push(Box::new(PlainHistoryCell {
+        lines: vec![Line::from(vec![
+            "  together: ".dim(),
+            together_status.into(),
+        ])],
+    }));
+
     if is_first_event {
         // Help lines below the header (new copy and list)
         let help_lines: Vec<Line<'static>> = vec![

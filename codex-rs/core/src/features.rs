@@ -125,6 +125,8 @@ pub enum Feature {
     EnableRequestCompression,
     /// Enable collab tools.
     Collab,
+    /// Enable codex-together collaboration controls and UI.
+    Together,
     /// Enable apps.
     Apps,
     /// Route apps MCP calls through the configured gateway.
@@ -597,6 +599,16 @@ pub const FEATURES: &[FeatureSpec] = &[
             name: "Multi-agents",
             menu_description: "Ask Codex to spawn multiple agents to parallelize the work and win in efficiency.",
             announcement: "NEW: Multi-agents can now be spawned by Codex. Enable in /experimental and restart Codex!",
+        },
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::Together,
+        key: "together",
+        stage: Stage::Experimental {
+            name: "Codex Together",
+            menu_description: "Enable codex-together server/session sharing and thread fork collaboration workflows.",
+            announcement: "NEW: Codex Together adds invite-based thread sharing and fork-first collaboration in /together.",
         },
         default_enabled: false,
     },

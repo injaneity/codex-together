@@ -3053,6 +3053,17 @@ impl App {
             AppEvent::OpenReviewCustomPrompt => {
                 self.chat_widget.show_review_custom_prompt();
             }
+            AppEvent::OpenTogetherPrompt {
+                title,
+                prompt,
+                command_prefix,
+            } => {
+                self.chat_widget
+                    .show_together_prompt(title, prompt, command_prefix);
+            }
+            AppEvent::RunTogetherCommand { args } => {
+                self.chat_widget.run_together_command(args);
+            }
             AppEvent::SubmitUserMessageWithMode {
                 text,
                 collaboration_mode,

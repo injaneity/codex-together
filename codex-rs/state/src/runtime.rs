@@ -55,6 +55,7 @@ mod memories;
 #[cfg(test)]
 mod test_support;
 mod threads;
+mod together;
 
 // "Partition" is the retention bucket we cap at 10 MiB:
 // - one bucket per non-null thread_id

@@ -30,6 +30,7 @@ pub enum SlashCommand {
     Compact,
     Plan,
     Collab,
+    Together,
     Agent,
     // Undo,
     Diff,
@@ -93,6 +94,7 @@ impl SlashCommand {
             SlashCommand::Settings => "configure realtime microphone/speaker",
             SlashCommand::Plan => "switch to Plan mode",
             SlashCommand::Collab => "change collaboration mode (experimental)",
+            SlashCommand::Together => "open codex-together menu",
             SlashCommand::Agent => "switch the active agent thread",
             SlashCommand::Approvals => "choose what Codex is allowed to do",
             SlashCommand::Permissions => "choose what Codex is allowed to do",
@@ -122,6 +124,7 @@ impl SlashCommand {
             SlashCommand::Review
                 | SlashCommand::Rename
                 | SlashCommand::Plan
+                | SlashCommand::Together
                 | SlashCommand::SandboxReadRoot
         )
     }
@@ -159,6 +162,7 @@ impl SlashCommand {
             | SlashCommand::Clean
             | SlashCommand::Mcp
             | SlashCommand::Apps
+            | SlashCommand::Together
             | SlashCommand::Feedback
             | SlashCommand::Quit
             | SlashCommand::Exit => true,

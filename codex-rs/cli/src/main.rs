@@ -105,6 +105,10 @@ enum Subcommand {
     /// [experimental] Run the app server or related tooling.
     AppServer(AppServerCommand),
 
+    /// [experimental] Run Codex Together collaboration server (internal).
+    #[clap(hide = true)]
+    TogetherServer(TogetherServerCommand),
+
     /// Launch the Codex desktop app (downloads the macOS installer if missing).
     #[cfg(target_os = "macos")]
     App(app_cmd::AppCommand),
@@ -339,6 +343,17 @@ struct AppServerCommand {
     /// See https://developers.openai.com/codex/config-advanced/#metrics for more details.
     #[arg(long = "analytics-default-enabled")]
     analytics_default_enabled: bool,
+}
+
+#[derive(Debug, Parser)]
+struct TogetherServerCommand {
+    /// WebSocket listen URL for together control plane.
+    #[arg(
+        long = "listen",
+        value_name = "URL",
+        default_value = "ws://127.0.0.1:8788"
+    )]
+    listen: String,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -631,6 +646,9 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 )?;
             }
         },
+        Some(Subcommand::TogetherServer(together_server_cli)) => {
+            codex_together_server::run_main(&together_server_cli.listen).await?;
+        }
         #[cfg(target_os = "macos")]
         Some(Subcommand::App(app_cli)) => {
             app_cmd::run_app(app_cli).await?;

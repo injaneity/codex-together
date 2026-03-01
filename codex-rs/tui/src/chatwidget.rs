@@ -8793,11 +8793,20 @@ async fn execute_together_command(
         "close" => {
             let endpoint = current_together_endpoint();
             let mut client = connect_and_auth(&endpoint).await?;
-            let _: TogetherServerCloseResponse = client
+            let close_result: anyhow::Result<TogetherServerCloseResponse> = client
                 .call(METHOD_TOGETHER_SERVER_CLOSE, serde_json::json!({}))
-                .await?;
+                .await;
             set_together_status(Some("disconnected".to_string()));
             clear_together_endpoint();
+            if let Err(err) = close_result {
+                if !together_not_connected(&err) {
+                    return Err(err);
+                }
+                return Ok(TogetherCommandOutput {
+                    message: "Already disconnected from together server.".to_string(),
+                    hint: None,
+                });
+            }
             Ok(TogetherCommandOutput {
                 message: "Together server closed.".to_string(),
                 hint: None,
@@ -8840,11 +8849,21 @@ async fn execute_together_command(
         "leave" => {
             let endpoint = current_together_endpoint();
             let mut client = connect_and_auth(&endpoint).await?;
-            let _: codex_together_protocol::TogetherLeaveResponse = client
+            let leave_result: anyhow::Result<codex_together_protocol::TogetherLeaveResponse> =
+                client
                 .call(METHOD_TOGETHER_LEAVE, serde_json::json!({}))
-                .await?;
+                .await;
             set_together_status(Some("disconnected".to_string()));
             clear_together_endpoint();
+            if let Err(err) = leave_result {
+                if !together_not_connected(&err) {
+                    return Err(err);
+                }
+                return Ok(TogetherCommandOutput {
+                    message: "Already disconnected from together server.".to_string(),
+                    hint: None,
+                });
+            }
             Ok(TogetherCommandOutput {
                 message: "Left together server.".to_string(),
                 hint: None,
@@ -9086,6 +9105,11 @@ fn together_checkout_target(command_args: &str) -> Option<String> {
 fn together_method_missing(err: &anyhow::Error) -> bool {
     let text = err.to_string().to_ascii_lowercase();
     text.contains("method not found") && text.contains("(-32601)")
+}
+
+fn together_not_connected(err: &anyhow::Error) -> bool {
+    let text = err.to_string();
+    text.contains("TOGETHER_NOT_CONNECTED")
 }
 
 fn together_replay_events(messages: Vec<TogetherReplayMessage>) -> Vec<EventMsg> {

@@ -738,11 +738,58 @@ async fn together_thread_share(
         .clone()
         .unwrap_or_else(|| "guest@local".to_string());
 
+    let existing_shared = {
+        let guard = state.inner.lock().await;
+        let Some(hosted) = guard.hosted.as_ref() else {
+            return rpc_error(req.id, RPC_ERR_NOT_CONNECTED, "TOGETHER_NOT_CONNECTED");
+        };
+
+        if member_role(hosted, &caller_email).is_none() {
+            return rpc_error(
+                req.id,
+                RPC_ERR_MEMBER_NOT_ALLOWED,
+                "TOGETHER_MEMBER_NOT_ALLOWED",
+            );
+        }
+
+        if let Some(existing) = hosted.threads.get(&payload.thread_id)
+            && existing.owner_email != caller_email
+        {
+            return rpc_error(req.id, RPC_ERR_FORBIDDEN, "TOGETHER_FORBIDDEN");
+        }
+
+        hosted.threads.get(&payload.thread_id).cloned()
+    };
+
     let thread = {
         let mut bridge = state.app_server.lock().await;
         match bridge.thread_read(payload.thread_id.clone(), true).await {
             Ok(response) => response.thread,
-            Err(err) => return app_server_error_response(req.id, err),
+            Err(err) => {
+                if app_server_thread_not_loaded(&err)
+                    && let Some(existing) = existing_shared
+                {
+                    return JsonRpcResponse::ok(
+                        req.id,
+                        TogetherThreadShareResponse {
+                            thread_id: existing.thread_id,
+                            owner_email: existing.owner_email,
+                            preview: existing.preview,
+                            shared_at: existing.shared_at,
+                        },
+                    )
+                    .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"));
+                }
+
+                if app_server_thread_not_loaded(&err) {
+                    return rpc_error(
+                        req.id,
+                        -32602,
+                        "thread is not loaded on this together host; if this thread was forked locally, fork it via together first",
+                    );
+                }
+                return app_server_error_response(req.id, err);
+            }
         }
     };
 
@@ -1612,6 +1659,15 @@ fn app_server_error_response(id: Value, err: AppServerError) -> JsonRpcResponse 
             rpc_error(id, -32603, "app-server protocol error")
         }
     }
+}
+
+fn app_server_thread_not_loaded(err: &AppServerError) -> bool {
+    matches!(
+        err,
+        AppServerError::Rpc { code, message }
+            if *code == -32600
+                && message.to_ascii_lowercase().contains("thread not loaded")
+    )
 }
 
 #[derive(Debug)]

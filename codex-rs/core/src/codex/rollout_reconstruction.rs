@@ -14,34 +14,42 @@ pub(super) struct RolloutReconstruction {
 // same "load older items on demand" contract, but page older rollout items from the session file
 // instead of cloning them out of an eagerly loaded `Vec<RolloutItem>`.
 //
-// The current in-memory source uses array indices as its location type. The future file-backed
-// equivalent should expose the same "read older items / replay forward from this location"
-// contract, but can back that location with an opaque file cursor instead of a slice index.
+// `-1` is the newest rollout row that already existed when reconstruction state was created.
+// Older persisted rows are more negative, and any rows appended after startup will be `0`, `1`,
+// `2`, and so on. The future file-backed source should expose the same "read older items / replay
+// forward from this location" contract, but can back that location with an opaque file cursor
+// instead of an in-memory signed index.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RolloutIndex(usize);
+struct RolloutIndex(isize);
 
 #[derive(Clone, Debug)]
 struct InMemoryReverseRolloutSource {
     rollout_items: Arc<[RolloutItem]>,
+    startup_rollout_len: isize,
     next_older_index: usize,
 }
 
 impl InMemoryReverseRolloutSource {
     fn new(rollout_items: Vec<RolloutItem>) -> Self {
         let rollout_items = Arc::<[RolloutItem]>::from(rollout_items);
+        let startup_rollout_len =
+            isize::try_from(rollout_items.len()).expect("rollout length should fit in isize");
         let next_older_index = rollout_items.len();
         Self {
             rollout_items,
+            startup_rollout_len,
             next_older_index,
         }
     }
 
     fn oldest_loaded_index(&self) -> RolloutIndex {
-        RolloutIndex(self.next_older_index)
+        self.rollout_index_from_actual(self.next_older_index)
     }
 
     fn items_between(&self, start: RolloutIndex, end: RolloutIndex) -> &[RolloutItem] {
-        &self.rollout_items[start.0..end.0]
+        let start = self.actual_index_from_rollout_index(start);
+        let end = self.actual_index_from_rollout_index(end);
+        &self.rollout_items[start..end]
     }
 
     fn pop_older(&mut self) -> Option<(RolloutIndex, RolloutItem)> {
@@ -50,8 +58,20 @@ impl InMemoryReverseRolloutSource {
         }
 
         self.next_older_index -= 1;
-        let item_index = RolloutIndex(self.next_older_index);
-        Some((item_index, self.rollout_items[item_index.0].clone()))
+        let item_index = self.rollout_index_from_actual(self.next_older_index);
+        let actual_index = self.actual_index_from_rollout_index(item_index);
+        Some((item_index, self.rollout_items[actual_index].clone()))
+    }
+
+    fn actual_index_from_rollout_index(&self, rollout_index: RolloutIndex) -> usize {
+        usize::try_from(rollout_index.0 + self.startup_rollout_len)
+            .expect("rollout index should map to a loaded rollout row")
+    }
+
+    fn rollout_index_from_actual(&self, actual_index: usize) -> RolloutIndex {
+        let actual_index =
+            isize::try_from(actual_index).expect("actual rollout index should fit in isize");
+        RolloutIndex(actual_index - self.startup_rollout_len)
     }
 }
 
@@ -81,7 +101,7 @@ pub(super) struct RolloutReconstructionState {
 
 impl RolloutReconstructionState {
     pub(super) fn new(rollout_items: Vec<RolloutItem>) -> Self {
-        let rollout_suffix_end = RolloutIndex(rollout_items.len());
+        let rollout_suffix_end = RolloutIndex(0);
         let mut reconstruction_state = Self {
             source: InMemoryReverseRolloutSource::new(rollout_items),
             history_base: HistoryBase::StartOfFile,
@@ -127,9 +147,10 @@ impl RolloutReconstructionState {
 
             let next_item = if replay_index.0 > self.source.oldest_loaded_index().0 {
                 replay_index.0 -= 1;
+                let actual_index = self.source.actual_index_from_rollout_index(replay_index);
                 Some((
                     replay_index,
-                    self.source.rollout_items[replay_index.0].clone(),
+                    self.source.rollout_items[actual_index].clone(),
                 ))
             } else {
                 self.source.pop_older()

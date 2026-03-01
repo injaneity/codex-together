@@ -45,9 +45,9 @@ enum HistoryBase {
     // The current history view starts from a replacement-history checkpoint. The checkpoint
     // rollout items are not materialized while this base is active, but they stay in memory so
     // future backtracking can roll before the compacted turn without restarting replay.
-    Replacement {
-        history: Vec<ResponseItem>,
-        checkpoint_segment: Vec<RolloutItem>,
+    CompactionReplacement {
+        replacement_history: Vec<ResponseItem>,
+        compaction_active_segment: Vec<RolloutItem>,
     },
 }
 
@@ -88,11 +88,12 @@ impl RolloutReconstructionState {
         // rollout items we still need from the source. Additional rollback is applied here
         // directly, so the durable state never stores a "pending rollback count".
         let mut loaded_rollout_items = self.loaded_prefix.clone();
-        if let HistoryBase::Replacement {
-            checkpoint_segment, ..
+        if let HistoryBase::CompactionReplacement {
+            compaction_active_segment,
+            ..
         } = &self.history_base
         {
-            loaded_rollout_items.extend(checkpoint_segment.iter().cloned());
+            loaded_rollout_items.extend(compaction_active_segment.iter().cloned());
         }
         loaded_rollout_items.extend(self.rollout_suffix.iter().cloned());
 
@@ -336,9 +337,9 @@ fn finalize_active_segment(
     if history_base.is_none()
         && let Some(replacement_history) = base_replacement_history
     {
-        *history_base = Some(HistoryBase::Replacement {
-            history: replacement_history,
-            checkpoint_segment: rollout_items_rev.into_iter().rev().collect(),
+        *history_base = Some(HistoryBase::CompactionReplacement {
+            replacement_history,
+            compaction_active_segment: rollout_items_rev.into_iter().rev().collect(),
         });
         return;
     }
@@ -371,8 +372,8 @@ impl Session {
 
         match &reconstruction_state.history_base {
             HistoryBase::StartOfFile => {}
-            HistoryBase::Replacement {
-                history: replacement_history,
+            HistoryBase::CompactionReplacement {
+                replacement_history,
                 ..
             } => {
                 history.replace(replacement_history.clone());

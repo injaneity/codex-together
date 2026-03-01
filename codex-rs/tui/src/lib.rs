@@ -41,7 +41,10 @@ use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
+use codex_state::StateRuntime;
+use codex_state::TogetherClientMode;
 use codex_state::log_db;
+use codex_together_client::status_env_key;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_oss::ensure_oss_provider_ready;
 use codex_utils_oss::get_default_model_for_oss_provider;
@@ -902,6 +905,7 @@ async fn run_ratatui_app(
     ) {
         config.startup_warnings.push(w);
     }
+    hydrate_together_status_from_state(&config).await;
 
     set_default_client_residency_requirement(config.enforce_residency.value());
     let active_profile = config.active_profile.clone();
@@ -941,6 +945,63 @@ async fn run_ratatui_app(
     session_log::log_session_end();
     // ignore error when collecting usage – report underlying error instead
     app_result
+}
+
+fn together_status_from_session(
+    mode: TogetherClientMode,
+    server_id: Option<String>,
+    owner_email: Option<String>,
+) -> String {
+    match mode {
+        TogetherClientMode::Disconnected => "disconnected".to_string(),
+        TogetherClientMode::Host => {
+            let short = server_id
+                .unwrap_or_default()
+                .chars()
+                .take(12)
+                .collect::<String>();
+            if short.is_empty() {
+                "together host".to_string()
+            } else {
+                format!("together host:{short}")
+            }
+        }
+        TogetherClientMode::Member => {
+            let owner = owner_email.unwrap_or_default().trim().to_string();
+            if owner.is_empty() {
+                "together member".to_string()
+            } else {
+                format!("together @{owner}")
+            }
+        }
+    }
+}
+
+async fn hydrate_together_status_from_state(config: &Config) {
+    let runtime = match StateRuntime::init(config.sqlite_home.clone(), "together".to_string(), None)
+        .await
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            tracing::debug!(error = %err, "failed to init together state runtime for startup hydration");
+            return;
+        }
+    };
+
+    let status = match runtime.get_together_client_session().await {
+        Ok(Some(session)) => {
+            together_status_from_session(session.mode, session.server_id, session.owner_email)
+        }
+        Ok(None) => "disconnected".to_string(),
+        Err(err) => {
+            tracing::debug!(error = %err, "failed to read together startup session");
+            "disconnected".to_string()
+        }
+    };
+
+    unsafe {
+        std::env::set_var(status_env_key(), status);
+    }
 }
 
 pub(crate) async fn resolve_session_thread_id(

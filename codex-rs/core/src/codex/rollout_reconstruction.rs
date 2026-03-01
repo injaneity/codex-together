@@ -10,6 +10,10 @@ pub(super) struct RolloutReconstruction {
 }
 
 #[derive(Clone, Debug)]
+// In-memory implementation of the reverse rollout source used by the current eager caller.
+// When reconstruction switches to lazy on-disk loading, the equivalent source should keep the
+// same "load older items on demand" contract, but page older rollout items from the session file
+// instead of cloning them out of an eagerly loaded `Vec<RolloutItem>`.
 struct InMemoryReverseRolloutSource {
     rollout_items: Arc<[RolloutItem]>,
     next_older_index: usize,

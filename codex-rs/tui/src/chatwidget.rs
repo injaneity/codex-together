@@ -8107,8 +8107,13 @@ impl ChatWidget {
     }
 
     pub(crate) fn open_together_history_view(&mut self) {
-        let Some(root_thread_id) = self.thread_id.map(|id| id.to_string()) else {
-            self.add_error_message("No active thread to load history from.".to_string());
+        let root_thread_id = current_together_checked_out_thread()
+            .or_else(|| self.thread_id.map(|id| id.to_string()));
+        let Some(root_thread_id) = root_thread_id else {
+            self.add_error_message(
+                "No together thread selected for /history. Use /threads and checkout first."
+                    .to_string(),
+            );
             return;
         };
 
@@ -8363,6 +8368,18 @@ impl ChatWidget {
                     }
                 }
                 Err(err) => {
+                    if together_thread_not_shared(&err) {
+                        clear_together_checked_out_thread();
+                        tx.send(AppEvent::InsertHistoryCell(Box::new(
+                            history_cell::new_info_event(
+                                "Your selected together thread is no longer shared.".to_string(),
+                                Some(
+                                    "Thread context was reset. Open /threads and checkout again."
+                                        .to_string(),
+                                ),
+                            ),
+                        )));
+                    }
                     tx.send(AppEvent::InsertHistoryCell(Box::new(
                         history_cell::new_error_event(format!("Together command failed: {err}")),
                     )));
@@ -8714,6 +8731,7 @@ async fn execute_together_command(
                     &existing.owner_email,
                     &existing.server_id,
                 )));
+                clear_together_checked_out_thread();
                 let connected = existing
                     .connected_members
                     .iter()
@@ -8768,6 +8786,7 @@ async fn execute_together_command(
                         &existing.owner_email,
                         &existing.server_id,
                     )));
+                    clear_together_checked_out_thread();
                     let connected = existing
                         .connected_members
                         .iter()
@@ -8919,6 +8938,7 @@ async fn execute_together_command(
                     },
                 )
                 .await?;
+            set_together_checked_out_thread(Some(response.thread_id.clone()));
             Ok(TogetherCommandOutput {
                 message: format!("Shared thread {}", response.thread_id),
                 hint: Some(format!(
@@ -9005,6 +9025,10 @@ async fn execute_together_command(
                     },
                 )
                 .await?;
+            if current_together_checked_out_thread().as_deref() == Some(response.thread_id.as_str())
+            {
+                clear_together_checked_out_thread();
+            }
             Ok(TogetherCommandOutput {
                 message: format!("Deleted shared thread {}", response.thread_id),
                 hint: None,
@@ -9068,6 +9092,7 @@ async fn execute_together_command(
             })
         }
         "status" => {
+            let explicit_endpoint = rest.first().is_some();
             let endpoint = if let Some(raw) = rest.first() {
                 normalize_together_ws_endpoint(raw)?
             } else {
@@ -9084,6 +9109,9 @@ async fn execute_together_command(
                 &response.owner_email,
                 &response.server_id,
             )));
+            if explicit_endpoint {
+                clear_together_checked_out_thread();
+            }
             let connected = response
                 .connected_members
                 .iter()
@@ -9181,6 +9209,12 @@ fn together_method_missing(err: &anyhow::Error) -> bool {
 fn together_not_connected(err: &anyhow::Error) -> bool {
     let text = err.to_string();
     text.contains("TOGETHER_NOT_CONNECTED")
+}
+
+fn together_thread_not_shared(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("thread not shared")
 }
 
 fn together_replay_events(messages: Vec<TogetherReplayMessage>) -> Vec<EventMsg> {

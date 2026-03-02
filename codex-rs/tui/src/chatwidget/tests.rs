@@ -4920,6 +4920,28 @@ async fn slash_exit_requests_exit() {
     assert_matches!(rx.try_recv(), Ok(AppEvent::Exit(ExitMode::ShutdownFirst)));
 }
 
+#[test]
+fn together_join_handshake_lines_include_right_side_joined_member_label() {
+    let joined = "new.member@example.com";
+    let lines = together_join_handshake_lines(joined);
+    let rendered = lines_to_single_string(&lines);
+
+    assert!(rendered.contains("handshake"));
+    assert!(rendered.contains("you (left)  <->  new.member@example.com (right)"));
+}
+
+#[test]
+fn together_join_handshake_lines_render_selected_variant_rows() {
+    let joined = "friend@example.com";
+    let variant = together_join_handshake_variant(joined);
+    let lines = together_join_handshake_lines(joined);
+    let rendered = lines_to_single_string(&lines);
+
+    assert!(rendered.contains(variant[0]));
+    assert!(rendered.contains(variant[1]));
+    assert!(rendered.contains(variant[2]));
+}
+
 #[tokio::test]
 async fn slash_clean_submits_background_terminal_cleanup() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;

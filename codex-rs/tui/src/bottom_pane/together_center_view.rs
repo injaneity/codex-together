@@ -25,17 +25,20 @@ use crate::render::renderable::Renderable;
 pub(crate) const TOGETHER_CENTER_VIEW_ID: &str = "together-center";
 
 const MAX_LABEL_WIDTH: usize = 14;
-const BLANK_SPRITE: &str = "     ";
-const LANDING_FINAL_FRAME: usize = 3;
-const STEPOUT_FINAL_FRAME: usize = 4;
+const SPRITE_HEIGHT: usize = 3;
+const BLANK_SPRITE: &str = "         ";
+const LANDING_FINAL_FRAME: usize = SPRITE_HEIGHT - 1;
+const STEPOUT_FINAL_FRAME: usize = SPRITE_HEIGHT;
 const ANIMATION_FRAME_MS: u64 = 90;
 
-const UNICODE_SPRITES: [[&str; 4]; 5] = [
-    [" ▗▆▖ ", "▐█▀▌", "▐█▄▌", " ▝▀▘ "],
-    [" ▟█▙ ", "▐▛█▌", "▐▙█▌", " ▝▀▘ "],
-    [" ▗▄▖ ", "▐▙█▌", "▐▛█▌", " ▝▀▘ "],
-    [" ▗▇▖ ", "▐█▚▌", "▐█▞▌", " ▝▀▘ "],
-    [" ▗▅▖ ", "▐▜█▌", "▐▟█▌", " ▝▀▘ "],
+const UNICODE_SPRITES: [[&str; SPRITE_HEIGHT]; 7] = [
+    [" (•.•)/  ", "<)   )   ", " /   \\   "],
+    ["\\(•.•)/  ", " (   )   ", " /   \\   "],
+    [" (•.•)/  ", "<)   )   ", " |   /   "],
+    [" \\(•.•)  ", "  (   )> ", "  /   \\  "],
+    [" ᕦ(•.•)ᕤ ", "  (   )  ", "  /   \\  "],
+    ["\\(°o°)/  ", " (   )   ", " /   \\   "],
+    [" (•_•)   ", "|(   )>  ", " /   \\   "],
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,7 +218,7 @@ impl TogetherCenterView {
             return vec!["[ no crew connected ]".dim().into()];
         }
 
-        (0..4)
+        (0..SPRITE_HEIGHT)
             .map(|line_idx| {
                 let mut spans = Vec::new();
                 for (slot_idx, slot) in slots.iter().enumerate() {
@@ -440,9 +443,13 @@ fn sprite_line_for_state(
     }
 }
 
-fn sprite_line_for_landing(base: [&'static str; 4], frame: usize, line_idx: usize) -> &'static str {
+fn sprite_line_for_landing(
+    base: [&'static str; SPRITE_HEIGHT],
+    frame: usize,
+    line_idx: usize,
+) -> &'static str {
     let clamped = frame.min(LANDING_FINAL_FRAME);
-    let visible_from = 3usize.saturating_sub(clamped);
+    let visible_from = (SPRITE_HEIGHT - 1).saturating_sub(clamped);
     if line_idx >= visible_from {
         base[line_idx]
     } else {
@@ -450,9 +457,13 @@ fn sprite_line_for_landing(base: [&'static str; 4], frame: usize, line_idx: usiz
     }
 }
 
-fn sprite_line_for_stepout(base: [&'static str; 4], frame: usize, line_idx: usize) -> &'static str {
+fn sprite_line_for_stepout(
+    base: [&'static str; SPRITE_HEIGHT],
+    frame: usize,
+    line_idx: usize,
+) -> &'static str {
     let clamped = frame.min(STEPOUT_FINAL_FRAME);
-    let keep_until = 4usize.saturating_sub(clamped);
+    let keep_until = SPRITE_HEIGHT.saturating_sub(clamped);
     if line_idx < keep_until {
         base[line_idx]
     } else {

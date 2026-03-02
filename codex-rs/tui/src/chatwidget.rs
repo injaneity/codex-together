@@ -367,6 +367,17 @@ const MASK_EMAIL_LABELS_BY_DEFAULT: bool = true;
 const TOGETHER_PRESENCE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const TOGETHER_PRESENCE_STALE_AFTER: Duration = Duration::from_secs(12);
 const NGROK_TUNNELS_API_URL: &str = "http://127.0.0.1:4040/api/tunnels";
+const TOGETHER_JOIN_HANDSHAKE_VARIANTS: [[&str; 3]; 5] = [
+    [" \\(•.•) (•.•)/", "  (  |--|  )", "  /  \\  /  \\"],
+    ["\\(•.•)   (•.•)/", "  )  |---|  (", "  /  \\   /  \\"],
+    [" (•.•) (•.•)", "<)   )>(  )|", " /   \\ /  \\"],
+    [
+        " (•.•)     (•.•)",
+        "<)   )o---o(   )>",
+        " /   \\     /   \\",
+    ],
+    [" (•.•)   (•.•)", "<)   )\\ /(   )>", " /   \\   /   \\"],
+];
 // Track information about an in-flight exec command.
 struct RunningCommand {
     command: Vec<String>,
@@ -8329,6 +8340,7 @@ impl ChatWidget {
                         format!("join: {email}"),
                         Some("Crew member landed in Together Center.".to_string()),
                     );
+                    self.add_plain_history_lines(together_join_handshake_lines(email));
                 }
                 for email in &left {
                     self.add_info_message(
@@ -10231,6 +10243,29 @@ fn together_usage_hint() -> String {
         "/together mascot labels masked|full",
     ]
     .join("\n")
+}
+
+fn together_join_handshake_lines(joined_email: &str) -> Vec<Line<'static>> {
+    let variant = together_join_handshake_variant(joined_email);
+    let mut lines = Vec::with_capacity(5);
+    lines.push("  handshake".dim().into());
+    for row in variant {
+        lines.push(format!("  {row}").into());
+    }
+    lines.push(
+        format!("  you (left)  <->  {joined_email} (right)")
+            .dim()
+            .into(),
+    );
+    lines
+}
+
+fn together_join_handshake_variant(joined_email: &str) -> [&'static str; 3] {
+    let mut hash: usize = 0;
+    for byte in joined_email.as_bytes() {
+        hash = hash.wrapping_mul(37).wrapping_add(usize::from(*byte));
+    }
+    TOGETHER_JOIN_HANDSHAKE_VARIANTS[hash % TOGETHER_JOIN_HANDSHAKE_VARIANTS.len()]
 }
 
 fn render_lineage_tree(response: &TogetherHistoryLineageResponse) -> String {

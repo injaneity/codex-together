@@ -1,0 +1,97 @@
+(A) Add `PenguinUiConfig` under `Tui` in `codex-rs/core/src/config/types.rs` with `enabled: bool` default `true`. +config +core +penguin
+(A) Add `PenguinUiConfig.show_onboarding: bool` default `true`. +config +core +penguin
+(A) Add `PenguinUiConfig.show_session_greeting: bool` default `true`. +config +core +penguin
+(A) Add `PenguinUiConfig.bubble_notifications: bool` default `true`. +config +core +penguin
+(A) Add `PenguinUiConfig.bubble_status: bool` default `true`. +config +core +penguin
+(A) Add `PenguinUiConfig.max_bubble_width: Option<u16>` for user overrides. +config +core +penguin
+(A) Add `PenguinUiConfig.align_mode: Option<String>` supporting `auto`, `right`, and `stacked`. +config +core +penguin
+(A) Thread `tui.penguin_ui` through config parsing in `codex-rs/core/src/config/mod.rs`. +config +core +penguin
+(A) Thread resolved `penguin_ui` into runtime `Config` in `codex-rs/core/src/config/mod.rs`. +config +core +penguin
+(A) Add config tests for `tui.penguin_ui.enabled` parsing and defaults. +config +core +tests
+(A) Add config tests for `tui.penguin_ui.bubble_notifications` parsing and defaults. +config +core +tests
+(A) Add config tests for `tui.penguin_ui.align_mode` invalid value rejection. +config +core +tests
+(A) Run `just write-config-schema` after config changes. +config +schema
+(A) Add `penguin_ui` module export in `codex-rs/tui/src/lib.rs`. +tui +penguin
+(A) Create `codex-rs/tui/src/penguin_ui/mod.rs` exporting sprite, bubble, and layout helpers. +tui +penguin
+(A) Create `codex-rs/tui/src/penguin_ui/sprite.rs` with the fixed static sprite exactly matching the approved art. +tui +penguin +assets
+(A) Store the sprite as a canonical 4-line constant in `sprite.rs` for reuse across views. +tui +penguin +assets
+(A) Create `codex-rs/tui/src/penguin_ui/bubble.rs` to render speech boxes with wrapped text. +tui +penguin +bubble
+(A) Implement bubble top border rendering with rounded ASCII/Unicode-safe corners. +tui +penguin +bubble
+(A) Implement bubble body rendering with left and right borders per wrapped line. +tui +penguin +bubble
+(A) Implement bubble bottom border rendering with tail notch support. +tui +penguin +bubble
+(A) Implement bubble tail rendering that visually points toward the penguin sprite. +tui +penguin +bubble
+(A) Use `textwrap::wrap` for all bubble text wrapping. +tui +penguin +bubble
+(A) Add bubble padding constants for left, right, top, and bottom content spacing. +tui +penguin +bubble
+(A) Add `max_bubble_width` clamping based on viewport width and optional config override. +tui +penguin +layout
+(A) Add fallback minimum bubble width to avoid malformed boxes on narrow terminals. +tui +penguin +layout
+(A) Create `codex-rs/tui/src/penguin_ui/layout.rs` to compute bubble and penguin positions. +tui +penguin +layout
+(A) Implement `auto` alignment mode that places bubble right of penguin when width permits. +tui +penguin +layout
+(A) Implement `stacked` alignment mode that places bubble above penguin in narrow layouts. +tui +penguin +layout
+(A) Implement `right` alignment mode forcing horizontal layout with clipping guards. +tui +penguin +layout
+(A) Ensure bubble tail x-position stays aligned to penguin head across all layout modes. +tui +penguin +layout
+(A) Ensure bubble baseline and penguin baseline remain stable between redraws to prevent jitter. +tui +penguin +layout
+(A) Add terminal-width guards to hide bubble and keep penguin visible when space is critically small. +tui +penguin +compat
+(A) Add Unicode fallback mode that keeps sprite eye glyph `■` while simplifying box borders when needed. +tui +penguin +compat
+(A) Add no-color rendering path for bubble and sprite. +tui +penguin +compat
+(A) Add `PenguinBubbleHistoryCell` in `codex-rs/tui/src/history_cell.rs`. +tui +history +penguin
+(A) Add `PenguinGreetingHistoryCell` in `codex-rs/tui/src/history_cell.rs` for startup text anchored to sprite. +tui +history +penguin
+(A) Extend `history_cell::new_session_info` to include optional penguin + bubble render context. +tui +history +penguin
+(A) Render penguin greeting bubble before first-session help lines when enabled. +tui +history +penguin
+(A) Keep existing first-session help lines unchanged under the penguin bubble block. +tui +history +compat
+(A) Skip penguin greeting insertion when `show_session_greeting` is false. +tui +history +penguin
+(A) Skip penguin onboarding insertion when `show_onboarding` is false. +tui +onboarding +penguin
+(A) Add `PenguinWelcomeWidget` support path in `codex-rs/tui/src/onboarding/welcome.rs`. +tui +onboarding +penguin
+(A) Replace onboarding animation area with static penguin + aligned greeting bubble when penguin UI is enabled. +tui +onboarding +penguin
+(A) Keep existing onboarding copy text unchanged inside the bubble body. +tui +onboarding +penguin
+(A) Ensure onboarding bubble wraps text to the current onboarding content area width. +tui +onboarding +layout
+(A) Add onboarding narrow-height fallback that renders sprite first and truncated bubble second. +tui +onboarding +compat
+(A) Create `PenguinMessageKind` enum with `Info`, `Warning`, `Error`, `Success`, and `Status`. +tui +penguin +state
+(A) Create `PenguinMessageBus` in `codex-rs/tui/src/penguin_ui/message_bus.rs` for routing UI messages to bubble cells. +tui +penguin +state
+(A) Add `penguin_message_bus` field to `ChatWidget` and initialize in constructors. +tui +chatwidget +penguin
+(A) Route `add_info_message` through `PenguinMessageBus` when `bubble_notifications` is enabled. +tui +chatwidget +penguin
+(A) Route warning events through `PenguinMessageBus` when `bubble_notifications` is enabled. +tui +chatwidget +penguin
+(A) Route error events through `PenguinMessageBus` when `bubble_notifications` is enabled. +tui +chatwidget +penguin
+(A) Route success/confirmation UI notices through `PenguinMessageBus` when `bubble_notifications` is enabled. +tui +chatwidget +penguin
+(A) Insert `PenguinBubbleHistoryCell` from bus events instead of plain text history cells when enabled. +tui +chatwidget +history
+(A) Preserve existing non-penguin history cell behavior when penguin UI is disabled. +tui +chatwidget +compat
+(A) Add status integration path so status header/details can be emitted as penguin bubble messages when `bubble_status` is enabled. +tui +status +penguin
+(A) Keep existing status indicator rendering enabled as fallback when `bubble_status` is disabled. +tui +status +compat
+(A) Prevent duplicate status content by suppressing plain status-line text insertion when a penguin status bubble is emitted. +tui +status +penguin
+(A) Add debouncing so repeated identical status text updates do not spam new penguin bubble cells. +tui +status +penguin
+(A) Add message coalescing for rapid MCP startup updates into a single updated bubble cell. +tui +chatwidget +penguin
+(A) Add message coalescing for repeated tool output progress summaries into bounded bubble updates. +tui +chatwidget +penguin
+(A) Add bubble priority rules so error/warning messages preempt status messages. +tui +penguin +state
+(A) Add deterministic ordering rules when multiple bubble messages arrive in one draw cycle. +tui +penguin +state
+(A) Add `/penguin` slash command in `codex-rs/tui/src/slash_command.rs`. +tui +slash +penguin
+(A) Add `/penguin on` and `/penguin off` command handling. +tui +slash +penguin
+(A) Add `/penguin bubble on` and `/penguin bubble off` command handling for notifications. +tui +slash +penguin
+(A) Add `/penguin status on` and `/penguin status off` command handling for status text routing. +tui +slash +penguin
+(A) Add `/penguin align auto|right|stacked` command handling. +tui +slash +penguin
+(A) Persist `/penguin` command updates through existing config edit plumbing. +tui +slash +config
+(A) Apply `/penguin` updates immediately without requiring app restart. +tui +slash +penguin
+(A) Add slash command feedback messages emitted as penguin bubbles when enabled. +tui +slash +history
+(A) Add unit tests for bubble wrapping with short, medium, and long messages. +tui +penguin +tests
+(A) Add unit tests for bubble tail alignment across `auto`, `right`, and `stacked` modes. +tui +penguin +tests
+(A) Add unit tests for layout fallback behavior in very narrow terminals. +tui +penguin +tests
+(A) Add unit tests for no-color rendering output. +tui +penguin +tests
+(A) Add unit tests for message priority and coalescing rules. +tui +penguin +tests
+(A) Add history snapshot test for session greeting with penguin bubble enabled. +tui +history +tests
+(A) Add history snapshot test for session greeting with penguin UI disabled. +tui +history +tests
+(A) Add history snapshot test for info notification rendered as penguin bubble. +tui +history +tests
+(A) Add history snapshot test for warning notification rendered as penguin bubble. +tui +history +tests
+(A) Add history snapshot test for error notification rendered as penguin bubble. +tui +history +tests
+(A) Add status snapshot test for penguin-routed status message. +tui +status +tests
+(A) Add onboarding snapshot test for static penguin plus aligned bubble. +tui +onboarding +tests
+(A) Add onboarding snapshot test for narrow layout stacked mode alignment. +tui +onboarding +tests
+(A) Add slash command tests for `/penguin on|off`. +tui +slash +tests
+(A) Add slash command tests for `/penguin bubble on|off`. +tui +slash +tests
+(A) Add slash command tests for `/penguin status on|off`. +tui +slash +tests
+(A) Add slash command tests for `/penguin align auto|right|stacked`. +tui +slash +tests
+(A) Add integration test ensuring `add_info_message` creates penguin bubble history cell when enabled. +tui +chatwidget +tests
+(A) Add integration test ensuring fallback plain message path when penguin UI is disabled. +tui +chatwidget +tests
+(A) Add integration test ensuring rapid status updates coalesce into bounded bubble cells. +tui +chatwidget +tests
+(A) Run `cargo test -p codex-tui` to update and validate snapshots. +tui +tests
+(A) Run `cargo insta pending-snapshots -p codex-tui` and review changes. +tui +tests
+(A) Accept intended snapshots with `cargo insta accept -p codex-tui`. +tui +tests
+(A) Run `just fmt` in `codex-rs` after Rust changes. +rust +fmt
+(A) Run `cargo test -p codex-tui` after formatting. +rust +tests

@@ -1403,6 +1403,46 @@ async fn together_leave(
     ctx: &mut ConnectionContext,
     req: JsonRpcRequest,
 ) -> JsonRpcResponse {
+    let leaving_email = ctx.email.clone();
+    let removed_member = if let Some(leaving_email) = leaving_email.clone() {
+        let mut guard = state.inner.lock().await;
+        guard.hosted.as_mut().and_then(|hosted| {
+            if leaving_email == hosted.owner_email {
+                return None;
+            }
+            hosted
+                .members
+                .remove(&leaving_email)
+                .then_some(leaving_email)
+        })
+    } else {
+        None
+    };
+
+    if let Some(email) = removed_member {
+        let server_id = {
+            let guard = state.inner.lock().await;
+            guard.hosted.as_ref().map(|hosted| hosted.server_id.clone())
+        };
+        if let Some(server_id) = server_id {
+            let now = Utc::now().timestamp();
+            if let Err(err) = state
+                .state_db
+                .upsert_together_member(&TogetherMemberRecord {
+                    server_id,
+                    email,
+                    role: StateTogetherRole::Member,
+                    added_at: now,
+                    removed_at: Some(now),
+                })
+                .await
+            {
+                error!(error = %err, "failed to persist together leave update");
+                return rpc_error(req.id, -32603, "failed to persist member leave");
+            }
+        }
+    }
+
     ctx.email = None;
     set_connection_email(state, connection_id, None).await;
 

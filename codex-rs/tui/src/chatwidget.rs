@@ -8481,6 +8481,7 @@ impl ChatWidget {
         } else {
             self.bottom_pane.show_view(view);
         }
+        self.request_redraw();
     }
 
     pub(crate) fn open_together_threads_view(&mut self) {

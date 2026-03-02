@@ -352,6 +352,7 @@ const DEFAULT_STATUS_LINE_ITEMS: [&str; 3] =
 const TOGETHER_DEFAULT_ENDPOINT_URL: &str = "ws://127.0.0.1:8788/ws";
 const TOGETHER_ENDPOINT_ENV_KEY: &str = "CODEX_TOGETHER_ENDPOINT";
 const TOGETHER_ENDPOINT_ALIASES_ENV_KEY: &str = "CODEX_TOGETHER_ENDPOINT_ALIASES";
+const TOGETHER_CHECKED_OUT_THREAD_ENV_KEY: &str = "CODEX_TOGETHER_CHECKED_OUT_THREAD";
 const TOGETHER_ACTOR_ENV_KEY: &str = "CODEX_TOGETHER_ACTOR";
 const NGROK_TUNNELS_API_URL: &str = "http://127.0.0.1:4040/api/tunnels";
 // Track information about an in-flight exec command.
@@ -8106,8 +8107,13 @@ impl ChatWidget {
     }
 
     pub(crate) fn open_together_history_view(&mut self) {
-        let Some(root_thread_id) = self.thread_id.map(|id| id.to_string()) else {
-            self.add_error_message("No active thread to load history from.".to_string());
+        let root_thread_id = current_together_checked_out_thread()
+            .or_else(|| self.thread_id.map(|id| id.to_string()));
+        let Some(root_thread_id) = root_thread_id else {
+            self.add_error_message(
+                "No together thread selected for /history. Use /threads and checkout first."
+                    .to_string(),
+            );
             return;
         };
 
@@ -8362,6 +8368,18 @@ impl ChatWidget {
                     }
                 }
                 Err(err) => {
+                    if together_thread_not_shared(&err) {
+                        clear_together_checked_out_thread();
+                        tx.send(AppEvent::InsertHistoryCell(Box::new(
+                            history_cell::new_info_event(
+                                "Your selected together thread is no longer shared.".to_string(),
+                                Some(
+                                    "Thread context was reset. Open /threads and checkout again."
+                                        .to_string(),
+                                ),
+                            ),
+                        )));
+                    }
                     tx.send(AppEvent::InsertHistoryCell(Box::new(
                         history_cell::new_error_event(format!("Together command failed: {err}")),
                     )));
@@ -8713,6 +8731,7 @@ async fn execute_together_command(
                     &existing.owner_email,
                     &existing.server_id,
                 )));
+                clear_together_checked_out_thread();
                 let connected = existing
                     .connected_members
                     .iter()
@@ -8767,6 +8786,7 @@ async fn execute_together_command(
                         &existing.owner_email,
                         &existing.server_id,
                     )));
+                    clear_together_checked_out_thread();
                     let connected = existing
                         .connected_members
                         .iter()
@@ -8803,6 +8823,7 @@ async fn execute_together_command(
                 "together host:{}",
                 short_server_id(&response.server_id)
             )));
+            clear_together_checked_out_thread();
 
             Ok(TogetherCommandOutput {
                 message: format!(
@@ -8826,6 +8847,7 @@ async fn execute_together_command(
                 .await;
             set_together_status(Some("disconnected".to_string()));
             clear_together_endpoint();
+            clear_together_checked_out_thread();
             if let Err(err) = close_result {
                 if !together_not_connected(&err) {
                     return Err(err);
@@ -8861,6 +8883,7 @@ async fn execute_together_command(
                 &response.owner_email,
                 &response.server_id,
             )));
+            clear_together_checked_out_thread();
             Ok(TogetherCommandOutput {
                 message: format!(
                     "Joined together server {}",
@@ -8883,6 +8906,7 @@ async fn execute_together_command(
                     .await;
             set_together_status(Some("disconnected".to_string()));
             clear_together_endpoint();
+            clear_together_checked_out_thread();
             if let Err(err) = leave_result {
                 if !together_not_connected(&err) {
                     return Err(err);
@@ -8901,6 +8925,7 @@ async fn execute_together_command(
             let thread_id = rest
                 .first()
                 .cloned()
+                .or_else(current_together_checked_out_thread)
                 .or(current_thread_id)
                 .ok_or_else(|| anyhow::anyhow!("usage: /share [thread-id]"))?;
             let endpoint = current_together_endpoint();
@@ -8913,6 +8938,7 @@ async fn execute_together_command(
                     },
                 )
                 .await?;
+            set_together_checked_out_thread(Some(response.thread_id.clone()));
             Ok(TogetherCommandOutput {
                 message: format!("Shared thread {}", response.thread_id),
                 hint: Some(format!(
@@ -8935,6 +8961,7 @@ async fn execute_together_command(
                     },
                 )
                 .await?;
+            set_together_checked_out_thread(Some(response.thread_id.clone()));
             let mode = if response.writable {
                 "writable"
             } else {
@@ -8998,6 +9025,10 @@ async fn execute_together_command(
                     },
                 )
                 .await?;
+            if current_together_checked_out_thread().as_deref() == Some(response.thread_id.as_str())
+            {
+                clear_together_checked_out_thread();
+            }
             Ok(TogetherCommandOutput {
                 message: format!("Deleted shared thread {}", response.thread_id),
                 hint: None,
@@ -9061,6 +9092,7 @@ async fn execute_together_command(
             })
         }
         "status" => {
+            let explicit_endpoint = rest.first().is_some();
             let endpoint = if let Some(raw) = rest.first() {
                 normalize_together_ws_endpoint(raw)?
             } else {
@@ -9077,6 +9109,9 @@ async fn execute_together_command(
                 &response.owner_email,
                 &response.server_id,
             )));
+            if explicit_endpoint {
+                clear_together_checked_out_thread();
+            }
             let connected = response
                 .connected_members
                 .iter()
@@ -9114,7 +9149,7 @@ pub(crate) async fn fork_thread_via_together(
 ) -> anyhow::Result<TogetherThreadForkResponse> {
     let endpoint = current_together_endpoint();
     let mut client = connect_and_auth(&endpoint).await?;
-    client
+    let response: TogetherThreadForkResponse = client
         .call(
             METHOD_TOGETHER_THREAD_FORK,
             TogetherThreadForkRequest {
@@ -9122,7 +9157,13 @@ pub(crate) async fn fork_thread_via_together(
                 cwd: Some(cwd.display().to_string()),
             },
         )
-        .await
+        .await?;
+    set_together_checked_out_thread(Some(response.child_thread_id.clone()));
+    Ok(response)
+}
+
+pub(crate) fn together_checked_out_thread_id() -> Option<String> {
+    current_together_checked_out_thread()
 }
 
 async fn fetch_together_thread_replay(
@@ -9168,6 +9209,12 @@ fn together_method_missing(err: &anyhow::Error) -> bool {
 fn together_not_connected(err: &anyhow::Error) -> bool {
     let text = err.to_string();
     text.contains("TOGETHER_NOT_CONNECTED")
+}
+
+fn together_thread_not_shared(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("thread not shared")
 }
 
 fn together_replay_events(messages: Vec<TogetherReplayMessage>) -> Vec<EventMsg> {
@@ -9638,6 +9685,13 @@ fn current_together_endpoint() -> String {
         .unwrap_or_else(|| TOGETHER_DEFAULT_ENDPOINT_URL.to_string())
 }
 
+fn current_together_checked_out_thread() -> Option<String> {
+    std::env::var(TOGETHER_CHECKED_OUT_THREAD_ENV_KEY)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn set_together_status(value: Option<String>) {
     unsafe {
         match value {
@@ -9656,8 +9710,21 @@ fn set_together_endpoint(value: Option<String>) {
     }
 }
 
+fn set_together_checked_out_thread(value: Option<String>) {
+    unsafe {
+        match value {
+            Some(value) => std::env::set_var(TOGETHER_CHECKED_OUT_THREAD_ENV_KEY, value),
+            None => std::env::remove_var(TOGETHER_CHECKED_OUT_THREAD_ENV_KEY),
+        }
+    }
+}
+
 fn clear_together_endpoint() {
     set_together_endpoint(None);
+}
+
+fn clear_together_checked_out_thread() {
+    set_together_checked_out_thread(None);
 }
 
 fn short_server_id(server_id: &str) -> String {

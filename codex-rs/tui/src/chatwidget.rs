@@ -374,22 +374,22 @@ struct HandshakeRow {
     right: &'static str,
 }
 
-const TOGETHER_JOIN_HANDSHAKE_VARIANTS: [[HandshakeRow; 3]; 5] = [
+const TOGETHER_JOIN_HANDSHAKE_VARIANTS: [[HandshakeRow; 3]; 4] = [
     [
         HandshakeRow {
             left: "\\(•.•)",
-            middle: " ",
-            right: "(•.•)/",
-        },
-        HandshakeRow {
-            left: "(  ",
-            middle: "|--|",
-            right: "  )",
-        },
-        HandshakeRow {
-            left: "/  \\",
             middle: "  ",
-            right: "/  \\",
+            right: "(•.•)/",
+        },
+        HandshakeRow {
+            left: " (   )",
+            middle: "--",
+            right: "(   )",
+        },
+        HandshakeRow {
+            left: " /   \\",
+            middle: "  ",
+            right: "/   \\",
         },
     ],
     [
@@ -399,36 +399,36 @@ const TOGETHER_JOIN_HANDSHAKE_VARIANTS: [[HandshakeRow; 3]; 5] = [
             right: "(•.•)/",
         },
         HandshakeRow {
-            left: ")  ",
+            left: " (   ",
             middle: "|---|",
-            right: "  (",
+            right: "   )",
         },
         HandshakeRow {
-            left: "/  \\",
+            left: " /   \\",
             middle: "   ",
-            right: "/  \\",
+            right: "/   \\",
         },
     ],
     [
         HandshakeRow {
-            left: "(•.•)",
-            middle: " ",
+            left: " (•.•)",
+            middle: "  ",
             right: "(•.•)",
         },
         HandshakeRow {
             left: "<)   )",
-            middle: ">",
-            right: "(  )|",
+            middle: "\\/",
+            right: "(   (>",
         },
         HandshakeRow {
-            left: "/   \\",
-            middle: " ",
-            right: "/  \\",
+            left: " /   \\",
+            middle: "  ",
+            right: "/   \\",
         },
     ],
     [
         HandshakeRow {
-            left: "(•.•)",
+            left: " (•.•)",
             middle: "     ",
             right: "(•.•)",
         },
@@ -438,25 +438,8 @@ const TOGETHER_JOIN_HANDSHAKE_VARIANTS: [[HandshakeRow; 3]; 5] = [
             right: "(   )>",
         },
         HandshakeRow {
-            left: "/   \\",
+            left: " /   \\",
             middle: "     ",
-            right: "/   \\",
-        },
-    ],
-    [
-        HandshakeRow {
-            left: "(•.•)",
-            middle: "   ",
-            right: "(•.•)",
-        },
-        HandshakeRow {
-            left: "<)   )",
-            middle: "\\ /",
-            right: "(   )>",
-        },
-        HandshakeRow {
-            left: "/   \\",
-            middle: "   ",
             right: "/   \\",
         },
     ],

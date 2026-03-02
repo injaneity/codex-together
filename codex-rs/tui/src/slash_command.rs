@@ -134,6 +134,7 @@ impl SlashCommand {
             SlashCommand::Review
                 | SlashCommand::Rename
                 | SlashCommand::Plan
+                | SlashCommand::Together
                 | SlashCommand::Join
                 | SlashCommand::Share
                 | SlashCommand::SandboxReadRoot

@@ -18,6 +18,7 @@ use codex_protocol::protocol::Event;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_together_protocol::TogetherHistoryLineageResponse;
 use codex_together_protocol::TogetherReplayMessage;
+use codex_together_protocol::TogetherServerInfoResponse;
 use codex_together_protocol::TogetherThreadSummary;
 use codex_utils_approval_presets::ApprovalPreset;
 
@@ -423,6 +424,11 @@ pub(crate) enum AppEvent {
     /// Open an interactive lineage list for together history operations.
     OpenTogetherHistoryView {
         lineage: TogetherHistoryLineageResponse,
+    },
+
+    /// Open Together Center with the latest server info (if connected).
+    OpenTogetherCenterView {
+        server_info: Option<TogetherServerInfoResponse>,
     },
 
     /// Dismiss the currently active bottom-pane modal/popup view, if any.

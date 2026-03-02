@@ -3186,6 +3186,9 @@ impl App {
             AppEvent::OpenTogetherHistoryView { lineage } => {
                 self.chat_widget.show_together_history_view(lineage);
             }
+            AppEvent::OpenTogetherCenterView { server_info } => {
+                self.chat_widget.show_together_center_view(server_info);
+            }
             AppEvent::DismissBottomPaneView => {
                 self.chat_widget.dismiss_active_bottom_pane_view();
             }

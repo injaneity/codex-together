@@ -220,6 +220,9 @@ use crate::bottom_pane::QUIT_SHORTCUT_TIMEOUT;
 use crate::bottom_pane::SelectionAction;
 use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
+use crate::bottom_pane::TogetherCenterView;
+use crate::bottom_pane::TogetherCenterViewParams;
+use crate::bottom_pane::TogetherPresenceState;
 use crate::bottom_pane::custom_prompt_view::CustomPromptView;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::clipboard_paste::paste_image_to_temp_png;
@@ -354,6 +357,11 @@ const TOGETHER_ENDPOINT_ENV_KEY: &str = "CODEX_TOGETHER_ENDPOINT";
 const TOGETHER_ENDPOINT_ALIASES_ENV_KEY: &str = "CODEX_TOGETHER_ENDPOINT_ALIASES";
 const TOGETHER_CHECKED_OUT_THREAD_ENV_KEY: &str = "CODEX_TOGETHER_CHECKED_OUT_THREAD";
 const TOGETHER_ACTOR_ENV_KEY: &str = "CODEX_TOGETHER_ACTOR";
+const TOGETHER_MASCOT_ENABLED_ENV_KEY: &str = "CODEX_TOGETHER_MASCOT_ENABLED";
+const TOGETHER_MASCOT_MOTION_ENV_KEY: &str = "CODEX_TOGETHER_MASCOT_MOTION";
+const TOGETHER_MASCOT_LABELS_ENV_KEY: &str = "CODEX_TOGETHER_MASCOT_LABELS";
+const MAX_VISIBLE_CREW: usize = 5;
+const MASK_EMAIL_LABELS_BY_DEFAULT: bool = true;
 const NGROK_TUNNELS_API_URL: &str = "http://127.0.0.1:4040/api/tunnels";
 // Track information about an in-flight exec command.
 struct RunningCommand {
@@ -739,6 +747,8 @@ pub(crate) struct ChatWidget {
     status_line_branch_lookup_complete: bool,
     external_editor_state: ExternalEditorState,
     realtime_conversation: RealtimeConversationUiState,
+    together_member_emails: HashSet<String>,
+    together_presence_seen_once: bool,
     last_rendered_user_message_event: Option<RenderedUserMessageEvent>,
 }
 
@@ -2963,6 +2973,8 @@ impl ChatWidget {
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
             realtime_conversation: RealtimeConversationUiState::default(),
+            together_member_emails: HashSet::new(),
+            together_presence_seen_once: false,
             last_rendered_user_message_event: None,
         };
 
@@ -3142,6 +3154,8 @@ impl ChatWidget {
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
             realtime_conversation: RealtimeConversationUiState::default(),
+            together_member_emails: HashSet::new(),
+            together_presence_seen_once: false,
             last_rendered_user_message_event: None,
         };
 
@@ -3310,6 +3324,8 @@ impl ChatWidget {
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
             realtime_conversation: RealtimeConversationUiState::default(),
+            together_member_emails: HashSet::new(),
+            together_presence_seen_once: false,
             last_rendered_user_message_event: None,
         };
 
@@ -3734,11 +3750,7 @@ impl ChatWidget {
                     );
                     return;
                 }
-                let connected = together_status_is_connected();
-                self.add_info_message(
-                    "Codex Together".to_string(),
-                    Some(together_overview_hint(connected)),
-                );
+                self.open_together_center_view();
             }
             SlashCommand::Agent => {
                 self.app_event_tx.send(AppEvent::OpenAgentPicker);
@@ -4106,6 +4118,22 @@ impl ChatWidget {
                     return;
                 };
                 self.run_together_command(format!("share {prepared_args}"));
+                self.bottom_pane.drain_pending_submission_state();
+            }
+            SlashCommand::Together if !trimmed.is_empty() => {
+                if !self.together_enabled() {
+                    self.add_info_message(
+                        "Codex Together is disabled.".to_string(),
+                        Some("Enable the together feature in /experimental first.".to_string()),
+                    );
+                    return;
+                }
+                let Some((prepared_args, _prepared_elements)) =
+                    self.bottom_pane.prepare_inline_args_submission(false)
+                else {
+                    return;
+                };
+                self.run_together_command(prepared_args);
                 self.bottom_pane.drain_pending_submission_state();
             }
             _ => self.dispatch_command(cmd),
@@ -8069,6 +8097,114 @@ impl ChatWidget {
         self.bottom_pane.show_view(Box::new(view));
     }
 
+    pub(crate) fn open_together_center_view(&mut self) {
+        if !together_status_is_connected() {
+            self.show_together_center_view(None);
+            return;
+        }
+
+        let endpoint = current_together_endpoint();
+        let tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let response = async {
+                let mut client = connect_and_auth(&endpoint).await?;
+                let response: TogetherServerInfoResponse = client
+                    .call(METHOD_TOGETHER_SERVER_INFO, serde_json::json!({}))
+                    .await?;
+                Ok::<TogetherServerInfoResponse, anyhow::Error>(response)
+            }
+            .await;
+
+            match response {
+                Ok(server_info) => {
+                    tx.send(AppEvent::OpenTogetherCenterView {
+                        server_info: Some(server_info),
+                    });
+                }
+                Err(err) => {
+                    tx.send(AppEvent::InsertHistoryCell(Box::new(
+                        history_cell::new_error_event(format!(
+                            "Failed to load Together Center: {err}"
+                        )),
+                    )));
+                    tx.send(AppEvent::OpenTogetherCenterView { server_info: None });
+                }
+            }
+        });
+    }
+
+    pub(crate) fn show_together_center_view(
+        &mut self,
+        server_info: Option<TogetherServerInfoResponse>,
+    ) {
+        let mascot_enabled = together_mascot_enabled();
+        let motion_enabled = together_mascot_motion_enabled();
+        let mask_email_labels = together_mascot_masked_labels();
+
+        let (state, owner_email, endpoint, connected_members) = if let Some(info) = server_info {
+            (
+                TogetherPresenceState::Connected,
+                Some(info.owner_email),
+                Some(info.public_base_url),
+                info.connected_members,
+            )
+        } else {
+            (
+                TogetherPresenceState::Disconnected,
+                None,
+                Some(current_together_endpoint()),
+                Vec::new(),
+            )
+        };
+
+        let current_member_emails: HashSet<String> = connected_members
+            .iter()
+            .map(|member| member.email.clone())
+            .collect();
+        if self.together_presence_seen_once {
+            let mut joined: Vec<String> = current_member_emails
+                .difference(&self.together_member_emails)
+                .cloned()
+                .collect();
+            let mut left: Vec<String> = self
+                .together_member_emails
+                .difference(&current_member_emails)
+                .cloned()
+                .collect();
+            joined.sort();
+            left.sort();
+
+            for email in joined {
+                self.add_info_message(
+                    format!("join: {email}"),
+                    Some("Crew member landed in Together Center.".to_string()),
+                );
+            }
+            for email in left {
+                self.add_info_message(
+                    format!("leave: {email}"),
+                    Some("Crew member stepped out of Together Center.".to_string()),
+                );
+            }
+        } else {
+            self.together_presence_seen_once = true;
+        }
+        self.together_member_emails = current_member_emails;
+
+        let params = TogetherCenterViewParams {
+            state,
+            owner_email,
+            endpoint,
+            connected_members,
+            max_visible: MAX_VISIBLE_CREW,
+            mask_email_labels,
+            mascot_enabled,
+            motion_enabled,
+        };
+        self.bottom_pane
+            .show_view(Box::new(TogetherCenterView::new(params)));
+    }
+
     pub(crate) fn open_together_threads_view(&mut self) {
         let tx = self.app_event_tx.clone();
         tokio::spawn(async move {
@@ -8711,6 +8847,82 @@ async fn execute_together_command(
             message: "Codex Together commands".to_string(),
             hint: Some(together_usage_hint()),
         }),
+        "mascot" => match rest {
+            [] => {
+                let enabled = if together_mascot_enabled() {
+                    "on"
+                } else {
+                    "off"
+                };
+                let motion = if together_mascot_motion_enabled() {
+                    "on"
+                } else {
+                    "off"
+                };
+                let labels = if together_mascot_masked_labels() {
+                    "masked"
+                } else {
+                    "full"
+                };
+                Ok(TogetherCommandOutput {
+                    message: "Together mascot settings".to_string(),
+                    hint: Some(format!(
+                        "mascot: {enabled}\nmotion: {motion}\nlabels: {labels}\n\nControls:\n/together mascot on|off\n/together mascot motion on|off\n/together mascot labels masked|full"
+                    )),
+                })
+            }
+            [value] if value.eq_ignore_ascii_case("on") => {
+                set_together_mascot_enabled(true);
+                Ok(TogetherCommandOutput {
+                    message: "Together mascot enabled.".to_string(),
+                    hint: Some("Crew sprites are visible in Together Center.".to_string()),
+                })
+            }
+            [value] if value.eq_ignore_ascii_case("off") => {
+                set_together_mascot_enabled(false);
+                Ok(TogetherCommandOutput {
+                    message: "Together mascot disabled.".to_string(),
+                    hint: Some("Together Center now shows text-only roster rows.".to_string()),
+                })
+            }
+            [mode, value] if mode.eq_ignore_ascii_case("motion") => {
+                if value.eq_ignore_ascii_case("on") {
+                    set_together_mascot_motion_enabled(true);
+                    return Ok(TogetherCommandOutput {
+                        message: "Together mascot motion enabled.".to_string(),
+                        hint: Some("Animation effects can run when supported.".to_string()),
+                    });
+                }
+                if value.eq_ignore_ascii_case("off") {
+                    set_together_mascot_motion_enabled(false);
+                    return Ok(TogetherCommandOutput {
+                        message: "Together mascot motion disabled.".to_string(),
+                        hint: Some("Mascot rendering uses static posture.".to_string()),
+                    });
+                }
+                anyhow::bail!("usage: /together mascot motion on|off");
+            }
+            [mode, value] if mode.eq_ignore_ascii_case("labels") => {
+                if value.eq_ignore_ascii_case("masked") {
+                    set_together_mascot_label_mode(true);
+                    return Ok(TogetherCommandOutput {
+                        message: "Together mascot labels set to masked.".to_string(),
+                        hint: Some("Default privacy-friendly label mode restored.".to_string()),
+                    });
+                }
+                if value.eq_ignore_ascii_case("full") {
+                    set_together_mascot_label_mode(false);
+                    return Ok(TogetherCommandOutput {
+                        message: "Together mascot labels set to full.".to_string(),
+                        hint: Some("Crew labels now render full email addresses.".to_string()),
+                    });
+                }
+                anyhow::bail!("usage: /together mascot labels masked|full");
+            }
+            _ => anyhow::bail!(
+                "usage: /together mascot on|off\n       /together mascot motion on|off\n       /together mascot labels masked|full"
+            ),
+        },
         "create" => {
             if !rest.is_empty() {
                 anyhow::bail!("usage: /host");
@@ -9760,30 +9972,45 @@ fn together_status_is_host() -> bool {
     together_status_value().contains("host:")
 }
 
-fn together_overview_hint(connected: bool) -> String {
-    if connected {
-        [
-            "Codex-Together lets collaborators branch conversations safely.",
-            "Available now:",
-            "/status  show current connection",
-            "/share   share current thread",
-            "/threads browse shared threads (Enter checkout, f fork, d delete-owner)",
-            "/history browse lazygit-style worktree for current thread",
-            "/fork    fork your current session",
-            "/join    switch/join another app server",
-            "/exit    leave current app server (run again to exit Codex)",
-        ]
-        .join("\n")
-    } else {
-        [
-            "Codex-Together lets collaborators branch conversations safely.",
-            "Available now:",
-            "/join    connect to an app server",
-            "/status  show connection state",
-            "/fork    fork your current session",
-            "/exit    exit Codex",
-        ]
-        .join("\n")
+fn together_mascot_enabled() -> bool {
+    std::env::var(TOGETHER_MASCOT_ENABLED_ENV_KEY)
+        .ok()
+        .map(|value| value.trim().eq_ignore_ascii_case("on"))
+        .unwrap_or(true)
+}
+
+fn together_mascot_motion_enabled() -> bool {
+    std::env::var(TOGETHER_MASCOT_MOTION_ENV_KEY)
+        .ok()
+        .map(|value| value.trim().eq_ignore_ascii_case("on"))
+        .unwrap_or(true)
+}
+
+fn together_mascot_masked_labels() -> bool {
+    std::env::var(TOGETHER_MASCOT_LABELS_ENV_KEY)
+        .ok()
+        .map(|value| !value.trim().eq_ignore_ascii_case("full"))
+        .unwrap_or(MASK_EMAIL_LABELS_BY_DEFAULT)
+}
+
+fn set_together_mascot_enabled(enabled: bool) {
+    let value = if enabled { "on" } else { "off" };
+    unsafe {
+        std::env::set_var(TOGETHER_MASCOT_ENABLED_ENV_KEY, value);
+    }
+}
+
+fn set_together_mascot_motion_enabled(enabled: bool) {
+    let value = if enabled { "on" } else { "off" };
+    unsafe {
+        std::env::set_var(TOGETHER_MASCOT_MOTION_ENV_KEY, value);
+    }
+}
+
+fn set_together_mascot_label_mode(masked: bool) {
+    let value = if masked { "masked" } else { "full" };
+    unsafe {
+        std::env::set_var(TOGETHER_MASCOT_LABELS_ENV_KEY, value);
     }
 }
 
@@ -9806,6 +10033,9 @@ fn together_usage_hint() -> String {
         "/status",
         "/exit",
         "/together",
+        "/together mascot on|off",
+        "/together mascot motion on|off",
+        "/together mascot labels masked|full",
     ]
     .join("\n")
 }

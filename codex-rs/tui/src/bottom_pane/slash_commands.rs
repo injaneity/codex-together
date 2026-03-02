@@ -94,6 +94,31 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
+    struct TogetherStatusGuard {
+        previous: Option<String>,
+    }
+
+    impl TogetherStatusGuard {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var("CODEX_TOGETHER_STATUS").ok();
+            unsafe {
+                std::env::set_var("CODEX_TOGETHER_STATUS", value);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for TogetherStatusGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("CODEX_TOGETHER_STATUS", value),
+                    None => std::env::remove_var("CODEX_TOGETHER_STATUS"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn debug_command_still_resolves_for_dispatch() {
         let cmd = find_builtin_command("debug-config", true, true, true, false, false, false);
@@ -134,9 +159,7 @@ mod tests {
 
     #[test]
     fn threads_hidden_when_disconnected() {
-        unsafe {
-            std::env::set_var("CODEX_TOGETHER_STATUS", "disconnected");
-        }
+        let _guard = TogetherStatusGuard::set("disconnected");
         assert_eq!(
             find_builtin_command("threads", true, true, true, false, true, false),
             None
@@ -145,9 +168,7 @@ mod tests {
 
     #[test]
     fn threads_visible_when_connected() {
-        unsafe {
-            std::env::set_var("CODEX_TOGETHER_STATUS", "together @owner@local");
-        }
+        let _guard = TogetherStatusGuard::set("together @owner@local");
         assert_eq!(
             find_builtin_command("threads", true, true, true, false, true, false),
             Some(SlashCommand::Threads)
@@ -156,9 +177,7 @@ mod tests {
 
     #[test]
     fn host_visible_when_disconnected() {
-        unsafe {
-            std::env::set_var("CODEX_TOGETHER_STATUS", "disconnected");
-        }
+        let _guard = TogetherStatusGuard::set("disconnected");
         assert_eq!(
             find_builtin_command("host", true, true, true, false, true, false),
             Some(SlashCommand::Host)
@@ -167,9 +186,7 @@ mod tests {
 
     #[test]
     fn host_hidden_when_connected() {
-        unsafe {
-            std::env::set_var("CODEX_TOGETHER_STATUS", "together @owner@local");
-        }
+        let _guard = TogetherStatusGuard::set("together @owner@local");
         assert_eq!(
             find_builtin_command("host", true, true, true, false, true, false),
             None
@@ -178,9 +195,7 @@ mod tests {
 
     #[test]
     fn share_hidden_when_disconnected() {
-        unsafe {
-            std::env::set_var("CODEX_TOGETHER_STATUS", "disconnected");
-        }
+        let _guard = TogetherStatusGuard::set("disconnected");
         assert_eq!(
             find_builtin_command("share", true, true, true, false, true, false),
             None
@@ -189,9 +204,7 @@ mod tests {
 
     #[test]
     fn share_visible_when_connected() {
-        unsafe {
-            std::env::set_var("CODEX_TOGETHER_STATUS", "together @owner@local");
-        }
+        let _guard = TogetherStatusGuard::set("together @owner@local");
         assert_eq!(
             find_builtin_command("share", true, true, true, false, true, false),
             Some(SlashCommand::Share)

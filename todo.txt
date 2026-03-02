@@ -1,97 +1,106 @@
-(A) Add `PenguinUiConfig` under `Tui` in `codex-rs/core/src/config/types.rs` with `enabled: bool` default `true`. +config +core +penguin
-(A) Add `PenguinUiConfig.show_onboarding: bool` default `true`. +config +core +penguin
-(A) Add `PenguinUiConfig.show_session_greeting: bool` default `true`. +config +core +penguin
-(A) Add `PenguinUiConfig.bubble_notifications: bool` default `true`. +config +core +penguin
-(A) Add `PenguinUiConfig.bubble_status: bool` default `true`. +config +core +penguin
-(A) Add `PenguinUiConfig.max_bubble_width: Option<u16>` for user overrides. +config +core +penguin
-(A) Add `PenguinUiConfig.align_mode: Option<String>` supporting `auto`, `right`, and `stacked`. +config +core +penguin
-(A) Thread `tui.penguin_ui` through config parsing in `codex-rs/core/src/config/mod.rs`. +config +core +penguin
-(A) Thread resolved `penguin_ui` into runtime `Config` in `codex-rs/core/src/config/mod.rs`. +config +core +penguin
-(A) Add config tests for `tui.penguin_ui.enabled` parsing and defaults. +config +core +tests
-(A) Add config tests for `tui.penguin_ui.bubble_notifications` parsing and defaults. +config +core +tests
-(A) Add config tests for `tui.penguin_ui.align_mode` invalid value rejection. +config +core +tests
+(A) Add `TogetherMascotUiConfig` under `Tui` in `codex-rs/core/src/config/types.rs` with `enabled: bool` default `true`. +config +core +together +mascot
+(A) Add `TogetherMascotUiConfig.max_visible: u8` default `5`. +config +core +together +mascot
+(A) Add `TogetherMascotUiConfig.show_overflow_counter: bool` default `true` for `+N more`. +config +core +together +mascot
+(A) Add `TogetherMascotUiConfig.show_email_labels: bool` default `true`. +config +core +together +mascot
+(A) Add `TogetherMascotUiConfig.mask_email_labels: bool` default `true` (masked by default). +config +core +together +mascot
+(A) Add `TogetherMascotUiConfig.landing_animation: bool` default `true`. +config +core +together +mascot
+(A) Add `TogetherMascotUiConfig.landing_frame_ms: u16` default `90`. +config +core +together +mascot
+(A) Add `TogetherMascotUiConfig.reduced_motion: bool` default `false` to disable non-essential mascot animation. +config +core +together +mascot +a11y
+(A) Add `TogetherMascotUiConfig.render_mode: Option<String>` supporting `unicode` and `ascii`. +config +core +together +mascot
+(A) Thread `tui.together_mascot_ui` through config parsing in `codex-rs/core/src/config/mod.rs`. +config +core +together +mascot
+(A) Thread resolved `together_mascot_ui` into runtime `Config` in `codex-rs/core/src/config/mod.rs`. +config +core +together +mascot
+(A) Add config tests for defaults and invalid `render_mode` rejection. +config +core +tests
 (A) Run `just write-config-schema` after config changes. +config +schema
-(A) Add `penguin_ui` module export in `codex-rs/tui/src/lib.rs`. +tui +penguin
-(A) Create `codex-rs/tui/src/penguin_ui/mod.rs` exporting sprite, bubble, and layout helpers. +tui +penguin
-(A) Create `codex-rs/tui/src/penguin_ui/sprite.rs` with the fixed static sprite exactly matching the approved art. +tui +penguin +assets
-(A) Store the sprite as a canonical 4-line constant in `sprite.rs` for reuse across views. +tui +penguin +assets
-(A) Create `codex-rs/tui/src/penguin_ui/bubble.rs` to render speech boxes with wrapped text. +tui +penguin +bubble
-(A) Implement bubble top border rendering with rounded ASCII/Unicode-safe corners. +tui +penguin +bubble
-(A) Implement bubble body rendering with left and right borders per wrapped line. +tui +penguin +bubble
-(A) Implement bubble bottom border rendering with tail notch support. +tui +penguin +bubble
-(A) Implement bubble tail rendering that visually points toward the penguin sprite. +tui +penguin +bubble
-(A) Use `textwrap::wrap` for all bubble text wrapping. +tui +penguin +bubble
-(A) Add bubble padding constants for left, right, top, and bottom content spacing. +tui +penguin +bubble
-(A) Add `max_bubble_width` clamping based on viewport width and optional config override. +tui +penguin +layout
-(A) Add fallback minimum bubble width to avoid malformed boxes on narrow terminals. +tui +penguin +layout
-(A) Create `codex-rs/tui/src/penguin_ui/layout.rs` to compute bubble and penguin positions. +tui +penguin +layout
-(A) Implement `auto` alignment mode that places bubble right of penguin when width permits. +tui +penguin +layout
-(A) Implement `stacked` alignment mode that places bubble above penguin in narrow layouts. +tui +penguin +layout
-(A) Implement `right` alignment mode forcing horizontal layout with clipping guards. +tui +penguin +layout
-(A) Ensure bubble tail x-position stays aligned to penguin head across all layout modes. +tui +penguin +layout
-(A) Ensure bubble baseline and penguin baseline remain stable between redraws to prevent jitter. +tui +penguin +layout
-(A) Add terminal-width guards to hide bubble and keep penguin visible when space is critically small. +tui +penguin +compat
-(A) Add Unicode fallback mode that keeps sprite eye glyph `■` while simplifying box borders when needed. +tui +penguin +compat
-(A) Add no-color rendering path for bubble and sprite. +tui +penguin +compat
-(A) Add `PenguinBubbleHistoryCell` in `codex-rs/tui/src/history_cell.rs`. +tui +history +penguin
-(A) Add `PenguinGreetingHistoryCell` in `codex-rs/tui/src/history_cell.rs` for startup text anchored to sprite. +tui +history +penguin
-(A) Extend `history_cell::new_session_info` to include optional penguin + bubble render context. +tui +history +penguin
-(A) Render penguin greeting bubble before first-session help lines when enabled. +tui +history +penguin
-(A) Keep existing first-session help lines unchanged under the penguin bubble block. +tui +history +compat
-(A) Skip penguin greeting insertion when `show_session_greeting` is false. +tui +history +penguin
-(A) Skip penguin onboarding insertion when `show_onboarding` is false. +tui +onboarding +penguin
-(A) Add `PenguinWelcomeWidget` support path in `codex-rs/tui/src/onboarding/welcome.rs`. +tui +onboarding +penguin
-(A) Replace onboarding animation area with static penguin + aligned greeting bubble when penguin UI is enabled. +tui +onboarding +penguin
-(A) Keep existing onboarding copy text unchanged inside the bubble body. +tui +onboarding +penguin
-(A) Ensure onboarding bubble wraps text to the current onboarding content area width. +tui +onboarding +layout
-(A) Add onboarding narrow-height fallback that renders sprite first and truncated bubble second. +tui +onboarding +compat
-(A) Create `PenguinMessageKind` enum with `Info`, `Warning`, `Error`, `Success`, and `Status`. +tui +penguin +state
-(A) Create `PenguinMessageBus` in `codex-rs/tui/src/penguin_ui/message_bus.rs` for routing UI messages to bubble cells. +tui +penguin +state
-(A) Add `penguin_message_bus` field to `ChatWidget` and initialize in constructors. +tui +chatwidget +penguin
-(A) Route `add_info_message` through `PenguinMessageBus` when `bubble_notifications` is enabled. +tui +chatwidget +penguin
-(A) Route warning events through `PenguinMessageBus` when `bubble_notifications` is enabled. +tui +chatwidget +penguin
-(A) Route error events through `PenguinMessageBus` when `bubble_notifications` is enabled. +tui +chatwidget +penguin
-(A) Route success/confirmation UI notices through `PenguinMessageBus` when `bubble_notifications` is enabled. +tui +chatwidget +penguin
-(A) Insert `PenguinBubbleHistoryCell` from bus events instead of plain text history cells when enabled. +tui +chatwidget +history
-(A) Preserve existing non-penguin history cell behavior when penguin UI is disabled. +tui +chatwidget +compat
-(A) Add status integration path so status header/details can be emitted as penguin bubble messages when `bubble_status` is enabled. +tui +status +penguin
-(A) Keep existing status indicator rendering enabled as fallback when `bubble_status` is disabled. +tui +status +compat
-(A) Prevent duplicate status content by suppressing plain status-line text insertion when a penguin status bubble is emitted. +tui +status +penguin
-(A) Add debouncing so repeated identical status text updates do not spam new penguin bubble cells. +tui +status +penguin
-(A) Add message coalescing for rapid MCP startup updates into a single updated bubble cell. +tui +chatwidget +penguin
-(A) Add message coalescing for repeated tool output progress summaries into bounded bubble updates. +tui +chatwidget +penguin
-(A) Add bubble priority rules so error/warning messages preempt status messages. +tui +penguin +state
-(A) Add deterministic ordering rules when multiple bubble messages arrive in one draw cycle. +tui +penguin +state
-(A) Add `/penguin` slash command in `codex-rs/tui/src/slash_command.rs`. +tui +slash +penguin
-(A) Add `/penguin on` and `/penguin off` command handling. +tui +slash +penguin
-(A) Add `/penguin bubble on` and `/penguin bubble off` command handling for notifications. +tui +slash +penguin
-(A) Add `/penguin status on` and `/penguin status off` command handling for status text routing. +tui +slash +penguin
-(A) Add `/penguin align auto|right|stacked` command handling. +tui +slash +penguin
-(A) Persist `/penguin` command updates through existing config edit plumbing. +tui +slash +config
-(A) Apply `/penguin` updates immediately without requiring app restart. +tui +slash +penguin
-(A) Add slash command feedback messages emitted as penguin bubbles when enabled. +tui +slash +history
-(A) Add unit tests for bubble wrapping with short, medium, and long messages. +tui +penguin +tests
-(A) Add unit tests for bubble tail alignment across `auto`, `right`, and `stacked` modes. +tui +penguin +tests
-(A) Add unit tests for layout fallback behavior in very narrow terminals. +tui +penguin +tests
-(A) Add unit tests for no-color rendering output. +tui +penguin +tests
-(A) Add unit tests for message priority and coalescing rules. +tui +penguin +tests
-(A) Add history snapshot test for session greeting with penguin bubble enabled. +tui +history +tests
-(A) Add history snapshot test for session greeting with penguin UI disabled. +tui +history +tests
-(A) Add history snapshot test for info notification rendered as penguin bubble. +tui +history +tests
-(A) Add history snapshot test for warning notification rendered as penguin bubble. +tui +history +tests
-(A) Add history snapshot test for error notification rendered as penguin bubble. +tui +history +tests
-(A) Add status snapshot test for penguin-routed status message. +tui +status +tests
-(A) Add onboarding snapshot test for static penguin plus aligned bubble. +tui +onboarding +tests
-(A) Add onboarding snapshot test for narrow layout stacked mode alignment. +tui +onboarding +tests
-(A) Add slash command tests for `/penguin on|off`. +tui +slash +tests
-(A) Add slash command tests for `/penguin bubble on|off`. +tui +slash +tests
-(A) Add slash command tests for `/penguin status on|off`. +tui +slash +tests
-(A) Add slash command tests for `/penguin align auto|right|stacked`. +tui +slash +tests
-(A) Add integration test ensuring `add_info_message` creates penguin bubble history cell when enabled. +tui +chatwidget +tests
-(A) Add integration test ensuring fallback plain message path when penguin UI is disabled. +tui +chatwidget +tests
-(A) Add integration test ensuring rapid status updates coalesce into bounded bubble cells. +tui +chatwidget +tests
-(A) Run `cargo test -p codex-tui` to update and validate snapshots. +tui +tests
-(A) Run `cargo insta pending-snapshots -p codex-tui` and review changes. +tui +tests
-(A) Accept intended snapshots with `cargo insta accept -p codex-tui`. +tui +tests
+
+(A) Add `together_mascot` module export in `codex-rs/tui/src/lib.rs`. +tui +together +mascot
+(A) Create `codex-rs/tui/src/together_mascot/mod.rs` exporting sprite, roster, and animation helpers. +tui +together +mascot
+(A) Create `codex-rs/tui/src/together_mascot/sprite.rs` with 5 canonical generic crew sprite variants. +tui +together +mascot +assets
+(A) Implement sprite rendering with TUI text + Unicode blocks only (no image assets). +tui +together +mascot +assets
+(A) Add ASCII fallback sprite set for non-Unicode terminals. +tui +together +mascot +compat
+(A) Add helper for deterministic slot style assignment by sorted member order. +tui +together +mascot +layout
+(A) Add helper to derive compact email labels (e.g. local-part trim + width clamp). +tui +together +mascot +labels
+(A) Add helper to mask email labels by default while preserving differentiability. +tui +together +mascot +labels
+(A) Add label collision rules: detect duplicate rendered labels in one roster and resolve with deterministic numeric suffixes. +tui +together +mascot +labels
+(A) Add secondary collision fallback: append short stable hash fragment when suffixing would overflow width. +tui +together +mascot +labels
+(A) Add label width clamp rules that preserve collision suffix/hash readability under narrow width. +tui +together +mascot +labels
+
+(A) Create `codex-rs/tui/src/together_mascot/animation.rs` with landing animation frame model. +tui +together +mascot +animation
+(A) Define landing sequence frames from off-screen entry to grounded idle stance. +tui +together +mascot +animation
+(A) Define leave sequence as a deterministic step-out animation for departing members. +tui +together +mascot +animation
+(A) Add per-slot animation state machine (`Idle`, `Landing`). +tui +together +mascot +animation
+(A) Extend per-slot animation state machine with `SteppingOut` for member leave behavior. +tui +together +mascot +animation
+(A) Add frame-tick advancement by elapsed time using `landing_frame_ms`. +tui +together +mascot +animation
+(A) Ensure new member arrivals trigger landing animation only once per join event. +tui +together +mascot +animation
+(A) Ensure member departures trigger step-out only once per leave/removal event. +tui +together +mascot +animation
+(A) Keep existing members stable (no re-landing) when roster order changes. +tui +together +mascot +animation
+(A) Honor `reduced_motion` by skipping landing/step-out animation and rendering direct state transitions. +tui +together +mascot +animation +a11y
+
+(A) Add `TogetherPresenceSnapshot` model in TUI runtime for connected members + role metadata. +tui +together +state
+(A) Add mapping from together server `connected_members` to mascot roster rows. +tui +together +state
+(A) Cap visible mascots at `5`; compute overflow count as `+N more`. +tui +together +state
+(A) Keep deterministic display ordering to minimize visual churn across refreshes. +tui +together +state
+(A) Differentiate users by email label while keeping mascot body generic. +tui +together +state
+
+(A) Add `AppEvent::TogetherPresenceUpdated` carrying latest connected members snapshot. +tui +together +events
+(A) Add lightweight together presence refresh call (`together/server/info`) after `/host`, `/join`, `/status`, `/leave`, `/close`. +tui +together +events
+(A) Create background Together presence monitor task with authenticated websocket client. +tui +together +events
+(A) Handle notifications `together/memberUpdated`, `together/serverClosed`, `together/connectionRevoked` in the monitor. +tui +together +events
+(A) Trigger targeted roster refresh on notification receipt to update mascot strip. +tui +together +events
+(A) Add polling fallback presence refresh when websocket notifications are unavailable or stale. +tui +together +events +resilience
+(A) Add reconnect loop/backoff for Together presence monitor after transient transport failures. +tui +together +events +resilience
+(A) Emit explicit presence connection state (`Connected`, `Reconnecting`, `Disconnected`, `Stale`) for UI rendering. +tui +together +events +state
+(A) Add graceful monitor shutdown when disconnected or app exits. +tui +together +events
+
+(A) Replace `/together` info-only output with a dedicated "Together Center" bottom-pane view. +tui +together +ui
+(A) Render mascot roster as the primary visual in Together Center. +tui +together +ui
+(A) Show one mascot when one member is connected. +tui +together +ui
+(A) Show landing animation when additional members join and appear in roster. +tui +together +ui
+(A) Show exactly five mascots max and append `+N more` overflow indicator when needed. +tui +together +ui
+(A) Show short email labels under or beside each visible mascot when enabled. +tui +together +ui
+(A) Show owner/member role badges using nerd-font/unicode/ascii/TUI characters only (no emoji). +tui +together +ui
+(A) Show masked email labels by default in Together Center; allow unmasked only when explicitly configured. +tui +together +ui
+(A) Render reconnect/stale/disconnected states in Together Center and adjust crew sprite posture/appearance accordingly. +tui +together +ui +state
+(A) Add "view all members" action when roster shows `5 + N more`. +tui +together +ui
+(A) Keep existing Together action hints (`/share`, `/threads`, `/history`, `/fork`, `/exit`) inside Together Center. +tui +together +ui
+
+(A) Add optional compact mascot summary line in shared thread views (`/threads` and `/history`) if space permits. +tui +together +ui
+(A) Preserve existing `/threads` and `/history` keyboard actions (`Enter`, `f`, `d`, `Esc`). +tui +together +compat
+(A) Do not block command execution while mascot animations are running. +tui +together +perf
+(A) Add narrow-width fallback: show email-count text when mascot strip cannot fit. +tui +together +compat
+
+(A) Add tests for roster cap logic (`0..10` members => visible + overflow correctness). +tui +together +tests
+(A) Add tests for deterministic member ordering and stable slot assignment. +tui +together +tests
+(A) Add tests for email label compaction and truncation behavior. +tui +together +tests
+(A) Add tests for landing animation frame progression and completion. +tui +together +tests
+(A) Add tests that existing members do not re-animate on unrelated roster updates. +tui +together +tests
+(A) Add snapshot test for Together Center with 1 member (single mascot). +tui +together +tests +snapshots
+(A) Add snapshot test for Together Center with 2 members (second member landing sequence). +tui +together +tests +snapshots
+(A) Add snapshot test for Together Center with 5 members (full visible crew). +tui +together +tests +snapshots
+(A) Add snapshot test for Together Center with 7 members (5 + 2 more indicator). +tui +together +tests +snapshots
+(A) Add snapshot test for ASCII fallback rendering mode. +tui +together +tests +snapshots
+(A) Add integration test validating notification-driven roster refresh updates mascot view. +tui +together +tests
+(A) Add integration test validating `/exit` disconnect flow clears mascot roster before app exit. +tui +together +tests
+(A) Add integration test validating websocket outage falls back to polling and recovers roster updates. +tui +together +tests +resilience
+(A) Add integration test validating reconnect/stale state visuals and transitions. +tui +together +tests +state
+(A) Add snapshot test for masked label default and unmasked override behavior. +tui +together +tests +snapshots
+(A) Add unit tests for label collision resolution (suffix + hash fallback). +tui +together +tests
+(A) Add unit tests for leave step-out animation triggering and completion. +tui +together +tests
+(A) Add snapshot tests for owner/member badge rendering with no emoji glyphs. +tui +together +tests +snapshots
+
+(A) Add join/leave toast lines synchronized with mascot landing/step-out events. +tui +together +ui +notifications
+(A) Add slash controls: `/together mascot on|off`, `/together mascot motion on|off`, `/together mascot labels masked|full`. +tui +together +slash
+(A) Persist slash control updates through existing config edit plumbing where applicable. +tui +together +slash +config
+(A) Add slash command tests for mascot toggles and label mode controls. +tui +together +slash +tests
+
+(A) Update user-facing Together docs in `docs/` to describe Together Center mascot behavior. +docs +together
+(A) Document roster cap behavior (`max 5`, overflow as `+N`). +docs +together
+(A) Document that visual differentiation is by email labels, not unique character bodies. +docs +together
+(A) Document that mascot rendering is terminal pixel-art via text/Unicode blocks only. +docs +together
+(A) Document masked-by-default label behavior and how to opt into full labels. +docs +together
+(A) Document reconnect/stale state visuals and polling fallback behavior. +docs +together
+(A) Document supported mascot slash controls. +docs +together
+
 (A) Run `just fmt` in `codex-rs` after Rust changes. +rust +fmt
-(A) Run `cargo test -p codex-tui` after formatting. +rust +tests
+(A) Run `cargo test -p codex-tui` for TUI changes and snapshot updates. +rust +tests
+(A) Run `cargo insta pending-snapshots -p codex-tui` and review all mascot diffs. +rust +tests
+(A) Accept intended snapshots with `cargo insta accept -p codex-tui`. +rust +tests

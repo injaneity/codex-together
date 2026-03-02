@@ -1,6 +1,5 @@
 ---
 source: tui/src/history_cell.rs
-assertion_line: 2608
 expression: rendered
 ---
 ╭─────────────────────────────────────╮
@@ -9,5 +8,7 @@ expression: rendered
 │ model:     gpt-5   /model to change │
 │ directory: /tmp/project             │
 ╰─────────────────────────────────────╯
+
+  together: disconnected
 
   Tip: Model just became available

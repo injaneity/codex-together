@@ -9336,22 +9336,27 @@ async fn execute_together_command(
             let close_result: anyhow::Result<TogetherServerCloseResponse> = client
                 .call(METHOD_TOGETHER_SERVER_CLOSE, serde_json::json!({}))
                 .await;
-            set_together_status(Some("disconnected".to_string()));
-            clear_together_endpoint();
-            clear_together_checked_out_thread();
-            if let Err(err) = close_result {
-                if !together_not_connected(&err) {
-                    return Err(err);
+            match close_result {
+                Ok(_) => {
+                    set_together_status(Some("disconnected".to_string()));
+                    clear_together_endpoint();
+                    clear_together_checked_out_thread();
+                    Ok(TogetherCommandOutput {
+                        message: "Together server closed.".to_string(),
+                        hint: None,
+                    })
                 }
-                return Ok(TogetherCommandOutput {
-                    message: "Already disconnected from together server.".to_string(),
-                    hint: None,
-                });
+                Err(err) if together_not_connected(&err) => {
+                    set_together_status(Some("disconnected".to_string()));
+                    clear_together_endpoint();
+                    clear_together_checked_out_thread();
+                    Ok(TogetherCommandOutput {
+                        message: "Already disconnected from together server.".to_string(),
+                        hint: None,
+                    })
+                }
+                Err(err) => Err(err),
             }
-            Ok(TogetherCommandOutput {
-                message: "Together server closed.".to_string(),
-                hint: None,
-            })
         }
         "join" => {
             let Some(target) = rest.first() else {
@@ -9395,22 +9400,30 @@ async fn execute_together_command(
                 client
                     .call(METHOD_TOGETHER_LEAVE, serde_json::json!({}))
                     .await;
-            set_together_status(Some("disconnected".to_string()));
-            clear_together_endpoint();
-            clear_together_checked_out_thread();
-            if let Err(err) = leave_result {
-                if !together_not_connected(&err) {
-                    return Err(err);
+            match leave_result {
+                Ok(response) if response.left => {
+                    set_together_status(Some("disconnected".to_string()));
+                    clear_together_endpoint();
+                    clear_together_checked_out_thread();
+                    Ok(TogetherCommandOutput {
+                        message: "Left together server.".to_string(),
+                        hint: None,
+                    })
                 }
-                return Ok(TogetherCommandOutput {
-                    message: "Already disconnected from together server.".to_string(),
-                    hint: None,
-                });
+                Ok(_) => anyhow::bail!(
+                    "leave was acknowledged but membership was not removed; retry /leave or ask the host to remove your member"
+                ),
+                Err(err) if together_not_connected(&err) => {
+                    set_together_status(Some("disconnected".to_string()));
+                    clear_together_endpoint();
+                    clear_together_checked_out_thread();
+                    Ok(TogetherCommandOutput {
+                        message: "Already disconnected from together server.".to_string(),
+                        hint: None,
+                    })
+                }
+                Err(err) => Err(err),
             }
-            Ok(TogetherCommandOutput {
-                message: "Left together server.".to_string(),
-                hint: None,
-            })
         }
         "share" => {
             let thread_id = rest

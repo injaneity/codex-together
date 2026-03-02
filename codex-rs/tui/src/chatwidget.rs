@@ -151,6 +151,7 @@ use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
+use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use tokio::sync::mpsc::UnboundedSender;
@@ -3541,6 +3542,10 @@ impl ChatWidget {
     pub(crate) fn show_selection_view(&mut self, params: SelectionViewParams) {
         self.bottom_pane.show_selection_view(params);
         self.request_redraw();
+    }
+
+    pub(crate) fn dismiss_active_bottom_pane_view(&mut self) {
+        self.bottom_pane.dismiss_active_view();
     }
 
     pub(crate) fn can_launch_external_editor(&self) -> bool {
@@ -8182,6 +8187,7 @@ impl ChatWidget {
             };
             match ch.to_ascii_lowercase() {
                 'f' => {
+                    tx.send(AppEvent::DismissBottomPaneView);
                     tx.send(AppEvent::RunTogetherCommand {
                         args: format!("fork {}", selected.thread_id),
                     });
@@ -8239,11 +8245,13 @@ impl ChatWidget {
         let mut items = Vec::with_capacity(rows.len());
         for row in rows {
             let thread_id = row.thread_id.clone();
-            let owner_email = row.owner_email.clone();
+            let description = row.description.clone();
+            let search_value = row.search_value.clone();
             items.push(SelectionItem {
-                name: row.display,
-                description: Some(format!("thread={thread_id} · owner={owner_email}")),
-                search_value: Some(format!("{thread_id} {owner_email}")),
+                name: row.display_name,
+                name_prefix_spans: row.display_prefix_spans,
+                description: Some(description),
+                search_value: Some(search_value),
                 actions: vec![Box::new(move |tx: &AppEventSender| {
                     tx.send(AppEvent::RunTogetherCommand {
                         args: format!("checkout {thread_id}"),
@@ -8260,6 +8268,7 @@ impl ChatWidget {
             };
             match ch.to_ascii_lowercase() {
                 'f' => {
+                    tx.send(AppEvent::DismissBottomPaneView);
                     tx.send(AppEvent::RunTogetherCommand {
                         args: format!("fork {}", selected.thread_id),
                     });
@@ -8286,11 +8295,14 @@ impl ChatWidget {
             as Box<dyn Fn(usize) -> Line<'static> + Send + Sync>);
         self.bottom_pane.show_selection_view(SelectionViewParams {
             title: Some("Thread History".to_string()),
-            subtitle: Some(format!("Lineage from {}", lineage.root)),
+            subtitle: Some(format!(
+                "Lazygit-style worktree for current thread {}",
+                short_thread_id(&lineage.root)
+            )),
             footer_hint: Some(together_threads_footer_hint(initial_can_delete)),
             items,
             is_searchable: true,
-            search_placeholder: Some("Search lineage by thread id or owner".to_string()),
+            search_placeholder: Some("Search by thread id, owner, or fork actor".to_string()),
             col_width_mode: ColumnWidthMode::AutoAllRows,
             on_selection_footer_hint,
             on_char_key,
@@ -8307,7 +8319,8 @@ impl ChatWidget {
             );
             return;
         }
-        let replay_thread_id = together_checkout_target(&trimmed);
+        let replay_thread_id_from_command = together_checkout_target(&trimmed);
+        let replay_command_args = trimmed.clone();
 
         let thread_id = self.thread_id.map(|id| id.to_string());
         let cwd = self.config.cwd.clone();
@@ -8315,6 +8328,9 @@ impl ChatWidget {
         tokio::spawn(async move {
             match execute_together_command(trimmed, thread_id, cwd).await {
                 Ok(output) => {
+                    let replay_thread_id = replay_thread_id_from_command.or_else(|| {
+                        together_fork_child_target(&replay_command_args, &output.message)
+                    });
                     tx.send(AppEvent::InsertHistoryCell(Box::new(
                         history_cell::new_info_event(output.message, output.hint),
                     )));
@@ -8492,7 +8508,18 @@ struct TogetherCommandOutput {
 struct TogetherLineageSelectionRow {
     thread_id: String,
     owner_email: String,
-    display: String,
+    display_name: String,
+    display_prefix_plain: String,
+    display_prefix_spans: Vec<Span<'static>>,
+    description: String,
+    search_value: String,
+}
+
+#[derive(Debug, Clone)]
+struct TogetherLineageChildEdge {
+    child_thread_id: String,
+    actor_email: String,
+    created_at: String,
 }
 
 type TogetherSocket =
@@ -8650,8 +8677,9 @@ async fn execute_together_command(
     current_thread_id: Option<String>,
     cwd: PathBuf,
 ) -> anyhow::Result<TogetherCommandOutput> {
-    let argv = shlex::split(&args)
-        .ok_or_else(|| anyhow::anyhow!("invalid shell-like quoting in `/together {args}`"))?;
+    let argv = shlex::split(&args).ok_or_else(|| {
+        anyhow::anyhow!("invalid shell-like quoting in together command: `{args}`")
+    })?;
     let Some(command) = argv.first().map(|s| s.to_ascii_lowercase()) else {
         return Ok(TogetherCommandOutput {
             message: "Codex Together commands".to_string(),
@@ -8667,7 +8695,7 @@ async fn execute_together_command(
         }),
         "create" => {
             if !rest.is_empty() {
-                anyhow::bail!("usage: /together create");
+                anyhow::bail!("usage: /host");
             }
             let endpoint = TOGETHER_DEFAULT_ENDPOINT_URL.to_string();
             let mut client = connect_and_auth(&endpoint).await?;
@@ -8782,7 +8810,7 @@ async fn execute_together_command(
                     short_server_id(&response.server_id)
                 ),
                 hint: Some(format!(
-                    "Public URL: {}\nJoin with URL: /together join {}\nJoin with short id: /together join {}\nInvite id: {}\nRemote websocket transport is experimental in v1.",
+                    "Public URL: {}\nJoin with URL: /join {}\nJoin with short id: /join {}\nInvite id: {}\nRemote websocket transport is experimental in v1.",
                     public_base_url,
                     public_base_url,
                     short_server_id(&response.server_id),
@@ -8814,7 +8842,7 @@ async fn execute_together_command(
         }
         "join" => {
             let Some(target) = rest.first() else {
-                anyhow::bail!("usage: /together join <ngrok-url-or-invite-id>");
+                anyhow::bail!("usage: /join <ngrok-url-or-invite-id>");
             };
             let endpoint = resolve_together_join_endpoint(target)?;
             let mut client = connect_and_auth(&endpoint).await?;
@@ -8851,8 +8879,8 @@ async fn execute_together_command(
             let mut client = connect_and_auth(&endpoint).await?;
             let leave_result: anyhow::Result<codex_together_protocol::TogetherLeaveResponse> =
                 client
-                .call(METHOD_TOGETHER_LEAVE, serde_json::json!({}))
-                .await;
+                    .call(METHOD_TOGETHER_LEAVE, serde_json::json!({}))
+                    .await;
             set_together_status(Some("disconnected".to_string()));
             clear_together_endpoint();
             if let Err(err) = leave_result {
@@ -8874,7 +8902,7 @@ async fn execute_together_command(
                 .first()
                 .cloned()
                 .or(current_thread_id)
-                .ok_or_else(|| anyhow::anyhow!("usage: /together share <thread-id>"))?;
+                .ok_or_else(|| anyhow::anyhow!("usage: /share [thread-id]"))?;
             let endpoint = current_together_endpoint();
             let mut client = connect_and_auth(&endpoint).await?;
             let response: TogetherThreadShareResponse = client
@@ -8895,7 +8923,7 @@ async fn execute_together_command(
         }
         "checkout" => {
             let Some(thread_id) = rest.first() else {
-                anyhow::bail!("usage: /together checkout <thread-id>");
+                anyhow::bail!("usage: /threads (select a thread and press Enter to checkout)");
             };
             let endpoint = current_together_endpoint();
             let mut client = connect_and_auth(&endpoint).await?;
@@ -8925,23 +8953,40 @@ async fn execute_together_command(
         }
         "fork" => {
             let Some(thread_id) = rest.first() else {
-                anyhow::bail!("usage: /together fork <thread-id>");
+                anyhow::bail!(
+                    "usage: /fork (current thread) or /threads (press f on a selected row)"
+                );
             };
             let response = fork_thread_via_together(thread_id.clone(), cwd.clone()).await?;
+            let endpoint = current_together_endpoint();
+            let mut client = connect_and_auth(&endpoint).await?;
+            let child_checkout: TogetherThreadCheckoutResponse = client
+                .call(
+                    METHOD_TOGETHER_THREAD_CHECKOUT,
+                    TogetherThreadCheckoutRequest {
+                        thread_id: response.child_thread_id.clone(),
+                    },
+                )
+                .await?;
+            let mode = if child_checkout.writable {
+                "writable"
+            } else {
+                "read-only"
+            };
             Ok(TogetherCommandOutput {
                 message: format!(
                     "Forked thread {} -> {}",
                     response.parent_thread_id, response.child_thread_id
                 ),
                 hint: Some(format!(
-                    "Resume child with: codex resume {}",
-                    response.child_thread_id
+                    "Auto-entered child thread {} ({mode}).\nOwner: {}\nResume child with: codex resume {}",
+                    child_checkout.thread_id, child_checkout.owner_email, response.child_thread_id
                 )),
             })
         }
         "delete" => {
             let Some(thread_id) = rest.first() else {
-                anyhow::bail!("usage: /together delete <thread-id>");
+                anyhow::bail!("usage: /threads (owner can press d on a selected row)");
             };
             let endpoint = current_together_endpoint();
             let mut client = connect_and_auth(&endpoint).await?;
@@ -8998,7 +9043,7 @@ async fn execute_together_command(
         }
         "lineage" | "history" => {
             let Some(root_thread_id) = rest.first() else {
-                anyhow::bail!("usage: /together lineage <root-thread-id>");
+                anyhow::bail!("usage: /history");
             };
             let endpoint = current_together_endpoint();
             let mut client = connect_and_auth(&endpoint).await?;
@@ -9100,6 +9145,19 @@ fn together_checkout_target(command_args: &str) -> Option<String> {
         return None;
     }
     argv.get(1).cloned()
+}
+
+fn together_fork_child_target(command_args: &str, message: &str) -> Option<String> {
+    let argv = shlex::split(command_args)?;
+    if argv.first()?.to_ascii_lowercase() != "fork" {
+        return None;
+    }
+    let (_, child) = message.split_once("->")?;
+    child
+        .split_whitespace()
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
 }
 
 fn together_method_missing(err: &anyhow::Error) -> bool {
@@ -9643,7 +9701,7 @@ fn together_overview_hint(connected: bool) -> String {
             "/status  show current connection",
             "/share   share current thread",
             "/threads browse shared threads (Enter checkout, f fork, d delete-owner)",
-            "/history browse lineage for current thread",
+            "/history browse lazygit-style worktree for current thread",
             "/fork    fork your current session",
             "/join    switch/join another app server",
             "/exit    leave current app server (run again to exit Codex)",
@@ -9672,16 +9730,15 @@ fn together_threads_footer_hint(can_delete: bool) -> Line<'static> {
 
 fn together_usage_hint() -> String {
     [
-        "/together create",
-        "/together join <ngrok-url-or-invite-id>",
-        "/together share [thread-id]",
-        "/together checkout <thread-id>",
-        "/together fork <thread-id>",
-        "/together delete <thread-id>",
-        "/together list [search-term]",
-        "/together lineage <root-thread-id>",
-        "/together status [endpoint]",
-        "/together close | leave | help",
+        "/host",
+        "/join <ngrok-url-or-invite-id>",
+        "/share [thread-id]",
+        "/threads",
+        "/history",
+        "/fork",
+        "/status",
+        "/exit",
+        "/together",
     ]
     .join("\n")
 }
@@ -9689,7 +9746,12 @@ fn together_usage_hint() -> String {
 fn render_lineage_tree(response: &TogetherHistoryLineageResponse) -> String {
     let lines = lineage_selection_rows(response)
         .into_iter()
-        .map(|row| row.display)
+        .map(|row| {
+            format!(
+                "{}{}  {}",
+                row.display_prefix_plain, row.display_name, row.description
+            )
+        })
         .collect::<Vec<_>>();
     if lines.is_empty() {
         return "No lineage nodes found.".to_string();
@@ -9700,78 +9762,202 @@ fn render_lineage_tree(response: &TogetherHistoryLineageResponse) -> String {
 fn lineage_selection_rows(
     response: &TogetherHistoryLineageResponse,
 ) -> Vec<TogetherLineageSelectionRow> {
-    use std::collections::BTreeMap;
-
-    let owners: HashMap<&str, &str> = response
+    let owners: HashMap<String, String> = response
         .nodes
         .iter()
-        .map(|node| (node.thread_id.as_str(), node.owner_email.as_str()))
+        .map(|node| (node.thread_id.clone(), node.owner_email.clone()))
         .collect();
 
-    let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut children: BTreeMap<String, Vec<TogetherLineageChildEdge>> = BTreeMap::new();
     for edge in &response.edges {
         children
-            .entry(edge.parent_thread_id.as_str())
+            .entry(edge.parent_thread_id.clone())
             .or_default()
-            .push(edge.child_thread_id.as_str());
+            .push(TogetherLineageChildEdge {
+                child_thread_id: edge.child_thread_id.clone(),
+                actor_email: edge.actor_email.clone(),
+                created_at: edge.created_at.clone(),
+            });
     }
     for values in children.values_mut() {
-        values.sort_unstable();
+        values.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.child_thread_id.cmp(&b.child_thread_id))
+        });
     }
 
     let mut out = Vec::new();
+    let mut lanes = Vec::new();
+    let mut visited = HashSet::new();
     lineage_selection_row_walk(
-        response.root.as_str(),
-        "",
+        &response.root,
+        None,
         true,
+        &mut lanes,
         &owners,
         &children,
+        &response.root,
+        &mut visited,
         &mut out,
     );
     out
 }
 
-fn lineage_selection_row_walk<'a>(
-    thread_id: &'a str,
-    prefix: &str,
+fn lineage_selection_row_walk(
+    thread_id: &str,
+    incoming_edge: Option<&TogetherLineageChildEdge>,
     is_last: bool,
-    owners: &HashMap<&'a str, &'a str>,
-    children: &std::collections::BTreeMap<&'a str, Vec<&'a str>>,
+    parent_lanes: &mut Vec<bool>,
+    owners: &HashMap<String, String>,
+    children: &BTreeMap<String, Vec<TogetherLineageChildEdge>>,
+    head_thread_id: &str,
+    visited: &mut HashSet<String>,
     out: &mut Vec<TogetherLineageSelectionRow>,
 ) {
-    let owner = owners.get(thread_id).copied().unwrap_or("unknown");
-    let label = format!("{thread_id} ({owner})");
-    let display = if prefix.is_empty() {
-        format!("* {label}")
+    if !visited.insert(thread_id.to_string()) {
+        return;
+    }
+
+    let owner = owners
+        .get(thread_id)
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    let is_root = incoming_edge.is_none();
+    let (display_prefix_spans, display_prefix_plain) =
+        lineage_graph_prefix(parent_lanes, is_last, is_root);
+    let short_id = short_thread_id(thread_id);
+    let display_name = if thread_id == head_thread_id {
+        format!("{short_id} (HEAD)")
     } else {
-        format!("{prefix}{} {label}", if is_last { "`--" } else { "|--" })
+        short_id
     };
+    let description = lineage_row_description(thread_id, owner.as_str(), incoming_edge);
+    let mut search_terms = vec![thread_id.to_string(), owner.clone()];
+    if let Some(edge) = incoming_edge {
+        search_terms.push(edge.actor_email.clone());
+        search_terms.push(compact_lineage_timestamp(edge.created_at.as_str()));
+    }
+
     out.push(TogetherLineageSelectionRow {
         thread_id: thread_id.to_string(),
-        owner_email: owner.to_string(),
-        display,
+        owner_email: owner,
+        display_name,
+        display_prefix_plain,
+        display_prefix_spans,
+        description,
+        search_value: search_terms.join(" "),
     });
 
     let Some(kids) = children.get(thread_id) else {
         return;
     };
-    let continuation = if prefix.is_empty() {
-        String::new()
-    } else if is_last {
-        format!("{prefix}   ")
-    } else {
-        format!("{prefix}|  ")
-    };
-    for (index, child) in kids.iter().enumerate() {
+
+    let track_parent_lane = incoming_edge.is_some();
+    if track_parent_lane {
+        parent_lanes.push(!is_last);
+    }
+
+    for (index, child_edge) in kids.iter().enumerate() {
         lineage_selection_row_walk(
-            child,
-            continuation.as_str(),
+            child_edge.child_thread_id.as_str(),
+            Some(child_edge),
             index + 1 == kids.len(),
+            parent_lanes,
             owners,
             children,
+            head_thread_id,
+            visited,
             out,
         );
     }
+
+    if track_parent_lane {
+        parent_lanes.pop();
+    }
+}
+
+fn lineage_graph_prefix(
+    parent_lanes: &[bool],
+    is_last: bool,
+    is_root: bool,
+) -> (Vec<Span<'static>>, String) {
+    let mut styled = Vec::new();
+    let mut plain = String::new();
+
+    if is_root {
+        styled.push(Span::styled(
+            "● ",
+            Style::default().fg(lineage_lane_color(0)).bold(),
+        ));
+        plain.push_str("● ");
+        return (styled, plain);
+    }
+
+    for (depth, has_more_siblings) in parent_lanes.iter().enumerate() {
+        if *has_more_siblings {
+            styled.push(Span::styled(
+                "│ ",
+                Style::default().fg(lineage_lane_color(depth)),
+            ));
+            plain.push_str("│ ");
+        } else {
+            styled.push(Span::raw("  "));
+            plain.push_str("  ");
+        }
+    }
+
+    let depth = parent_lanes.len();
+    let lane_style = Style::default().fg(lineage_lane_color(depth));
+    let branch = if is_last { "└" } else { "├" };
+    styled.push(Span::styled(format!("{branch}─"), lane_style));
+    styled.push(Span::styled("● ", lane_style.bold()));
+    plain.push_str(branch);
+    plain.push('─');
+    plain.push('●');
+    plain.push(' ');
+
+    (styled, plain)
+}
+
+fn lineage_lane_color(depth: usize) -> Color {
+    const PALETTE: [Color; 6] = [
+        Color::Yellow,
+        Color::Cyan,
+        Color::Green,
+        Color::Magenta,
+        Color::Blue,
+        Color::Red,
+    ];
+    PALETTE[depth % PALETTE.len()]
+}
+
+fn short_thread_id(thread_id: &str) -> String {
+    thread_id.chars().take(12).collect()
+}
+
+fn lineage_row_description(
+    thread_id: &str,
+    owner_email: &str,
+    incoming_edge: Option<&TogetherLineageChildEdge>,
+) -> String {
+    match incoming_edge {
+        Some(edge) => format!(
+            "owner={owner_email} · thread={thread_id} · forked_by={} · {}",
+            edge.actor_email,
+            compact_lineage_timestamp(edge.created_at.as_str())
+        ),
+        None => format!("owner={owner_email} · thread={thread_id} · root"),
+    }
+}
+
+fn compact_lineage_timestamp(raw: &str) -> String {
+    let base = raw
+        .split_once('.')
+        .map(|(ts, _)| ts)
+        .unwrap_or(raw)
+        .replace('T', " ");
+    base.strip_suffix("+00:00").unwrap_or(&base).to_string()
 }
 
 fn has_websocket_timing_metrics(summary: RuntimeMetricsSummary) -> bool {

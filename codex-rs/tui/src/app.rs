@@ -3180,6 +3180,9 @@ impl App {
             AppEvent::OpenTogetherHistoryView { lineage } => {
                 self.chat_widget.show_together_history_view(lineage);
             }
+            AppEvent::DismissBottomPaneView => {
+                self.chat_widget.dismiss_active_bottom_pane_view();
+            }
             AppEvent::ReplayTogetherThread {
                 thread_id,
                 messages,

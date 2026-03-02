@@ -425,6 +425,9 @@ pub(crate) enum AppEvent {
         lineage: TogetherHistoryLineageResponse,
     },
 
+    /// Dismiss the currently active bottom-pane modal/popup view, if any.
+    DismissBottomPaneView,
+
     /// Replay a checked-out together thread using the same UI replay flow as resume.
     ReplayTogetherThread {
         thread_id: String,

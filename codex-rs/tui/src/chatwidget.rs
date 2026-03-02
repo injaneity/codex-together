@@ -367,16 +367,99 @@ const MASK_EMAIL_LABELS_BY_DEFAULT: bool = true;
 const TOGETHER_PRESENCE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const TOGETHER_PRESENCE_STALE_AFTER: Duration = Duration::from_secs(12);
 const NGROK_TUNNELS_API_URL: &str = "http://127.0.0.1:4040/api/tunnels";
-const TOGETHER_JOIN_HANDSHAKE_VARIANTS: [[&str; 3]; 5] = [
-    [" \\(•.•) (•.•)/", "  (  |--|  )", "  /  \\  /  \\"],
-    ["\\(•.•)   (•.•)/", "  )  |---|  (", "  /  \\   /  \\"],
-    [" (•.•) (•.•)", "<)   )>(  )|", " /   \\ /  \\"],
+#[derive(Clone, Copy)]
+struct HandshakeRow {
+    left: &'static str,
+    middle: &'static str,
+    right: &'static str,
+}
+
+const TOGETHER_JOIN_HANDSHAKE_VARIANTS: [[HandshakeRow; 3]; 5] = [
     [
-        " (•.•)     (•.•)",
-        "<)   )o---o(   )>",
-        " /   \\     /   \\",
+        HandshakeRow {
+            left: "\\(•.•)",
+            middle: " ",
+            right: "(•.•)/",
+        },
+        HandshakeRow {
+            left: "(  ",
+            middle: "|--|",
+            right: "  )",
+        },
+        HandshakeRow {
+            left: "/  \\",
+            middle: "  ",
+            right: "/  \\",
+        },
     ],
-    [" (•.•)   (•.•)", "<)   )\\ /(   )>", " /   \\   /   \\"],
+    [
+        HandshakeRow {
+            left: "\\(•.•)",
+            middle: "   ",
+            right: "(•.•)/",
+        },
+        HandshakeRow {
+            left: ")  ",
+            middle: "|---|",
+            right: "  (",
+        },
+        HandshakeRow {
+            left: "/  \\",
+            middle: "   ",
+            right: "/  \\",
+        },
+    ],
+    [
+        HandshakeRow {
+            left: "(•.•)",
+            middle: " ",
+            right: "(•.•)",
+        },
+        HandshakeRow {
+            left: "<)   )",
+            middle: ">",
+            right: "(  )|",
+        },
+        HandshakeRow {
+            left: "/   \\",
+            middle: " ",
+            right: "/  \\",
+        },
+    ],
+    [
+        HandshakeRow {
+            left: "(•.•)",
+            middle: "     ",
+            right: "(•.•)",
+        },
+        HandshakeRow {
+            left: "<)   )",
+            middle: "o---o",
+            right: "(   )>",
+        },
+        HandshakeRow {
+            left: "/   \\",
+            middle: "     ",
+            right: "/   \\",
+        },
+    ],
+    [
+        HandshakeRow {
+            left: "(•.•)",
+            middle: "   ",
+            right: "(•.•)",
+        },
+        HandshakeRow {
+            left: "<)   )",
+            middle: "\\ /",
+            right: "(   )>",
+        },
+        HandshakeRow {
+            left: "/   \\",
+            middle: "   ",
+            right: "/   \\",
+        },
+    ],
 ];
 // Track information about an in-flight exec command.
 struct RunningCommand {
@@ -8335,12 +8418,17 @@ impl ChatWidget {
             joined.sort();
             left.sort();
             if self.together_presence_seen_once {
+                let local_actor = local_together_actor_id();
                 for email in &joined {
                     self.add_info_message(
                         format!("join: {email}"),
                         Some("Crew member landed in Together Center.".to_string()),
                     );
-                    self.add_plain_history_lines(together_join_handshake_lines(email));
+                    self.add_plain_history_lines(together_join_handshake_lines(
+                        local_actor.as_str(),
+                        email,
+                        &connected_members,
+                    ));
                 }
                 for email in &left {
                     self.add_info_message(
@@ -10245,27 +10333,60 @@ fn together_usage_hint() -> String {
     .join("\n")
 }
 
-fn together_join_handshake_lines(joined_email: &str) -> Vec<Line<'static>> {
+fn together_join_handshake_lines(
+    local_email: &str,
+    joined_email: &str,
+    connected_members: &[ConnectedMember],
+) -> Vec<Line<'static>> {
     let variant = together_join_handshake_variant(joined_email);
+    let left_style = together_handshake_member_style(local_email, connected_members);
+    let right_style = together_handshake_member_style(joined_email, connected_members);
     let mut lines = Vec::with_capacity(5);
     lines.push("  handshake".dim().into());
     for row in variant {
-        lines.push(format!("  {row}").into());
+        lines.push(Line::from(vec![
+            "  ".into(),
+            Span::styled(row.left, left_style),
+            row.middle.into(),
+            Span::styled(row.right, right_style),
+        ]));
     }
-    lines.push(
-        format!("  you (left)  <->  {joined_email} (right)")
-            .dim()
-            .into(),
-    );
+    lines.push(Line::from(vec![
+        "  ".into(),
+        Span::styled(local_email.to_string(), left_style),
+        "  <->  ".dim(),
+        Span::styled(joined_email.to_string(), right_style),
+    ]));
     lines
 }
 
-fn together_join_handshake_variant(joined_email: &str) -> [&'static str; 3] {
+fn together_join_handshake_variant(joined_email: &str) -> [HandshakeRow; 3] {
     let mut hash: usize = 0;
     for byte in joined_email.as_bytes() {
         hash = hash.wrapping_mul(37).wrapping_add(usize::from(*byte));
     }
     TOGETHER_JOIN_HANDSHAKE_VARIANTS[hash % TOGETHER_JOIN_HANDSHAKE_VARIANTS.len()]
+}
+
+fn together_handshake_member_style(email: &str, connected_members: &[ConnectedMember]) -> Style {
+    let slot_idx = connected_members
+        .iter()
+        .position(|member| member.email == email)
+        .unwrap_or_else(|| {
+            let mut hash: usize = 0;
+            for byte in email.as_bytes() {
+                hash = hash.wrapping_mul(33).wrapping_add(usize::from(*byte));
+            }
+            hash
+        });
+    let color = match slot_idx % 5 {
+        0 => Color::Cyan,
+        1 => Color::Green,
+        2 => Color::Magenta,
+        3 => Color::Yellow,
+        _ => Color::Blue,
+    };
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
 }
 
 fn render_lineage_tree(response: &TogetherHistoryLineageResponse) -> String {

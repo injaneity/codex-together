@@ -4922,24 +4922,49 @@ async fn slash_exit_requests_exit() {
 
 #[test]
 fn together_join_handshake_lines_include_right_side_joined_member_label() {
+    let local = "alice@example.com";
     let joined = "new.member@example.com";
-    let lines = together_join_handshake_lines(joined);
+    let members = vec![
+        ConnectedMember {
+            email: local.to_string(),
+            role: TogetherRole::Owner,
+        },
+        ConnectedMember {
+            email: joined.to_string(),
+            role: TogetherRole::Member,
+        },
+    ];
+    let lines = together_join_handshake_lines(local, joined, &members);
     let rendered = lines_to_single_string(&lines);
 
     assert!(rendered.contains("handshake"));
-    assert!(rendered.contains("you (left)  <->  new.member@example.com (right)"));
+    assert!(rendered.contains("alice@example.com  <->  new.member@example.com"));
+    assert!(!rendered.contains("(left)"));
+    assert!(!rendered.contains("(right)"));
 }
 
 #[test]
 fn together_join_handshake_lines_render_selected_variant_rows() {
+    let local = "alice@example.com";
     let joined = "friend@example.com";
+    let members = vec![
+        ConnectedMember {
+            email: local.to_string(),
+            role: TogetherRole::Owner,
+        },
+        ConnectedMember {
+            email: joined.to_string(),
+            role: TogetherRole::Member,
+        },
+    ];
     let variant = together_join_handshake_variant(joined);
-    let lines = together_join_handshake_lines(joined);
+    let lines = together_join_handshake_lines(local, joined, &members);
     let rendered = lines_to_single_string(&lines);
 
-    assert!(rendered.contains(variant[0]));
-    assert!(rendered.contains(variant[1]));
-    assert!(rendered.contains(variant[2]));
+    for row in variant {
+        let row_text = format!("{}{}{}", row.left, row.middle, row.right);
+        assert!(rendered.contains(&row_text));
+    }
 }
 
 #[tokio::test]

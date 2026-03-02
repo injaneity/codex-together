@@ -24,6 +24,7 @@ use codex_utils_approval_presets::ApprovalPreset;
 
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::StatusLineItem;
+use crate::bottom_pane::TogetherPresenceState;
 use crate::history_cell::HistoryCell;
 
 use codex_core::features::Feature;
@@ -429,6 +430,12 @@ pub(crate) enum AppEvent {
     /// Open Together Center with the latest server info (if connected).
     OpenTogetherCenterView {
         server_info: Option<TogetherServerInfoResponse>,
+    },
+
+    /// Background together presence refresh event for Together Center updates.
+    TogetherPresenceUpdated {
+        server_info: Option<TogetherServerInfoResponse>,
+        state: TogetherPresenceState,
     },
 
     /// Dismiss the currently active bottom-pane modal/popup view, if any.

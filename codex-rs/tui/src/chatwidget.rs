@@ -220,6 +220,7 @@ use crate::bottom_pane::QUIT_SHORTCUT_TIMEOUT;
 use crate::bottom_pane::SelectionAction;
 use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
+use crate::bottom_pane::TOGETHER_CENTER_VIEW_ID;
 use crate::bottom_pane::TogetherCenterView;
 use crate::bottom_pane::TogetherCenterViewParams;
 use crate::bottom_pane::TogetherPresenceState;
@@ -293,6 +294,7 @@ use codex_protocol::protocol::SandboxPolicy;
 use codex_together_client::decode_invite;
 use codex_together_client::status_env_key;
 use codex_together_protocol::CheckoutReason;
+use codex_together_protocol::ConnectedMember;
 use codex_together_protocol::JsonRpcRequest as TogetherJsonRpcRequest;
 use codex_together_protocol::JsonRpcResponse as TogetherJsonRpcResponse;
 use codex_together_protocol::METHOD_INITIALIZE;
@@ -362,6 +364,8 @@ const TOGETHER_MASCOT_MOTION_ENV_KEY: &str = "CODEX_TOGETHER_MASCOT_MOTION";
 const TOGETHER_MASCOT_LABELS_ENV_KEY: &str = "CODEX_TOGETHER_MASCOT_LABELS";
 const MAX_VISIBLE_CREW: usize = 5;
 const MASK_EMAIL_LABELS_BY_DEFAULT: bool = true;
+const TOGETHER_PRESENCE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const TOGETHER_PRESENCE_STALE_AFTER: Duration = Duration::from_secs(12);
 const NGROK_TUNNELS_API_URL: &str = "http://127.0.0.1:4040/api/tunnels";
 // Track information about an in-flight exec command.
 struct RunningCommand {
@@ -748,7 +752,9 @@ pub(crate) struct ChatWidget {
     external_editor_state: ExternalEditorState,
     realtime_conversation: RealtimeConversationUiState,
     together_member_emails: HashSet<String>,
+    together_member_roles: HashMap<String, TogetherRole>,
     together_presence_seen_once: bool,
+    together_presence_monitor: Option<JoinHandle<()>>,
     last_rendered_user_message_event: Option<RenderedUserMessageEvent>,
 }
 
@@ -2974,7 +2980,9 @@ impl ChatWidget {
             external_editor_state: ExternalEditorState::Closed,
             realtime_conversation: RealtimeConversationUiState::default(),
             together_member_emails: HashSet::new(),
+            together_member_roles: HashMap::new(),
             together_presence_seen_once: false,
+            together_presence_monitor: None,
             last_rendered_user_message_event: None,
         };
 
@@ -3155,7 +3163,9 @@ impl ChatWidget {
             external_editor_state: ExternalEditorState::Closed,
             realtime_conversation: RealtimeConversationUiState::default(),
             together_member_emails: HashSet::new(),
+            together_member_roles: HashMap::new(),
             together_presence_seen_once: false,
+            together_presence_monitor: None,
             last_rendered_user_message_event: None,
         };
 
@@ -3325,7 +3335,9 @@ impl ChatWidget {
             external_editor_state: ExternalEditorState::Closed,
             realtime_conversation: RealtimeConversationUiState::default(),
             together_member_emails: HashSet::new(),
+            together_member_roles: HashMap::new(),
             together_presence_seen_once: false,
+            together_presence_monitor: None,
             last_rendered_user_message_event: None,
         };
 
@@ -8137,31 +8149,169 @@ impl ChatWidget {
         &mut self,
         server_info: Option<TogetherServerInfoResponse>,
     ) {
+        let state = if server_info.is_some() {
+            TogetherPresenceState::Connected
+        } else {
+            TogetherPresenceState::Disconnected
+        };
+        self.render_together_center_with_state(server_info, state);
+        match state {
+            TogetherPresenceState::Connected => self.ensure_together_presence_monitor(),
+            TogetherPresenceState::Disconnected => self.stop_together_presence_monitor(),
+            TogetherPresenceState::Reconnecting | TogetherPresenceState::Stale => {}
+        }
+    }
+
+    pub(crate) fn handle_together_presence_update(
+        &mut self,
+        server_info: Option<TogetherServerInfoResponse>,
+        state: TogetherPresenceState,
+    ) {
+        if !self.is_together_center_active() {
+            self.stop_together_presence_monitor();
+            if state == TogetherPresenceState::Disconnected {
+                self.together_member_emails.clear();
+                self.together_member_roles.clear();
+                self.together_presence_seen_once = false;
+            }
+            return;
+        }
+        self.render_together_center_with_state(server_info, state);
+        if state == TogetherPresenceState::Disconnected {
+            self.stop_together_presence_monitor();
+        }
+    }
+
+    fn ensure_together_presence_monitor(&mut self) {
+        if self
+            .together_presence_monitor
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            return;
+        }
+
+        let endpoint = current_together_endpoint();
+        let tx = self.app_event_tx.clone();
+        self.together_presence_monitor = Some(tokio::spawn(async move {
+            let mut last_success: Option<Instant> = None;
+            let mut last_state = TogetherPresenceState::Disconnected;
+            let mut last_signature: Option<String> = None;
+
+            loop {
+                if !together_status_is_connected() {
+                    if last_state != TogetherPresenceState::Disconnected {
+                        tx.send(AppEvent::TogetherPresenceUpdated {
+                            server_info: None,
+                            state: TogetherPresenceState::Disconnected,
+                        });
+                    }
+                    break;
+                }
+
+                let response = async {
+                    let mut client = connect_and_auth(&endpoint).await?;
+                    let info: TogetherServerInfoResponse = client
+                        .call(METHOD_TOGETHER_SERVER_INFO, serde_json::json!({}))
+                        .await?;
+                    Ok::<TogetherServerInfoResponse, anyhow::Error>(info)
+                }
+                .await;
+
+                match response {
+                    Ok(info) => {
+                        let signature = together_presence_signature(&info);
+                        if last_state != TogetherPresenceState::Connected
+                            || last_signature.as_ref() != Some(&signature)
+                        {
+                            tx.send(AppEvent::TogetherPresenceUpdated {
+                                server_info: Some(info),
+                                state: TogetherPresenceState::Connected,
+                            });
+                        }
+                        last_success = Some(Instant::now());
+                        last_state = TogetherPresenceState::Connected;
+                        last_signature = Some(signature);
+                    }
+                    Err(_) => {
+                        let state = match last_success {
+                            Some(ts) if ts.elapsed() >= TOGETHER_PRESENCE_STALE_AFTER => {
+                                TogetherPresenceState::Stale
+                            }
+                            _ => TogetherPresenceState::Reconnecting,
+                        };
+                        if state != last_state {
+                            tx.send(AppEvent::TogetherPresenceUpdated {
+                                server_info: None,
+                                state,
+                            });
+                            last_state = state;
+                        }
+                    }
+                }
+
+                tokio::time::sleep(TOGETHER_PRESENCE_POLL_INTERVAL).await;
+            }
+        }));
+    }
+
+    fn stop_together_presence_monitor(&mut self) {
+        if let Some(handle) = self.together_presence_monitor.take() {
+            handle.abort();
+        }
+    }
+
+    fn is_together_center_active(&self) -> bool {
+        self.bottom_pane.active_view_id() == Some(TOGETHER_CENTER_VIEW_ID)
+    }
+
+    fn render_together_center_with_state(
+        &mut self,
+        server_info: Option<TogetherServerInfoResponse>,
+        state: TogetherPresenceState,
+    ) {
         let mascot_enabled = together_mascot_enabled();
         let motion_enabled = together_mascot_motion_enabled();
         let mask_email_labels = together_mascot_masked_labels();
 
-        let (state, owner_email, endpoint, connected_members) = if let Some(info) = server_info {
+        let had_fresh_snapshot = server_info.is_some();
+        let (owner_email, endpoint, mut connected_members) = if let Some(info) = server_info {
             (
-                TogetherPresenceState::Connected,
                 Some(info.owner_email),
                 Some(info.public_base_url),
                 info.connected_members,
             )
         } else {
-            (
-                TogetherPresenceState::Disconnected,
-                None,
-                Some(current_together_endpoint()),
-                Vec::new(),
-            )
+            (None, Some(current_together_endpoint()), Vec::new())
         };
+        if !had_fresh_snapshot
+            && matches!(
+                state,
+                TogetherPresenceState::Reconnecting | TogetherPresenceState::Stale
+            )
+        {
+            connected_members = self
+                .together_member_roles
+                .iter()
+                .map(|(email, role)| ConnectedMember {
+                    email: email.clone(),
+                    role: *role,
+                })
+                .collect();
+        }
+        connected_members.sort_by(|a, b| a.email.cmp(&b.email));
 
-        let current_member_emails: HashSet<String> = connected_members
-            .iter()
-            .map(|member| member.email.clone())
-            .collect();
-        if self.together_presence_seen_once {
+        let mut landing_emails = Vec::new();
+        let mut departing_members = Vec::new();
+        if had_fresh_snapshot {
+            let current_member_emails: HashSet<String> = connected_members
+                .iter()
+                .map(|member| member.email.clone())
+                .collect();
+            let current_member_roles: HashMap<String, TogetherRole> = connected_members
+                .iter()
+                .map(|member| (member.email.clone(), member.role))
+                .collect();
             let mut joined: Vec<String> = current_member_emails
                 .difference(&self.together_member_emails)
                 .cloned()
@@ -8173,23 +8323,43 @@ impl ChatWidget {
                 .collect();
             joined.sort();
             left.sort();
+            if self.together_presence_seen_once {
+                for email in &joined {
+                    self.add_info_message(
+                        format!("join: {email}"),
+                        Some("Crew member landed in Together Center.".to_string()),
+                    );
+                }
+                for email in &left {
+                    self.add_info_message(
+                        format!("leave: {email}"),
+                        Some("Crew member stepped out of Together Center.".to_string()),
+                    );
+                }
+            }
+            landing_emails = joined;
+            departing_members = left
+                .iter()
+                .map(|email| ConnectedMember {
+                    email: email.clone(),
+                    role: self
+                        .together_member_roles
+                        .get(email)
+                        .copied()
+                        .unwrap_or(TogetherRole::Member),
+                })
+                .collect();
 
-            for email in joined {
-                self.add_info_message(
-                    format!("join: {email}"),
-                    Some("Crew member landed in Together Center.".to_string()),
-                );
+            self.together_member_emails = current_member_emails;
+            self.together_member_roles = current_member_roles;
+            if !self.together_presence_seen_once {
+                self.together_presence_seen_once = true;
             }
-            for email in left {
-                self.add_info_message(
-                    format!("leave: {email}"),
-                    Some("Crew member stepped out of Together Center.".to_string()),
-                );
-            }
-        } else {
-            self.together_presence_seen_once = true;
+        } else if state == TogetherPresenceState::Disconnected {
+            self.together_member_emails.clear();
+            self.together_member_roles.clear();
+            self.together_presence_seen_once = false;
         }
-        self.together_member_emails = current_member_emails;
 
         let params = TogetherCenterViewParams {
             state,
@@ -8200,9 +8370,17 @@ impl ChatWidget {
             mask_email_labels,
             mascot_enabled,
             motion_enabled,
+            landing_emails,
+            departing_members,
         };
-        self.bottom_pane
-            .show_view(Box::new(TogetherCenterView::new(params)));
+        let view = Box::new(TogetherCenterView::new(params));
+        if self.is_together_center_active() {
+            let _ = self
+                .bottom_pane
+                .replace_view_if_active(TOGETHER_CENTER_VIEW_ID, view);
+        } else {
+            self.bottom_pane.show_view(view);
+        }
     }
 
     pub(crate) fn open_together_threads_view(&mut self) {
@@ -9970,6 +10148,21 @@ fn together_status_is_connected() -> bool {
 
 fn together_status_is_host() -> bool {
     together_status_value().contains("host:")
+}
+
+fn together_presence_signature(info: &TogetherServerInfoResponse) -> String {
+    let mut members = info
+        .connected_members
+        .iter()
+        .map(|member| format!("{}:{}", member.email, together_role_label(member.role)))
+        .collect::<Vec<_>>();
+    members.sort();
+    format!(
+        "{}|{}|{}",
+        info.server_id,
+        info.owner_email,
+        members.join(",")
+    )
 }
 
 fn together_mascot_enabled() -> bool {

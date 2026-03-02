@@ -93,6 +93,7 @@ pub(crate) use skills_toggle_view::SkillsToggleItem;
 pub(crate) use skills_toggle_view::SkillsToggleView;
 pub(crate) use status_line_setup::StatusLineItem;
 pub(crate) use status_line_setup::StatusLineSetupView;
+pub(crate) use together_center_view::TOGETHER_CENTER_VIEW_ID;
 pub(crate) use together_center_view::TogetherCenterView;
 pub(crate) use together_center_view::TogetherCenterViewParams;
 pub(crate) use together_center_view::TogetherPresenceState;
@@ -487,6 +488,11 @@ impl BottomPane {
         #[cfg(not(target_os = "linux"))]
         self.composer.process_space_hold_trigger();
         self.composer.sync_popups();
+        if let Some(view) = self.view_stack.last_mut()
+            && let Some(next_redraw) = view.pre_draw_tick()
+        {
+            self.request_redraw_in(next_redraw);
+        }
     }
 
     /// Replace the composer text with `text`.
@@ -773,6 +779,24 @@ impl BottomPane {
         true
     }
 
+    pub(crate) fn replace_view_if_active(
+        &mut self,
+        view_id: &'static str,
+        view: Box<dyn BottomPaneView>,
+    ) -> bool {
+        let is_match = self
+            .view_stack
+            .last()
+            .is_some_and(|active| active.view_id() == Some(view_id));
+        if !is_match {
+            return false;
+        }
+
+        self.view_stack.pop();
+        self.push_view(view);
+        true
+    }
+
     /// Update the queued messages preview shown above the composer.
     pub(crate) fn set_queued_user_messages(&mut self, queued: Vec<String>) {
         self.queued_user_messages.messages = queued;
@@ -829,6 +853,10 @@ impl BottomPane {
     #[cfg(test)]
     pub(crate) fn has_active_view(&self) -> bool {
         !self.view_stack.is_empty()
+    }
+
+    pub(crate) fn active_view_id(&self) -> Option<&'static str> {
+        self.active_view().and_then(|view| view.view_id())
     }
 
     /// Return true when the pane is in the regular composer state without any

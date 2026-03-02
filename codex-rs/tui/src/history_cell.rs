@@ -2437,6 +2437,32 @@ mod tests {
     use rmcp::model::Content;
 
     const SMALL_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+
+    struct TogetherStatusGuard {
+        previous: Option<String>,
+    }
+
+    impl TogetherStatusGuard {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var(status_env_key()).ok();
+            unsafe {
+                std::env::set_var(status_env_key(), value);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for TogetherStatusGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(status_env_key(), value),
+                    None => std::env::remove_var(status_env_key()),
+                }
+            }
+        }
+    }
+
     async fn test_config() -> Config {
         let codex_home = std::env::temp_dir();
         ConfigBuilder::default()
@@ -2611,6 +2637,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_info_availability_nux_tooltip_snapshot() {
+        let _guard = TogetherStatusGuard::set("disconnected");
         let mut config = test_config().await;
         config.cwd = PathBuf::from("/tmp/project");
         let cell = new_session_info(

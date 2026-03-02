@@ -103,8 +103,6 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use insta::assert_snapshot;
 use pretty_assertions::assert_eq;
-#[cfg(target_os = "windows")]
-use serial_test::serial;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -122,6 +120,31 @@ async fn test_config() -> Config {
         .build()
         .await
         .expect("config")
+}
+
+struct TogetherStatusGuard {
+    previous: Option<String>,
+}
+
+impl TogetherStatusGuard {
+    fn set(value: &str) -> Self {
+        let previous = std::env::var(status_env_key()).ok();
+        unsafe {
+            std::env::set_var(status_env_key(), value);
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for TogetherStatusGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(status_env_key(), value),
+                None => std::env::remove_var(status_env_key()),
+            }
+        }
+    }
 }
 
 fn invalid_value(candidate: impl Into<String>, allowed: impl Into<String>) -> ConstraintError {
@@ -1737,7 +1760,9 @@ async fn make_chatwidget_manual(
         external_editor_state: ExternalEditorState::Closed,
         realtime_conversation: RealtimeConversationUiState::default(),
         together_member_emails: HashSet::new(),
+        together_member_roles: HashMap::new(),
         together_presence_seen_once: false,
+        together_presence_monitor: None,
         last_rendered_user_message_event: None,
     };
     widget.set_model(&resolved_model);
@@ -4887,6 +4912,7 @@ async fn slash_copy_does_not_return_stale_output_after_thread_rollback() {
 
 #[tokio::test]
 async fn slash_exit_requests_exit() {
+    let _guard = TogetherStatusGuard::set("disconnected");
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
     chat.dispatch_command(SlashCommand::Exit);

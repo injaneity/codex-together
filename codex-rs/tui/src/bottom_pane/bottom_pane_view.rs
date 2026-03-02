@@ -2,6 +2,7 @@ use crate::bottom_pane::ApprovalRequest;
 use crate::render::renderable::Renderable;
 use codex_protocol::request_user_input::RequestUserInputEvent;
 use crossterm::event::KeyEvent;
+use std::time::Duration;
 
 use super::CancellationEvent;
 
@@ -44,6 +45,13 @@ pub(crate) trait BottomPaneView: Renderable {
     /// time-based paste burst flushing as the primary composer.
     fn flush_paste_burst_if_due(&mut self) -> bool {
         false
+    }
+
+    /// Advance any view-local timers/animation state before drawing.
+    ///
+    /// Return `Some(duration)` to request a follow-up redraw after `duration`.
+    fn pre_draw_tick(&mut self) -> Option<Duration> {
+        None
     }
 
     /// Whether the view is currently holding paste-burst transient state.

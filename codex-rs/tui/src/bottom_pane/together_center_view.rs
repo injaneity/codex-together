@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::time::Duration;
+use std::time::Instant;
 
 use codex_together_protocol::ConnectedMember;
 use codex_together_protocol::TogetherRole;
@@ -19,7 +22,13 @@ use super::CancellationEvent;
 use super::bottom_pane_view::BottomPaneView;
 use crate::render::renderable::Renderable;
 
+pub(crate) const TOGETHER_CENTER_VIEW_ID: &str = "together-center";
+
 const MAX_LABEL_WIDTH: usize = 14;
+const BLANK_SPRITE: &str = "     ";
+const LANDING_FINAL_FRAME: usize = 3;
+const STEPOUT_FINAL_FRAME: usize = 4;
+const ANIMATION_FRAME_MS: u64 = 90;
 
 const UNICODE_SPRITES: [[&str; 4]; 5] = [
     [" ▗▆▖ ", "▐█▀▌", "▐█▄▌", " ▝▀▘ "],
@@ -30,12 +39,23 @@ const UNICODE_SPRITES: [[&str; 4]; 5] = [
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum TogetherPresenceState {
     Connected,
     Reconnecting,
     Stale,
     Disconnected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrewAnimationState {
+    Idle,
+    Landing(usize),
+    SteppingOut(usize),
+}
+
+#[derive(Debug, Clone)]
+struct CrewSlot {
+    animation: CrewAnimationState,
 }
 
 pub(crate) struct TogetherCenterViewParams {
@@ -47,6 +67,8 @@ pub(crate) struct TogetherCenterViewParams {
     pub(crate) mask_email_labels: bool,
     pub(crate) mascot_enabled: bool,
     pub(crate) motion_enabled: bool,
+    pub(crate) landing_emails: Vec<String>,
+    pub(crate) departing_members: Vec<ConnectedMember>,
 }
 
 pub(crate) struct TogetherCenterView {
@@ -54,12 +76,15 @@ pub(crate) struct TogetherCenterView {
     owner_email: Option<String>,
     endpoint: Option<String>,
     connected_members: Vec<ConnectedMember>,
+    crew_slots: Vec<CrewSlot>,
     max_visible: usize,
     mask_email_labels: bool,
     mascot_enabled: bool,
     motion_enabled: bool,
     show_all_members: bool,
     complete: bool,
+    frame_interval: Duration,
+    last_animation_tick: Instant,
 }
 
 impl TogetherCenterView {
@@ -73,30 +98,99 @@ impl TogetherCenterView {
             mask_email_labels,
             mascot_enabled,
             motion_enabled,
+            landing_emails,
+            mut departing_members,
         } = params;
+
         connected_members.sort_by(|a, b| a.email.cmp(&b.email));
+        departing_members.sort_by(|a, b| a.email.cmp(&b.email));
+        let landing_set: HashSet<String> = landing_emails.into_iter().collect();
+        let connected_email_set: HashSet<String> = connected_members
+            .iter()
+            .map(|member| member.email.clone())
+            .collect();
+
+        let mut crew_slots = connected_members
+            .iter()
+            .map(|member| {
+                let animation = if motion_enabled && landing_set.contains(&member.email) {
+                    CrewAnimationState::Landing(0)
+                } else {
+                    CrewAnimationState::Idle
+                };
+                CrewSlot { animation }
+            })
+            .collect::<Vec<_>>();
+
+        if motion_enabled {
+            for member in departing_members {
+                if connected_email_set.contains(&member.email) {
+                    continue;
+                }
+                crew_slots.push(CrewSlot {
+                    animation: CrewAnimationState::SteppingOut(0),
+                });
+            }
+        }
+
         Self {
             state,
             owner_email,
             endpoint,
             connected_members,
+            crew_slots,
             max_visible: max_visible.max(1),
             mask_email_labels,
             mascot_enabled,
             motion_enabled,
             show_all_members: false,
             complete: false,
+            frame_interval: Duration::from_millis(ANIMATION_FRAME_MS),
+            last_animation_tick: Instant::now(),
         }
     }
 
-    fn visible_count(&self) -> usize {
+    fn visible_connected_count(&self) -> usize {
         self.connected_members.len().min(self.max_visible)
     }
 
     fn overflow_count(&self) -> usize {
         self.connected_members
             .len()
-            .saturating_sub(self.visible_count())
+            .saturating_sub(self.visible_connected_count())
+    }
+
+    fn visible_slots(&self) -> Vec<&CrewSlot> {
+        self.crew_slots.iter().take(self.max_visible).collect()
+    }
+
+    fn has_active_animation(&self) -> bool {
+        self.crew_slots.iter().any(|slot| {
+            !matches!(slot.animation, CrewAnimationState::Idle)
+                && self.mascot_enabled
+                && self.motion_enabled
+        })
+    }
+
+    fn step_animation(&mut self) {
+        self.crew_slots.retain_mut(|slot| match slot.animation {
+            CrewAnimationState::Idle => true,
+            CrewAnimationState::Landing(frame) => {
+                if frame >= LANDING_FINAL_FRAME {
+                    slot.animation = CrewAnimationState::Idle;
+                } else {
+                    slot.animation = CrewAnimationState::Landing(frame + 1);
+                }
+                true
+            }
+            CrewAnimationState::SteppingOut(frame) => {
+                if frame >= STEPOUT_FINAL_FRAME {
+                    return false;
+                }
+                slot.animation = CrewAnimationState::SteppingOut(frame + 1);
+                true
+            }
+        });
     }
 
     fn connection_status_line(&self) -> String {
@@ -116,22 +210,21 @@ impl TogetherCenterView {
             return vec!["[ mascot disabled ]".dim().into()];
         }
 
-        let visible = self.visible_count();
-        if visible == 0 {
+        let slots = self.visible_slots();
+        if slots.is_empty() {
             return vec!["[ no crew connected ]".dim().into()];
         }
 
         (0..4)
             .map(|line_idx| {
                 let mut spans = Vec::new();
-                for slot_idx in 0..visible {
+                for (slot_idx, slot) in slots.iter().enumerate() {
                     if slot_idx > 0 {
                         spans.push("  ".into());
                     }
-                    spans.push(styled_sprite(
-                        UNICODE_SPRITES[slot_idx % UNICODE_SPRITES.len()][line_idx],
-                        slot_idx,
-                    ));
+                    let sprite =
+                        sprite_line_for_state(slot_idx, slot.animation, line_idx, self.state);
+                    spans.push(style_slot(sprite, slot_idx, self.state, slot.animation));
                 }
                 Line::from(spans)
             })
@@ -145,7 +238,7 @@ impl TogetherCenterView {
             self.mask_email_labels,
             MAX_LABEL_WIDTH,
         );
-        let visible = self.visible_count();
+        let visible = self.visible_connected_count();
         for index in 0..visible {
             let member = &self.connected_members[index];
             out.push(
@@ -190,7 +283,12 @@ impl TogetherCenterView {
     fn render_lines(&self, width: usize) -> Vec<Line<'static>> {
         let mut lines = vec!["Together Center".bold().into()];
         for row in wrap(&self.connection_status_line(), width.max(1)) {
-            lines.push(row.into_owned().cyan().into());
+            lines.push(match self.state {
+                TogetherPresenceState::Connected => row.into_owned().cyan().into(),
+                TogetherPresenceState::Reconnecting => row.into_owned().yellow().into(),
+                TogetherPresenceState::Stale => row.into_owned().yellow().dim().into(),
+                TogetherPresenceState::Disconnected => row.into_owned().dim().into(),
+            });
         }
 
         if let Some(endpoint) = self.endpoint.as_deref() {
@@ -248,6 +346,10 @@ impl BottomPaneView for TogetherCenterView {
         }
     }
 
+    fn view_id(&self) -> Option<&'static str> {
+        Some(TOGETHER_CENTER_VIEW_ID)
+    }
+
     fn on_ctrl_c(&mut self) -> CancellationEvent {
         self.complete = true;
         CancellationEvent::Handled
@@ -255,6 +357,26 @@ impl BottomPaneView for TogetherCenterView {
 
     fn is_complete(&self) -> bool {
         self.complete
+    }
+
+    fn pre_draw_tick(&mut self) -> Option<Duration> {
+        if !self.has_active_animation() {
+            return None;
+        }
+
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last_animation_tick);
+        if elapsed < self.frame_interval {
+            return Some(self.frame_interval - elapsed);
+        }
+
+        self.last_animation_tick = now;
+        self.step_animation();
+        if self.has_active_animation() {
+            Some(self.frame_interval)
+        } else {
+            None
+        }
     }
 }
 
@@ -276,13 +398,65 @@ impl Renderable for TogetherCenterView {
     }
 }
 
-fn styled_sprite(text: &'static str, slot_idx: usize) -> Span<'static> {
-    match slot_idx % 5 {
-        0 => text.cyan().bold(),
-        1 => text.green().bold(),
-        2 => text.magenta().bold(),
-        3 => text.yellow().bold(),
-        _ => text.blue().bold(),
+fn style_slot(
+    text: &'static str,
+    slot_idx: usize,
+    state: TogetherPresenceState,
+    animation: CrewAnimationState,
+) -> Span<'static> {
+    let base = match slot_idx % 5 {
+        0 => text.cyan(),
+        1 => text.green(),
+        2 => text.magenta(),
+        3 => text.yellow(),
+        _ => text.blue(),
+    };
+    match (state, animation) {
+        (TogetherPresenceState::Connected, CrewAnimationState::Idle) => base.bold(),
+        (TogetherPresenceState::Connected, CrewAnimationState::Landing(_)) => base.bold(),
+        (TogetherPresenceState::Connected, CrewAnimationState::SteppingOut(_)) => base.dim(),
+        (TogetherPresenceState::Reconnecting, _) => base.dim(),
+        (TogetherPresenceState::Stale, _) => base.dim().italic(),
+        (TogetherPresenceState::Disconnected, _) => base.dim(),
+    }
+}
+
+fn sprite_line_for_state(
+    slot_idx: usize,
+    animation: CrewAnimationState,
+    line_idx: usize,
+    state: TogetherPresenceState,
+) -> &'static str {
+    let base = UNICODE_SPRITES[slot_idx % UNICODE_SPRITES.len()];
+    match animation {
+        CrewAnimationState::Idle => match state {
+            TogetherPresenceState::Connected => base[line_idx],
+            TogetherPresenceState::Reconnecting => sprite_line_for_landing(base, 1, line_idx),
+            TogetherPresenceState::Stale => sprite_line_for_stepout(base, 1, line_idx),
+            TogetherPresenceState::Disconnected => BLANK_SPRITE,
+        },
+        CrewAnimationState::Landing(frame) => sprite_line_for_landing(base, frame, line_idx),
+        CrewAnimationState::SteppingOut(frame) => sprite_line_for_stepout(base, frame, line_idx),
+    }
+}
+
+fn sprite_line_for_landing(base: [&'static str; 4], frame: usize, line_idx: usize) -> &'static str {
+    let clamped = frame.min(LANDING_FINAL_FRAME);
+    let visible_from = 3usize.saturating_sub(clamped);
+    if line_idx >= visible_from {
+        base[line_idx]
+    } else {
+        BLANK_SPRITE
+    }
+}
+
+fn sprite_line_for_stepout(base: [&'static str; 4], frame: usize, line_idx: usize) -> &'static str {
+    let clamped = frame.min(STEPOUT_FINAL_FRAME);
+    let keep_until = 4usize.saturating_sub(clamped);
+    if line_idx < keep_until {
+        base[line_idx]
+    } else {
+        BLANK_SPRITE
     }
 }
 
@@ -379,6 +553,13 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
+    fn member(email: &str, role: TogetherRole) -> ConnectedMember {
+        ConnectedMember {
+            email: email.to_string(),
+            role,
+        }
+    }
+
     #[test]
     fn masked_email_is_stable_and_compact() {
         assert_eq!(masked_email("alice@example.com"), "al***@e…");
@@ -388,18 +569,9 @@ mod tests {
     #[test]
     fn duplicate_labels_get_deterministic_suffixes() {
         let members = vec![
-            ConnectedMember {
-                email: "alice@example.com".to_string(),
-                role: TogetherRole::Member,
-            },
-            ConnectedMember {
-                email: "alice@elsewhere.com".to_string(),
-                role: TogetherRole::Member,
-            },
-            ConnectedMember {
-                email: "alice@example.com".to_string(),
-                role: TogetherRole::Owner,
-            },
+            member("alice@example.com", TogetherRole::Member),
+            member("alice@elsewhere.com", TogetherRole::Member),
+            member("alice@example.com", TogetherRole::Owner),
         ];
         let labels = render_member_labels(&members, true, MAX_LABEL_WIDTH);
         assert_eq!(labels[0], "al***@e…");
@@ -409,12 +581,57 @@ mod tests {
 
     #[test]
     fn labels_fall_back_to_hash_when_width_is_tight() {
-        let members = vec![ConnectedMember {
-            email: "very.long.user@example.com".to_string(),
-            role: TogetherRole::Member,
-        }];
+        let members = vec![member("very.long.user@example.com", TogetherRole::Member)];
         let labels = render_member_labels(&members, false, 8);
         assert_eq!(labels[0].chars().count(), 8);
         assert!(labels[0].contains('~'));
+    }
+
+    #[test]
+    fn landing_animation_transitions_to_idle() {
+        let mut view = TogetherCenterView::new(TogetherCenterViewParams {
+            state: TogetherPresenceState::Connected,
+            owner_email: None,
+            endpoint: None,
+            connected_members: vec![member("alice@example.com", TogetherRole::Member)],
+            max_visible: 5,
+            mask_email_labels: true,
+            mascot_enabled: true,
+            motion_enabled: true,
+            landing_emails: vec!["alice@example.com".to_string()],
+            departing_members: Vec::new(),
+        });
+        assert!(matches!(
+            view.crew_slots[0].animation,
+            CrewAnimationState::Landing(0)
+        ));
+        for _ in 0..=LANDING_FINAL_FRAME {
+            view.step_animation();
+        }
+        assert!(matches!(
+            view.crew_slots[0].animation,
+            CrewAnimationState::Idle
+        ));
+    }
+
+    #[test]
+    fn stepout_animation_removes_departing_member() {
+        let mut view = TogetherCenterView::new(TogetherCenterViewParams {
+            state: TogetherPresenceState::Connected,
+            owner_email: None,
+            endpoint: None,
+            connected_members: Vec::new(),
+            max_visible: 5,
+            mask_email_labels: true,
+            mascot_enabled: true,
+            motion_enabled: true,
+            landing_emails: Vec::new(),
+            departing_members: vec![member("alice@example.com", TogetherRole::Member)],
+        });
+        assert_eq!(view.crew_slots.len(), 1);
+        for _ in 0..=STEPOUT_FINAL_FRAME {
+            view.step_animation();
+        }
+        assert!(view.crew_slots.is_empty());
     }
 }

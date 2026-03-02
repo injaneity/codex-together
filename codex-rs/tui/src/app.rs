@@ -3189,6 +3189,10 @@ impl App {
             AppEvent::OpenTogetherCenterView { server_info } => {
                 self.chat_widget.show_together_center_view(server_info);
             }
+            AppEvent::TogetherPresenceUpdated { server_info, state } => {
+                self.chat_widget
+                    .handle_together_presence_update(server_info, state);
+            }
             AppEvent::DismissBottomPaneView => {
                 self.chat_widget.dismiss_active_bottom_pane_view();
             }

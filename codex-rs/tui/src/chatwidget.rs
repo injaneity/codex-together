@@ -352,6 +352,7 @@ const DEFAULT_STATUS_LINE_ITEMS: [&str; 3] =
 const TOGETHER_DEFAULT_ENDPOINT_URL: &str = "ws://127.0.0.1:8788/ws";
 const TOGETHER_ENDPOINT_ENV_KEY: &str = "CODEX_TOGETHER_ENDPOINT";
 const TOGETHER_ENDPOINT_ALIASES_ENV_KEY: &str = "CODEX_TOGETHER_ENDPOINT_ALIASES";
+const TOGETHER_CHECKED_OUT_THREAD_ENV_KEY: &str = "CODEX_TOGETHER_CHECKED_OUT_THREAD";
 const TOGETHER_ACTOR_ENV_KEY: &str = "CODEX_TOGETHER_ACTOR";
 const NGROK_TUNNELS_API_URL: &str = "http://127.0.0.1:4040/api/tunnels";
 // Track information about an in-flight exec command.
@@ -8803,6 +8804,7 @@ async fn execute_together_command(
                 "together host:{}",
                 short_server_id(&response.server_id)
             )));
+            clear_together_checked_out_thread();
 
             Ok(TogetherCommandOutput {
                 message: format!(
@@ -8826,6 +8828,7 @@ async fn execute_together_command(
                 .await;
             set_together_status(Some("disconnected".to_string()));
             clear_together_endpoint();
+            clear_together_checked_out_thread();
             if let Err(err) = close_result {
                 if !together_not_connected(&err) {
                     return Err(err);
@@ -8861,6 +8864,7 @@ async fn execute_together_command(
                 &response.owner_email,
                 &response.server_id,
             )));
+            clear_together_checked_out_thread();
             Ok(TogetherCommandOutput {
                 message: format!(
                     "Joined together server {}",
@@ -8883,6 +8887,7 @@ async fn execute_together_command(
                     .await;
             set_together_status(Some("disconnected".to_string()));
             clear_together_endpoint();
+            clear_together_checked_out_thread();
             if let Err(err) = leave_result {
                 if !together_not_connected(&err) {
                     return Err(err);
@@ -8901,6 +8906,7 @@ async fn execute_together_command(
             let thread_id = rest
                 .first()
                 .cloned()
+                .or_else(current_together_checked_out_thread)
                 .or(current_thread_id)
                 .ok_or_else(|| anyhow::anyhow!("usage: /share [thread-id]"))?;
             let endpoint = current_together_endpoint();
@@ -8935,6 +8941,7 @@ async fn execute_together_command(
                     },
                 )
                 .await?;
+            set_together_checked_out_thread(Some(response.thread_id.clone()));
             let mode = if response.writable {
                 "writable"
             } else {
@@ -9114,7 +9121,7 @@ pub(crate) async fn fork_thread_via_together(
 ) -> anyhow::Result<TogetherThreadForkResponse> {
     let endpoint = current_together_endpoint();
     let mut client = connect_and_auth(&endpoint).await?;
-    client
+    let response: TogetherThreadForkResponse = client
         .call(
             METHOD_TOGETHER_THREAD_FORK,
             TogetherThreadForkRequest {
@@ -9122,7 +9129,13 @@ pub(crate) async fn fork_thread_via_together(
                 cwd: Some(cwd.display().to_string()),
             },
         )
-        .await
+        .await?;
+    set_together_checked_out_thread(Some(response.child_thread_id.clone()));
+    Ok(response)
+}
+
+pub(crate) fn together_checked_out_thread_id() -> Option<String> {
+    current_together_checked_out_thread()
 }
 
 async fn fetch_together_thread_replay(
@@ -9638,6 +9651,13 @@ fn current_together_endpoint() -> String {
         .unwrap_or_else(|| TOGETHER_DEFAULT_ENDPOINT_URL.to_string())
 }
 
+fn current_together_checked_out_thread() -> Option<String> {
+    std::env::var(TOGETHER_CHECKED_OUT_THREAD_ENV_KEY)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn set_together_status(value: Option<String>) {
     unsafe {
         match value {
@@ -9656,8 +9676,21 @@ fn set_together_endpoint(value: Option<String>) {
     }
 }
 
+fn set_together_checked_out_thread(value: Option<String>) {
+    unsafe {
+        match value {
+            Some(value) => std::env::set_var(TOGETHER_CHECKED_OUT_THREAD_ENV_KEY, value),
+            None => std::env::remove_var(TOGETHER_CHECKED_OUT_THREAD_ENV_KEY),
+        }
+    }
+}
+
 fn clear_together_endpoint() {
     set_together_endpoint(None);
+}
+
+fn clear_together_checked_out_thread() {
+    set_together_checked_out_thread(None);
 }
 
 fn short_server_id(server_id: &str) -> String {

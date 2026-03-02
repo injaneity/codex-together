@@ -13,6 +13,7 @@ use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ExternalEditorState;
 use crate::chatwidget::fork_thread_via_together;
+use crate::chatwidget::together_checked_out_thread_id;
 use crate::cwd_prompt::CwdPromptAction;
 use crate::diff_render::DiffSummary;
 use crate::exec_command::strip_bash_lc_and_escape;
@@ -2038,10 +2039,10 @@ impl App {
                 let mut handled_via_together = false;
 
                 if together_connected {
-                    if let Some(current_thread_id) =
-                        self.chat_widget.thread_id().map(|id| id.to_string())
-                    {
-                        match fork_thread_via_together(current_thread_id, self.config.cwd.clone())
+                    let fork_target_thread_id = together_checked_out_thread_id()
+                        .or_else(|| self.chat_widget.thread_id().map(|id| id.to_string()));
+                    if let Some(target_thread_id) = fork_target_thread_id {
+                        match fork_thread_via_together(target_thread_id, self.config.cwd.clone())
                             .await
                         {
                             Ok(forked) => {
@@ -2128,17 +2129,22 @@ impl App {
                                 handled_via_together = true;
                             }
                             Err(err) => {
+                                self.chat_widget
+                                    .add_error_message(format!("Together /fork failed: {err}"));
                                 self.chat_widget.add_info_message(
-                                    format!("Together fork unavailable; falling back to local /fork ({err})"),
+                                    "Use /threads to select a shared thread and press f to fork it."
+                                        .to_string(),
                                     None,
                                 );
+                                handled_via_together = true;
                             }
                         }
                     } else {
                         self.chat_widget.add_error_message(
-                            "Current thread id is unavailable; cannot fork via together."
+                            "No together thread selected to fork. Use /threads and press Enter to checkout, then /fork."
                                 .to_string(),
                         );
+                        handled_via_together = true;
                     }
                 }
 

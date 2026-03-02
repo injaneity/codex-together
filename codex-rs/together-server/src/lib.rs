@@ -1665,7 +1665,7 @@ fn app_server_thread_not_loaded(err: &AppServerError) -> bool {
     matches!(
         err,
         AppServerError::Rpc { code, message }
-            if *code == -32600
+            if (*code == -32600 || *code == -32602 || *code == -32603)
                 && message.to_ascii_lowercase().contains("thread not loaded")
     )
 }

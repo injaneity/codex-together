@@ -461,6 +461,9 @@ pub(crate) enum AppEvent {
         owner_email: String,
     },
 
+    /// Leave the current read-only together checkout and return to the prior local session.
+    ExitReadOnlyTogetherCheckout,
+
     /// Submit a user message with an explicit collaboration mask.
     SubmitUserMessageWithMode {
         text: String,

@@ -1750,6 +1750,7 @@ async fn make_chatwidget_manual(
         feedback: codex_feedback::CodexFeedback::new(),
         feedback_audience: FeedbackAudience::External,
         current_rollout_path: None,
+        read_only_together_checkout_owner: None,
         current_cwd: None,
         session_network_proxy: None,
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
@@ -1843,6 +1844,34 @@ async fn together_threads_view_refresh_snapshot() {
         "together_threads_view_refresh_after_delete",
         terminal.backend()
     );
+}
+
+#[test]
+fn together_status_hint_includes_server_build_identity() {
+    let hint = render_together_server_status_hint(
+        &TogetherServerInfoResponse {
+            server_id: "srv_1234567890abcdef".to_string(),
+            owner_email: "zanechee@local".to_string(),
+            public_base_url: "https://example.ngrok-free.app".to_string(),
+            version: "0.0.0".to_string(),
+            commit: Some("62a1b2ae4deadbeef".to_string()),
+            role: TogetherRole::Member,
+            connected_members: vec![
+                ConnectedMember {
+                    email: "zanechee@local".to_string(),
+                    role: TogetherRole::Owner,
+                },
+                ConnectedMember {
+                    email: "weisintai@local".to_string(),
+                    role: TogetherRole::Member,
+                },
+            ],
+        },
+        "wss://example.ngrok-free.app/ws",
+        "zanechee@local (owner), weisintai@local (member)",
+    );
+
+    assert_snapshot!("together_status_hint_with_build_identity", hint);
 }
 
 fn set_chatgpt_auth(chat: &mut ChatWidget) {
@@ -5101,6 +5130,26 @@ async fn slash_fork_requests_current_fork() {
     chat.dispatch_command(SlashCommand::Fork);
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::ForkCurrentSession));
+}
+
+#[tokio::test]
+async fn read_only_together_checkout_f_requests_fork() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.set_together_checkout_mode(false, "owner@example.com");
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::ForkCurrentSession));
+}
+
+#[tokio::test]
+async fn read_only_together_checkout_escape_requests_exit() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.set_together_checkout_mode(false, "owner@example.com");
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::ExitReadOnlyTogetherCheckout));
 }
 
 #[tokio::test]

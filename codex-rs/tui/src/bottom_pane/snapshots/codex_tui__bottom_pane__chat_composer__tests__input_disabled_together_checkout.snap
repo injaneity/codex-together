@@ -3,7 +3,7 @@ source: tui/src/bottom_pane/chat_composer.rs
 expression: terminal.backend()
 ---
 "                                                                                                    "
-"› Read-only together checkout owned by owner@example.com. Use /fork before writing.                 "
+"› Read-only together checkout owned by owner@example.com. Press f to fork or Esc to leave.          "
 "                                                                                                    "
 "                                                                                                    "
 "                                                                                                    "

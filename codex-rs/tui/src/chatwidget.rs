@@ -816,6 +816,7 @@ pub(crate) struct ChatWidget {
     feedback_audience: FeedbackAudience,
     // Current session rollout path (if known)
     current_rollout_path: Option<PathBuf>,
+    read_only_together_checkout_owner: Option<String>,
     // Current working directory (if known)
     current_cwd: Option<PathBuf>,
     // Runtime network proxy bind addresses from SessionConfigured.
@@ -3051,6 +3052,7 @@ impl ChatWidget {
             feedback,
             feedback_audience,
             current_rollout_path: None,
+            read_only_together_checkout_owner: None,
             current_cwd,
             session_network_proxy: None,
             status_line_invalid_items_warned,
@@ -3234,6 +3236,7 @@ impl ChatWidget {
             feedback,
             feedback_audience,
             current_rollout_path: None,
+            read_only_together_checkout_owner: None,
             current_cwd,
             session_network_proxy: None,
             status_line_invalid_items_warned,
@@ -3406,6 +3409,7 @@ impl ChatWidget {
             feedback,
             feedback_audience,
             current_rollout_path: None,
+            read_only_together_checkout_owner: None,
             current_cwd,
             session_network_proxy: None,
             status_line_invalid_items_warned,
@@ -3522,6 +3526,33 @@ impl ChatWidget {
                 self.request_redraw();
             }
             return;
+        }
+
+        if key_event.kind == KeyEventKind::Press
+            && self.read_only_together_checkout_owner.is_some()
+            && self.bottom_pane.no_modal_or_popup_active()
+            && !self.bottom_pane.is_task_running()
+        {
+            match key_event {
+                KeyEvent {
+                    code: KeyCode::Char('f'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                } => {
+                    self.app_event_tx.send(AppEvent::ForkCurrentSession);
+                    return;
+                }
+                KeyEvent {
+                    code: KeyCode::Esc,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                } => {
+                    self.app_event_tx
+                        .send(AppEvent::ExitReadOnlyTogetherCheckout);
+                    return;
+                }
+                _ => {}
+            }
         }
 
         match key_event {
@@ -8901,12 +8932,14 @@ impl ChatWidget {
 
     pub(crate) fn set_together_checkout_mode(&mut self, writable: bool, owner_email: &str) {
         if writable {
+            self.read_only_together_checkout_owner = None;
             self.bottom_pane.set_composer_input_enabled(true, None);
         } else {
+            self.read_only_together_checkout_owner = Some(owner_email.to_string());
             self.bottom_pane.set_composer_input_enabled(
                 false,
                 Some(format!(
-                    "Read-only together checkout owned by {owner_email}. Use /fork before writing."
+                    "Read-only together checkout owned by {owner_email}. Press f to fork or Esc to leave."
                 )),
             );
         }
@@ -9792,13 +9825,10 @@ async fn execute_together_command(
                 .join(", ");
             Ok(TogetherCommandOutput {
                 message: format!("Together server {}", short_server_id(&response.server_id)),
-                hint: Some(format!(
-                    "Owner: {}\nRole: {}\nEndpoint: {}\nPublic URL: {}\nConnected: {}",
-                    response.owner_email,
-                    together_role_label(response.role),
-                    endpoint,
-                    response.public_base_url,
-                    connected
+                hint: Some(render_together_server_status_hint(
+                    &response,
+                    endpoint.as_str(),
+                    connected.as_str(),
                 )),
                 follow_up: None,
             })
@@ -9816,7 +9846,7 @@ pub(crate) async fn fork_thread_via_together(
 ) -> anyhow::Result<TogetherThreadForkResponse> {
     let endpoint = current_together_endpoint();
     let mut client = connect_and_auth(&endpoint).await?;
-    let response: TogetherThreadForkResponse = client
+    let mut response: TogetherThreadForkResponse = client
         .call(
             METHOD_TOGETHER_THREAD_FORK,
             TogetherThreadForkRequest {
@@ -9825,12 +9855,19 @@ pub(crate) async fn fork_thread_via_together(
             },
         )
         .await?;
+    if response.owner_email.is_empty() {
+        response.owner_email = local_together_actor_id();
+    }
     set_together_checked_out_thread(Some(response.child_thread_id.clone()));
     Ok(response)
 }
 
 pub(crate) fn together_checked_out_thread_id() -> Option<String> {
     current_together_checked_out_thread()
+}
+
+pub(crate) fn clear_together_checked_out_thread_id() {
+    clear_together_checked_out_thread();
 }
 
 pub(crate) async fn fetch_together_thread_replay(
@@ -10441,6 +10478,34 @@ fn together_role_label(role: TogetherRole) -> &'static str {
         TogetherRole::Owner => "Owner",
         TogetherRole::Member => "Member",
     }
+}
+
+fn render_together_server_status_hint(
+    response: &TogetherServerInfoResponse,
+    endpoint: &str,
+    connected: &str,
+) -> String {
+    let version = if response.version.is_empty() {
+        "unknown".to_string()
+    } else {
+        response.version.clone()
+    };
+    let commit = response
+        .commit
+        .as_deref()
+        .filter(|commit| !commit.is_empty())
+        .map(short_server_id)
+        .unwrap_or_else(|| "unknown".to_string());
+    format!(
+        "Owner: {}\nRole: {}\nVersion: {}\nCommit: {}\nEndpoint: {}\nPublic URL: {}\nConnected: {}",
+        response.owner_email,
+        together_role_label(response.role),
+        version,
+        commit,
+        endpoint,
+        response.public_base_url,
+        connected
+    )
 }
 
 fn status_label_for_role(role: TogetherRole, owner_email: &str, server_id: &str) -> String {

@@ -1,0 +1,11 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: hint
+---
+Owner: zanechee@local
+Role: Member
+Version: 0.0.0
+Commit: 62a1b2ae4dea
+Endpoint: wss://example.ngrok-free.app/ws
+Public URL: https://example.ngrok-free.app
+Connected: zanechee@local (owner), weisintai@local (member)

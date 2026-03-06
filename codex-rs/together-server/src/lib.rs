@@ -41,6 +41,8 @@ use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::UserInput;
 use codex_core::RolloutRecorder;
 use codex_core::config::find_codex_home;
+use codex_core::git_info::get_git_repo_root;
+use codex_core::git_info::get_head_commit_hash;
 use codex_protocol::ThreadId;
 use codex_state::StateRuntime;
 use codex_state::TogetherClientMode as StateTogetherClientMode;
@@ -251,6 +253,12 @@ async fn healthz() -> Json<Healthz> {
         ok: true,
         version: env!("CARGO_PKG_VERSION"),
     })
+}
+
+async fn together_build_commit() -> Option<String> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = get_git_repo_root(manifest_dir)?;
+    get_head_commit_hash(repo_root.as_path()).await
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
@@ -713,6 +721,7 @@ async fn together_server_info(
         });
     }
     connected_members.sort_by(|a, b| a.email.cmp(&b.email));
+    let commit = together_build_commit().await;
 
     JsonRpcResponse::ok(
         req.id,
@@ -720,6 +729,8 @@ async fn together_server_info(
             server_id: hosted.server_id.clone(),
             owner_email: hosted.owner_email.clone(),
             public_base_url: hosted.public_base_url.clone(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            commit,
             role,
             connected_members,
         },

@@ -12,6 +12,7 @@ use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ExternalEditorState;
+use crate::chatwidget::clear_together_checked_out_thread_id;
 use crate::chatwidget::fetch_together_thread_replay;
 use crate::chatwidget::fork_thread_via_together;
 use crate::chatwidget::together_checked_out_thread_id;
@@ -699,6 +700,7 @@ pub(crate) struct App {
     primary_thread_id: Option<ThreadId>,
     primary_session_configured: Option<SessionConfiguredEvent>,
     pending_primary_events: VecDeque<Event>,
+    read_only_together_checkout_return_path: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -758,9 +760,19 @@ impl App {
         writable: bool,
         owner_email: String,
     ) {
+        let previous_rollout_path = if writable {
+            None
+        } else {
+            self.chat_widget.rollout_path()
+        };
         if self.chat_widget.thread_id().map(|id| id.to_string()) == Some(thread_id.clone()) {
             self.chat_widget
                 .set_together_checkout_mode(writable, owner_email.as_str());
+            if writable {
+                self.read_only_together_checkout_return_path = None;
+            } else if self.read_only_together_checkout_return_path.is_none() {
+                self.read_only_together_checkout_return_path = previous_rollout_path;
+            }
             return;
         }
 
@@ -772,6 +784,7 @@ impl App {
                     self.swap_in_existing_thread(tui, resumed).await;
                     self.chat_widget
                         .set_together_checkout_mode(writable, owner_email.as_str());
+                    self.read_only_together_checkout_return_path = previous_rollout_path;
                 }
                 Err(err) => {
                     self.chat_widget.add_error_message(format!(
@@ -796,6 +809,7 @@ impl App {
                     self.swap_in_existing_thread(tui, resumed).await;
                     self.chat_widget
                         .set_together_checkout_mode(writable, owner_email.as_str());
+                    self.read_only_together_checkout_return_path = previous_rollout_path;
                 }
                 Err(err) => {
                     let path_display = path.display();
@@ -810,6 +824,7 @@ impl App {
                         .replay_together_thread_messages(thread_id.clone(), replay.messages);
                     self.chat_widget
                         .set_together_checkout_mode(writable, owner_email.as_str());
+                    self.read_only_together_checkout_return_path = previous_rollout_path;
                 }
                 Err(err) => {
                     self.chat_widget.add_error_message(format!(
@@ -846,6 +861,36 @@ impl App {
         self.chat_widget =
             ChatWidget::new_from_existing(init, resumed.thread, resumed.session_configured);
         self.reset_thread_event_state();
+    }
+
+    async fn exit_read_only_together_checkout(&mut self, tui: &mut tui::Tui) {
+        clear_together_checked_out_thread_id();
+        let Some(path) = self.read_only_together_checkout_return_path.take() else {
+            self.start_fresh_session_with_summary_hint(tui).await;
+            return;
+        };
+
+        match self
+            .server
+            .resume_thread_from_rollout(
+                self.config.clone(),
+                path.clone(),
+                self.auth_manager.clone(),
+            )
+            .await
+        {
+            Ok(resumed) => {
+                self.swap_in_existing_thread(tui, resumed).await;
+                self.chat_widget.set_together_checkout_mode(true, "");
+            }
+            Err(err) => {
+                let path_display = path.display();
+                self.chat_widget.add_error_message(format!(
+                    "Failed to restore the previous local thread from {path_display}: {err}"
+                ));
+                self.start_fresh_session_with_summary_hint(tui).await;
+            }
+        }
     }
 
     async fn rebuild_config_for_cwd(&self, cwd: PathBuf) -> Result<Config> {
@@ -1835,6 +1880,7 @@ impl App {
             primary_thread_id: None,
             primary_session_configured: None,
             pending_primary_events: VecDeque::new(),
+            read_only_together_checkout_return_path: None,
         };
 
         // On startup, if Agent mode (workspace-write) or ReadOnly is active, warn about world-writable dirs on Windows.
@@ -2159,6 +2205,7 @@ impl App {
                                                 forked.writable,
                                                 forked.owner_email.as_str(),
                                             );
+                                            self.read_only_together_checkout_return_path = None;
                                             if let Some(summary) = summary.as_ref() {
                                                 let mut lines: Vec<Line<'static>> =
                                                     vec![summary.usage_line.clone().into()];
@@ -2208,6 +2255,8 @@ impl App {
                                                         forked.writable,
                                                         forked.owner_email.as_str(),
                                                     );
+                                                    self.read_only_together_checkout_return_path =
+                                                        None;
                                                     if let Some(summary) = summary.as_ref() {
                                                         let mut lines: Vec<Line<'static>> =
                                                             vec![summary.usage_line.clone().into()];
@@ -3350,6 +3399,9 @@ impl App {
             } => {
                 self.resume_together_thread(tui, thread_id, history, writable, owner_email)
                     .await;
+            }
+            AppEvent::ExitReadOnlyTogetherCheckout => {
+                self.exit_read_only_together_checkout(tui).await;
             }
             AppEvent::SubmitUserMessageWithMode {
                 text,
@@ -4721,6 +4773,7 @@ mod tests {
             primary_thread_id: None,
             primary_session_configured: None,
             pending_primary_events: VecDeque::new(),
+            read_only_together_checkout_return_path: None,
         }
     }
 
@@ -4781,6 +4834,7 @@ mod tests {
                 primary_thread_id: None,
                 primary_session_configured: None,
                 pending_primary_events: VecDeque::new(),
+                read_only_together_checkout_return_path: None,
             },
             rx,
             op_rx,

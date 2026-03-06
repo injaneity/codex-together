@@ -172,6 +172,10 @@ pub struct TogetherServerInfoResponse {
     pub server_id: String,
     pub owner_email: String,
     pub public_base_url: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub commit: Option<String>,
     pub role: TogetherRole,
     pub connected_members: Vec<ConnectedMember>,
 }
@@ -253,6 +257,7 @@ pub struct TogetherThreadForkRequest {
 pub struct TogetherThreadForkResponse {
     pub parent_thread_id: String,
     pub child_thread_id: String,
+    #[serde(default)]
     pub owner_email: String,
     pub history: Option<Vec<RolloutItem>>,
     pub writable: bool,

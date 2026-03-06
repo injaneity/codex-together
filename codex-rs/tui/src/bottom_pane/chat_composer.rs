@@ -9484,12 +9484,12 @@ mod tests {
     fn input_disabled_together_checkout_snapshot() {
         snapshot_composer_state("input_disabled_together_checkout", true, |composer| {
             composer.set_input_enabled(
-                    false,
-                    Some(
-                        "Read-only together checkout owned by owner@example.com. Use /fork before writing."
-                            .to_string(),
-                    ),
-                );
+                false,
+                Some(
+                    "Read-only together checkout owned by owner@example.com. Press f to fork or Esc to leave."
+                        .to_string(),
+                ),
+            );
         });
     }
 }

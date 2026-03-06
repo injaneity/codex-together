@@ -39,7 +39,9 @@ use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::UserInput;
+use codex_core::RolloutRecorder;
 use codex_core::config::find_codex_home;
+use codex_protocol::ThreadId;
 use codex_state::StateRuntime;
 use codex_state::TogetherClientMode as StateTogetherClientMode;
 use codex_state::TogetherClientSession as StateTogetherClientSession;
@@ -172,6 +174,7 @@ struct SharedThread {
     owner_email: String,
     preview: Option<String>,
     shared_at: String,
+    history: Option<Vec<codex_protocol::protocol::RolloutItem>>,
 }
 
 #[derive(Debug, Clone)]
@@ -761,42 +764,60 @@ async fn together_thread_share(
         hosted.threads.contains_key(&payload.thread_id)
     };
 
-    let (thread, include_turns_available) = {
-        let mut bridge = state.app_server.lock().await;
-        match bridge.thread_read(payload.thread_id.clone(), true).await {
-            Ok(response) => (response.thread, true),
-            Err(err) => {
-                if app_server_thread_not_loaded(&err) {
-                    match bridge.thread_read(payload.thread_id.clone(), false).await {
-                        Ok(response) => (response.thread, false),
-                        Err(fallback_err) if app_server_thread_not_loaded(&fallback_err) => {
-                            let reason = if has_existing_shared {
-                                "thread is not loaded on this together host; unable to refresh preview from latest turns"
-                            } else {
-                                "thread is not loaded on this together host; if this thread was forked locally, fork it via together first"
-                            };
-                            return rpc_error(req.id, -32602, reason);
+    let (preview, shared_history) = if let Some(history) = payload.history.clone() {
+        if history.is_empty() {
+            return rpc_error(
+                req.id,
+                -32602,
+                "cannot share thread: no persisted turns yet; send at least one message first",
+            );
+        }
+        let shared_history = canonicalize_shared_history(&payload.thread_id, history);
+        (
+            rollout_history_preview(shared_history.as_slice()),
+            Some(shared_history),
+        )
+    } else {
+        let (thread, include_turns_available) = {
+            let mut bridge = state.app_server.lock().await;
+            match bridge.thread_read(payload.thread_id.clone(), true).await {
+                Ok(response) => (response.thread, true),
+                Err(err) => {
+                    if app_server_thread_not_loaded(&err) {
+                        match bridge.thread_read(payload.thread_id.clone(), false).await {
+                            Ok(response) => (response.thread, false),
+                            Err(fallback_err) if app_server_thread_not_loaded(&fallback_err) => {
+                                let reason = if has_existing_shared {
+                                    "thread is not loaded on this together host; unable to refresh preview from latest turns"
+                                } else {
+                                    "thread is not loaded on this together host; if this thread was forked locally, fork it via together first"
+                                };
+                                return rpc_error(req.id, -32602, reason);
+                            }
+                            Err(fallback_err) => {
+                                return app_server_error_response(req.id, fallback_err);
+                            }
                         }
-                        Err(fallback_err) => {
-                            return app_server_error_response(req.id, fallback_err);
-                        }
+                    } else {
+                        return app_server_error_response(req.id, err);
                     }
-                } else {
-                    return app_server_error_response(req.id, err);
                 }
             }
+        };
+
+        if include_turns_available && thread.turns.is_empty() {
+            return rpc_error(
+                req.id,
+                -32602,
+                "cannot share thread: no persisted turns yet; send at least one message first",
+            );
         }
+
+        (
+            non_empty_string(thread.preview),
+            forkable_history_from_rollout(thread.path.as_ref()).await,
+        )
     };
-
-    if include_turns_available && thread.turns.is_empty() {
-        return rpc_error(
-            req.id,
-            -32602,
-            "cannot share thread: no persisted turns yet; send at least one message first",
-        );
-    }
-
-    let preview = non_empty_string(thread.preview);
     let shared_at = Utc::now().to_rfc3339();
     let shared_at_epoch = Utc::now().timestamp();
 
@@ -834,6 +855,7 @@ async fn together_thread_share(
                     owner_email: owner_email.clone(),
                     preview: preview.clone(),
                     shared_at: shared_at.clone(),
+                    history: shared_history.clone(),
                 },
             );
 
@@ -946,7 +968,7 @@ async fn together_thread_read(
         .clone()
         .unwrap_or_else(|| "guest@local".to_string());
 
-    let owner_email = {
+    let maybe_snapshot = {
         let guard = state.inner.lock().await;
         let Some(hosted) = guard.hosted.as_ref() else {
             return rpc_error(req.id, RPC_ERR_NOT_CONNECTED, "TOGETHER_NOT_CONNECTED");
@@ -962,8 +984,23 @@ async fn together_thread_read(
         let Some(thread) = hosted.threads.get(&payload.thread_id) else {
             return rpc_error(req.id, -32602, "thread not shared");
         };
-        thread.owner_email.clone()
+        (thread.owner_email.clone(), thread.history.clone())
     };
+
+    let (owner_email, snapshot_history) = maybe_snapshot;
+
+    if let Some(history) = snapshot_history {
+        return JsonRpcResponse::ok(
+            req.id,
+            TogetherThreadReadResponse {
+                thread_id: payload.thread_id,
+                owner_email,
+                history: Some(history.clone()),
+                messages: replay_messages_from_history(history.as_slice()),
+            },
+        )
+        .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"));
+    }
 
     let thread_read = {
         let mut bridge = state.app_server.lock().await;
@@ -978,6 +1015,7 @@ async fn together_thread_read(
         TogetherThreadReadResponse {
             thread_id: payload.thread_id,
             owner_email,
+            history: forkable_history_from_rollout(thread_read.thread.path.as_ref()).await,
             messages: replay_messages_from_turns(&thread_read.thread.turns),
         },
     )
@@ -998,7 +1036,7 @@ async fn together_thread_fork(
         .clone()
         .unwrap_or_else(|| "guest@local".to_string());
 
-    {
+    let parent_snapshot = {
         let guard = state.inner.lock().await;
         let Some(hosted) = guard.hosted.as_ref() else {
             return rpc_error(req.id, RPC_ERR_NOT_CONNECTED, "TOGETHER_NOT_CONNECTED");
@@ -1013,6 +1051,112 @@ async fn together_thread_fork(
         if !hosted.threads.contains_key(&payload.thread_id) {
             return rpc_error(req.id, -32602, "thread not shared");
         }
+        hosted
+            .threads
+            .get(&payload.thread_id)
+            .and_then(|thread| thread.history.clone())
+    };
+
+    if let Some(history) = parent_snapshot {
+        if history.is_empty() {
+            return rpc_error(
+                req.id,
+                -32602,
+                "cannot fork thread: no persisted turns yet; send at least one message first",
+            );
+        }
+
+        let child_thread_id = ThreadId::default().to_string();
+        let child_thread_owner_email = caller_email.clone();
+        let preview = rollout_history_preview(history.as_slice());
+        let child_history = Some(history.clone());
+        let now = Utc::now();
+        let created_at = now.to_rfc3339();
+        let created_at_epoch = now.timestamp();
+
+        let server_id = {
+            let mut guard = state.inner.lock().await;
+            let (server_id, edge) = {
+                let Some(hosted) = guard.hosted.as_mut() else {
+                    return rpc_error(req.id, RPC_ERR_NOT_CONNECTED, "TOGETHER_NOT_CONNECTED");
+                };
+
+                hosted.threads.insert(
+                    child_thread_id.clone(),
+                    SharedThread {
+                        thread_id: child_thread_id.clone(),
+                        owner_email: caller_email.clone(),
+                        preview,
+                        shared_at: created_at.clone(),
+                        history: child_history.clone(),
+                    },
+                );
+
+                let edge = ForkEdge {
+                    parent_thread_id: payload.thread_id.clone(),
+                    child_thread_id: child_thread_id.clone(),
+                    actor_email: caller_email.clone(),
+                    created_at: created_at.clone(),
+                };
+                hosted.forks.push(edge.clone());
+
+                (hosted.server_id.clone(), edge)
+            };
+            broadcast_notification(
+                &guard,
+                NOTIFY_TOGETHER_THREAD_FORKED,
+                serde_json::json!({
+                    "parentThreadId": edge.parent_thread_id,
+                    "childThreadId": edge.child_thread_id,
+                    "actorEmail": edge.actor_email,
+                    "createdAt": edge.created_at,
+                }),
+            );
+
+            server_id
+        };
+
+        if let Err(err) = state
+            .state_db
+            .upsert_together_thread_acl(&TogetherThreadAclRecord {
+                server_id: server_id.clone(),
+                thread_id: child_thread_id.clone(),
+                owner_email: caller_email.clone(),
+                shared_by_email: caller_email.clone(),
+                shared_at: created_at_epoch,
+            })
+            .await
+        {
+            error!(error = %err, "failed to persist forked thread ACL");
+            return rpc_error(req.id, -32603, "failed to persist fork metadata");
+        }
+
+        if let Err(err) = state
+            .state_db
+            .insert_together_thread_fork(&TogetherThreadForkRecord {
+                server_id,
+                child_thread_id: child_thread_id.clone(),
+                parent_thread_id: payload.thread_id.clone(),
+                actor_email: caller_email,
+                created_at: created_at_epoch,
+            })
+            .await
+        {
+            error!(error = %err, "failed to persist thread fork edge");
+            return rpc_error(req.id, -32603, "failed to persist fork metadata");
+        }
+
+        return JsonRpcResponse::ok(
+            req.id,
+            TogetherThreadForkResponse {
+                parent_thread_id: payload.thread_id,
+                child_thread_id,
+                owner_email: child_thread_owner_email,
+                history: Some(history),
+                writable: true,
+            },
+        )
+        .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"));
     }
 
     {
@@ -1042,7 +1186,9 @@ async fn together_thread_fork(
     };
 
     let child_thread_id = forked.thread.id.clone();
+    let child_thread_owner_email = caller_email.clone();
     let preview = non_empty_string(forked.thread.preview);
+    let child_history = forkable_history_from_rollout(forked.thread.path.as_ref()).await;
     let now = Utc::now();
     let created_at = now.to_rfc3339();
     let created_at_epoch = now.timestamp();
@@ -1061,6 +1207,7 @@ async fn together_thread_fork(
                     owner_email: caller_email.clone(),
                     preview,
                     shared_at: created_at.clone(),
+                    history: child_history.clone(),
                 },
             );
 
@@ -1123,6 +1270,8 @@ async fn together_thread_fork(
         TogetherThreadForkResponse {
             parent_thread_id: payload.thread_id,
             child_thread_id,
+            owner_email: child_thread_owner_email,
+            history: child_history,
             writable: true,
         },
     )
@@ -1644,6 +1793,101 @@ fn replay_messages_from_turns(turns: &[Turn]) -> Vec<TogetherReplayMessage> {
         }
     }
     out
+}
+
+fn replay_messages_from_history(
+    history: &[codex_protocol::protocol::RolloutItem],
+) -> Vec<TogetherReplayMessage> {
+    history
+        .iter()
+        .filter_map(|item| match item {
+            codex_protocol::protocol::RolloutItem::ResponseItem(
+                codex_protocol::models::ResponseItem::Message { role, content, .. },
+            ) => history_message_from_content(role.as_str(), content.as_slice()),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn forkable_history_from_rollout(
+    path: Option<&PathBuf>,
+) -> Option<Vec<codex_protocol::protocol::RolloutItem>> {
+    let path = path?;
+
+    match RolloutRecorder::get_rollout_history(path).await {
+        Ok(codex_protocol::protocol::InitialHistory::New) => None,
+        Ok(codex_protocol::protocol::InitialHistory::Resumed(resumed)) => Some(resumed.history),
+        Ok(codex_protocol::protocol::InitialHistory::Forked(items)) => Some(items),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                rollout_path = %path.display(),
+                "failed to read together rollout history"
+            );
+            None
+        }
+    }
+}
+
+fn canonicalize_shared_history(
+    thread_id: &str,
+    mut history: Vec<codex_protocol::protocol::RolloutItem>,
+) -> Vec<codex_protocol::protocol::RolloutItem> {
+    if let Ok(shared_thread_id) = ThreadId::from_string(thread_id)
+        && let Some(codex_protocol::protocol::RolloutItem::SessionMeta(meta_line)) = history
+            .iter_mut()
+            .find(|item| matches!(item, codex_protocol::protocol::RolloutItem::SessionMeta(_)))
+    {
+        meta_line.meta.id = shared_thread_id;
+    }
+    history
+}
+
+fn rollout_history_preview(history: &[codex_protocol::protocol::RolloutItem]) -> Option<String> {
+    history.iter().find_map(|item| match item {
+        codex_protocol::protocol::RolloutItem::ResponseItem(
+            codex_protocol::models::ResponseItem::Message { role, content, .. },
+        ) if role == "user" => non_empty_string(
+            content
+                .iter()
+                .filter_map(|entry| match entry {
+                    codex_protocol::models::ContentItem::InputText { text }
+                    | codex_protocol::models::ContentItem::OutputText { text } => {
+                        Some(text.clone())
+                    }
+                    codex_protocol::models::ContentItem::InputImage { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => None,
+    })
+}
+
+fn history_message_from_content(
+    role: &str,
+    content: &[codex_protocol::models::ContentItem],
+) -> Option<TogetherReplayMessage> {
+    let text = non_empty_string(
+        content
+            .iter()
+            .filter_map(|entry| match entry {
+                codex_protocol::models::ContentItem::InputText { text }
+                | codex_protocol::models::ContentItem::OutputText { text } => Some(text.clone()),
+                codex_protocol::models::ContentItem::InputImage { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )?;
+
+    let role = match role {
+        "user" => TogetherReplayRole::User,
+        "assistant" => TogetherReplayRole::Assistant,
+        "system" => TogetherReplayRole::System,
+        _ => return None,
+    };
+
+    Some(TogetherReplayMessage { role, text })
 }
 
 fn replay_user_message_text(content: &[UserInput]) -> Option<String> {

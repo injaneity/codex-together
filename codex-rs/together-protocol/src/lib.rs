@@ -1,3 +1,4 @@
+use codex_protocol::protocol::RolloutItem;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -179,6 +180,8 @@ pub struct TogetherServerInfoResponse {
 #[serde(rename_all = "camelCase")]
 pub struct TogetherThreadShareRequest {
     pub thread_id: String,
+    #[serde(default)]
+    pub history: Option<Vec<RolloutItem>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +236,7 @@ pub struct TogetherReplayMessage {
 pub struct TogetherThreadReadResponse {
     pub thread_id: String,
     pub owner_email: String,
+    pub history: Option<Vec<RolloutItem>>,
     pub messages: Vec<TogetherReplayMessage>,
 }
 
@@ -249,6 +253,8 @@ pub struct TogetherThreadForkRequest {
 pub struct TogetherThreadForkResponse {
     pub parent_thread_id: String,
     pub child_thread_id: String,
+    pub owner_email: String,
+    pub history: Option<Vec<RolloutItem>>,
     pub writable: bool,
 }
 

@@ -12,6 +12,7 @@ use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ExternalEditorState;
+use crate::chatwidget::fetch_together_thread_replay;
 use crate::chatwidget::fork_thread_via_together;
 use crate::chatwidget::together_checked_out_thread_id;
 use crate::cwd_prompt::CwdPromptAction;
@@ -743,6 +744,70 @@ impl App {
             startup_tooltip_override: None,
             status_line_invalid_items_warned: self.status_line_invalid_items_warned.clone(),
             otel_manager: self.otel_manager.clone(),
+        }
+    }
+
+    async fn resume_together_thread(
+        &mut self,
+        tui: &mut tui::Tui,
+        thread_id: String,
+        writable: bool,
+        owner_email: String,
+    ) {
+        if self.chat_widget.thread_id().map(|id| id.to_string()) == Some(thread_id.clone()) {
+            self.chat_widget
+                .set_together_checkout_mode(writable, owner_email.as_str());
+            return;
+        }
+
+        match find_thread_path_by_id_str(self.config.codex_home.as_path(), &thread_id).await {
+            Ok(Some(path)) => match self
+                .server
+                .resume_thread_from_rollout(
+                    self.config.clone(),
+                    path.clone(),
+                    self.auth_manager.clone(),
+                )
+                .await
+            {
+                Ok(resumed) => {
+                    self.shutdown_current_thread().await;
+                    let init =
+                        self.chatwidget_init_for_forked_or_resumed_thread(tui, self.config.clone());
+                    self.chat_widget = ChatWidget::new_from_existing(
+                        init,
+                        resumed.thread,
+                        resumed.session_configured,
+                    );
+                    self.chat_widget
+                        .set_together_checkout_mode(writable, owner_email.as_str());
+                    self.reset_thread_event_state();
+                }
+                Err(err) => {
+                    let path_display = path.display();
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to open together thread {thread_id} from {path_display}: {err}"
+                    ));
+                }
+            },
+            Ok(None) => match fetch_together_thread_replay(thread_id.clone()).await {
+                Ok(replay) => {
+                    self.chat_widget
+                        .replay_together_thread_messages(thread_id.clone(), replay.messages);
+                    self.chat_widget
+                        .set_together_checkout_mode(writable, owner_email.as_str());
+                }
+                Err(err) => {
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to load together thread {thread_id}: {err}"
+                    ));
+                }
+            },
+            Err(err) => {
+                self.chat_widget.add_error_message(format!(
+                    "Failed to locate together thread {thread_id}: {err}"
+                ));
+            }
         }
     }
 
@@ -3183,6 +3248,10 @@ impl App {
             AppEvent::OpenTogetherThreadsView { threads } => {
                 self.chat_widget.show_together_threads_view(threads);
             }
+            AppEvent::RefreshTogetherThreadsViewIfActive { threads } => {
+                self.chat_widget
+                    .refresh_together_threads_view_if_open(threads);
+            }
             AppEvent::OpenTogetherHistoryView { lineage } => {
                 self.chat_widget.show_together_history_view(lineage);
             }
@@ -3202,6 +3271,14 @@ impl App {
             } => {
                 self.chat_widget
                     .replay_together_thread_messages(thread_id, messages);
+            }
+            AppEvent::ResumeTogetherThread {
+                thread_id,
+                writable,
+                owner_email,
+            } => {
+                self.resume_together_thread(tui, thread_id, writable, owner_email)
+                    .await;
             }
             AppEvent::SubmitUserMessageWithMode {
                 text,

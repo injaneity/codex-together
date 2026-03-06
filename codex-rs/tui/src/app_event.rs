@@ -422,6 +422,11 @@ pub(crate) enum AppEvent {
         threads: Vec<TogetherThreadSummary>,
     },
 
+    /// Refresh the shared-threads list when that picker is currently open.
+    RefreshTogetherThreadsViewIfActive {
+        threads: Vec<TogetherThreadSummary>,
+    },
+
     /// Open an interactive lineage list for together history operations.
     OpenTogetherHistoryView {
         lineage: TogetherHistoryLineageResponse,
@@ -445,6 +450,13 @@ pub(crate) enum AppEvent {
     ReplayTogetherThread {
         thread_id: String,
         messages: Vec<TogetherReplayMessage>,
+    },
+
+    /// Try to switch the active thread to a together checkout/fork target.
+    ResumeTogetherThread {
+        thread_id: String,
+        writable: bool,
+        owner_email: String,
     },
 
     /// Submit a user message with an explicit collaboration mask.

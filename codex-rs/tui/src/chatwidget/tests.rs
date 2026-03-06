@@ -1791,6 +1791,60 @@ fn assert_no_submit_op(op_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Op>) {
     }
 }
 
+#[test]
+fn together_replay_is_skipped_for_current_thread() {
+    assert!(!should_replay_together_thread(
+        Some("thread-1"),
+        Some("thread-1")
+    ));
+    assert!(should_replay_together_thread(
+        Some("thread-1"),
+        Some("thread-2")
+    ));
+    assert!(should_replay_together_thread(Some("thread-1"), None));
+    assert!(!should_replay_together_thread(None, Some("thread-1")));
+}
+
+#[tokio::test]
+async fn together_threads_view_refresh_snapshot() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let actor = local_together_actor_id();
+
+    chat.show_together_threads_view(vec![
+        TogetherThreadSummary {
+            thread_id: "thread-1".to_string(),
+            owner_email: actor.clone(),
+            preview: Some("first preview".to_string()),
+            created_at: "2026-03-06T12:00:00Z".to_string(),
+        },
+        TogetherThreadSummary {
+            thread_id: "thread-2".to_string(),
+            owner_email: actor.clone(),
+            preview: Some("second preview".to_string()),
+            created_at: "2026-03-06T12:05:00Z".to_string(),
+        },
+    ]);
+
+    chat.refresh_together_threads_view_if_open(vec![TogetherThreadSummary {
+        thread_id: "thread-2".to_string(),
+        owner_email: actor,
+        preview: Some("second preview".to_string()),
+        created_at: "2026-03-06T12:05:00Z".to_string(),
+    }]);
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 16)).expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw refreshed threads view");
+    assert_snapshot!(
+        "together_threads_view_refresh_after_delete",
+        terminal.backend()
+    );
+}
+
 fn set_chatgpt_auth(chat: &mut ChatWidget) {
     chat.auth_manager = codex_core::test_support::auth_manager_from_auth(
         CodexAuth::create_dummy_chatgpt_auth_for_testing(),

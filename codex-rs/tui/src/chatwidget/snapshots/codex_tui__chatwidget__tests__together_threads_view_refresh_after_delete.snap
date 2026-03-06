@@ -1,0 +1,20 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: terminal.backend()
+---
+"                                                                                                    "
+"                                                                                                    "
+"  Shared Threads                                                                                    "
+"  Search, checkout, fork, or delete owner-owned threads                                             "
+"                                                                                                    "
+"  Search by thread id, owner, or preview                                                            "
+"› thread-2  owner=weisintai@local · second preview · shared_at=2026-03-06T12:05:00Z                 "
+"                                                                                                    "
+"  Enter checkout · f fork · d delete · Esc close                                                    "
+"                                                                                                    "
+"                                                                                                    "
+"                                                                                                    "
+"                                                                                                    "
+"                                                                                                    "
+"                                                                                                    "
+"                                                                                                    "

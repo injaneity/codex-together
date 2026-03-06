@@ -9479,4 +9479,17 @@ mod tests {
         };
         assert_eq!(composer.cursor_pos(area), None);
     }
+
+    #[test]
+    fn input_disabled_together_checkout_snapshot() {
+        snapshot_composer_state("input_disabled_together_checkout", true, |composer| {
+            composer.set_input_enabled(
+                    false,
+                    Some(
+                        "Read-only together checkout owned by owner@example.com. Use /fork before writing."
+                            .to_string(),
+                    ),
+                );
+        });
+    }
 }

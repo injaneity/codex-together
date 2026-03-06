@@ -168,6 +168,7 @@ const PLAN_MODE_REASONING_SCOPE_TITLE: &str = "Apply reasoning change";
 const PLAN_MODE_REASONING_SCOPE_PLAN_ONLY: &str = "Apply to Plan mode override";
 const PLAN_MODE_REASONING_SCOPE_ALL_MODES: &str = "Apply to global default and Plan mode override";
 const CONNECTORS_SELECTION_VIEW_ID: &str = "connectors-selection";
+const TOGETHER_THREADS_SELECTION_VIEW_ID: &str = "together-threads-selection";
 
 /// Choose the keybinding used to edit the most-recently queued message.
 ///
@@ -8551,6 +8552,40 @@ impl ChatWidget {
             return;
         }
 
+        if self.bottom_pane.active_view_id() == Some(TOGETHER_THREADS_SELECTION_VIEW_ID) {
+            let _ = self.bottom_pane.replace_selection_view_if_active(
+                TOGETHER_THREADS_SELECTION_VIEW_ID,
+                self.together_threads_view_params(threads),
+            );
+        } else {
+            self.bottom_pane
+                .show_selection_view(self.together_threads_view_params(threads));
+        }
+    }
+
+    pub(crate) fn refresh_together_threads_view_if_open(
+        &mut self,
+        threads: Vec<TogetherThreadSummary>,
+    ) {
+        if self.bottom_pane.active_view_id() != Some(TOGETHER_THREADS_SELECTION_VIEW_ID) {
+            return;
+        }
+        if threads.is_empty() {
+            self.bottom_pane.dismiss_active_view();
+            self.add_info_message("No shared threads found.".to_string(), None);
+            return;
+        }
+
+        let _ = self.bottom_pane.replace_selection_view_if_active(
+            TOGETHER_THREADS_SELECTION_VIEW_ID,
+            self.together_threads_view_params(threads),
+        );
+    }
+
+    fn together_threads_view_params(
+        &self,
+        threads: Vec<TogetherThreadSummary>,
+    ) -> SelectionViewParams {
         let actor = local_together_actor_id();
         let initial_can_delete = threads
             .first()
@@ -8617,7 +8652,8 @@ impl ChatWidget {
         })
             as Box<dyn Fn(usize) -> Line<'static> + Send + Sync>);
 
-        self.bottom_pane.show_selection_view(SelectionViewParams {
+        SelectionViewParams {
+            view_id: Some(TOGETHER_THREADS_SELECTION_VIEW_ID),
             title: Some("Shared Threads".to_string()),
             subtitle: Some("Search, checkout, fork, or delete owner-owned threads".to_string()),
             footer_hint: Some(together_threads_footer_hint(initial_can_delete)),
@@ -8628,7 +8664,7 @@ impl ChatWidget {
             on_selection_footer_hint,
             on_char_key,
             ..Default::default()
-        });
+        }
     }
 
     pub(crate) fn show_together_history_view(&mut self, lineage: TogetherHistoryLineageResponse) {
@@ -8726,11 +8762,11 @@ impl ChatWidget {
         let replay_thread_id_from_command = together_checkout_target(&trimmed);
         let replay_command_args = trimmed.clone();
 
-        let thread_id = self.thread_id.map(|id| id.to_string());
+        let current_thread_id = self.thread_id.map(|id| id.to_string());
         let cwd = self.config.cwd.clone();
         let tx = self.app_event_tx.clone();
         tokio::spawn(async move {
-            match execute_together_command(trimmed, thread_id, cwd).await {
+            match execute_together_command(trimmed, current_thread_id.clone(), cwd).await {
                 Ok(output) => {
                     let replay_thread_id = replay_thread_id_from_command.or_else(|| {
                         together_fork_child_target(&replay_command_args, &output.message)
@@ -8738,7 +8774,29 @@ impl ChatWidget {
                     tx.send(AppEvent::InsertHistoryCell(Box::new(
                         history_cell::new_info_event(output.message, output.hint),
                     )));
-                    if let Some(thread_id) = replay_thread_id {
+                    if let Some(follow_up) = output.follow_up {
+                        match follow_up {
+                            TogetherCommandFollowUp::ResumeThread {
+                                thread_id,
+                                writable,
+                                owner_email,
+                            } => {
+                                tx.send(AppEvent::ResumeTogetherThread {
+                                    thread_id,
+                                    writable,
+                                    owner_email,
+                                });
+                            }
+                            TogetherCommandFollowUp::RefreshThreadsViewIfActive { threads } => {
+                                tx.send(AppEvent::RefreshTogetherThreadsViewIfActive { threads });
+                            }
+                        }
+                    } else if let Some(thread_id) = replay_thread_id
+                        && should_replay_together_thread(
+                            Some(thread_id.as_str()),
+                            current_thread_id.as_deref(),
+                        )
+                    {
                         match fetch_together_thread_replay(thread_id.clone()).await {
                             Ok(replay) => tx.send(AppEvent::ReplayTogetherThread {
                                 thread_id,
@@ -8824,6 +8882,19 @@ impl ChatWidget {
 
     pub(crate) fn thread_name(&self) -> Option<String> {
         self.thread_name.clone()
+    }
+
+    pub(crate) fn set_together_checkout_mode(&mut self, writable: bool, owner_email: &str) {
+        if writable {
+            self.bottom_pane.set_composer_input_enabled(true, None);
+        } else {
+            self.bottom_pane.set_composer_input_enabled(
+                false,
+                Some(format!(
+                    "Read-only together checkout owned by {owner_email}. Use /fork before writing."
+                )),
+            );
+        }
     }
 
     /// Returns the current thread's precomputed rollout path.
@@ -8918,6 +8989,19 @@ impl ChatWidget {
 struct TogetherCommandOutput {
     message: String,
     hint: Option<String>,
+    follow_up: Option<TogetherCommandFollowUp>,
+}
+
+#[derive(Debug)]
+enum TogetherCommandFollowUp {
+    ResumeThread {
+        thread_id: String,
+        writable: bool,
+        owner_email: String,
+    },
+    RefreshThreadsViewIfActive {
+        threads: Vec<TogetherThreadSummary>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -9100,6 +9184,7 @@ async fn execute_together_command(
         return Ok(TogetherCommandOutput {
             message: "Codex Together commands".to_string(),
             hint: Some(together_usage_hint()),
+            follow_up: None,
         });
     };
     let rest = &argv[1..];
@@ -9108,6 +9193,7 @@ async fn execute_together_command(
         "help" => Ok(TogetherCommandOutput {
             message: "Codex Together commands".to_string(),
             hint: Some(together_usage_hint()),
+            follow_up: None,
         }),
         "mascot" => match rest {
             [] => {
@@ -9131,6 +9217,7 @@ async fn execute_together_command(
                     hint: Some(format!(
                         "mascot: {enabled}\nmotion: {motion}\nlabels: {labels}\n\nControls:\n/together mascot on|off\n/together mascot motion on|off\n/together mascot labels masked|full"
                     )),
+                    follow_up: None,
                 })
             }
             [value] if value.eq_ignore_ascii_case("on") => {
@@ -9138,6 +9225,7 @@ async fn execute_together_command(
                 Ok(TogetherCommandOutput {
                     message: "Together mascot enabled.".to_string(),
                     hint: Some("Crew sprites are visible in Together Center.".to_string()),
+                    follow_up: None,
                 })
             }
             [value] if value.eq_ignore_ascii_case("off") => {
@@ -9145,6 +9233,7 @@ async fn execute_together_command(
                 Ok(TogetherCommandOutput {
                     message: "Together mascot disabled.".to_string(),
                     hint: Some("Together Center now shows text-only roster rows.".to_string()),
+                    follow_up: None,
                 })
             }
             [mode, value] if mode.eq_ignore_ascii_case("motion") => {
@@ -9153,6 +9242,7 @@ async fn execute_together_command(
                     return Ok(TogetherCommandOutput {
                         message: "Together mascot motion enabled.".to_string(),
                         hint: Some("Animation effects can run when supported.".to_string()),
+                        follow_up: None,
                     });
                 }
                 if value.eq_ignore_ascii_case("off") {
@@ -9160,6 +9250,7 @@ async fn execute_together_command(
                     return Ok(TogetherCommandOutput {
                         message: "Together mascot motion disabled.".to_string(),
                         hint: Some("Mascot rendering uses static posture.".to_string()),
+                        follow_up: None,
                     });
                 }
                 anyhow::bail!("usage: /together mascot motion on|off");
@@ -9170,6 +9261,7 @@ async fn execute_together_command(
                     return Ok(TogetherCommandOutput {
                         message: "Together mascot labels set to masked.".to_string(),
                         hint: Some("Default privacy-friendly label mode restored.".to_string()),
+                        follow_up: None,
                     });
                 }
                 if value.eq_ignore_ascii_case("full") {
@@ -9177,6 +9269,7 @@ async fn execute_together_command(
                     return Ok(TogetherCommandOutput {
                         message: "Together mascot labels set to full.".to_string(),
                         hint: Some("Crew labels now render full email addresses.".to_string()),
+                        follow_up: None,
                     });
                 }
                 anyhow::bail!("usage: /together mascot labels masked|full");
@@ -9231,6 +9324,7 @@ async fn execute_together_command(
                         existing.public_base_url,
                         connected
                     )),
+                    follow_up: None,
                 });
             }
 
@@ -9286,6 +9380,7 @@ async fn execute_together_command(
                             existing.public_base_url,
                             connected
                         )),
+                        follow_up: None,
                     });
                 }
                 Err(err) => return Err(err),
@@ -9311,6 +9406,7 @@ async fn execute_together_command(
                     short_server_id(&response.server_id),
                     response.invite_token
                 )),
+                follow_up: None,
             })
         }
         "close" => {
@@ -9327,6 +9423,7 @@ async fn execute_together_command(
                     Ok(TogetherCommandOutput {
                         message: "Together server closed.".to_string(),
                         hint: None,
+                        follow_up: None,
                     })
                 }
                 Err(err) if together_not_connected(&err) => {
@@ -9336,6 +9433,7 @@ async fn execute_together_command(
                     Ok(TogetherCommandOutput {
                         message: "Already disconnected from together server.".to_string(),
                         hint: None,
+                        follow_up: None,
                     })
                 }
                 Err(err) => Err(err),
@@ -9374,6 +9472,7 @@ async fn execute_together_command(
                     response.endpoint,
                     together_role_label(response.role)
                 )),
+                follow_up: None,
             })
         }
         "leave" => {
@@ -9391,6 +9490,7 @@ async fn execute_together_command(
                     Ok(TogetherCommandOutput {
                         message: "Left together server.".to_string(),
                         hint: None,
+                        follow_up: None,
                     })
                 }
                 Ok(_) => anyhow::bail!(
@@ -9403,6 +9503,7 @@ async fn execute_together_command(
                     Ok(TogetherCommandOutput {
                         message: "Already disconnected from together server.".to_string(),
                         hint: None,
+                        follow_up: None,
                     })
                 }
                 Err(err) => Err(err),
@@ -9432,6 +9533,7 @@ async fn execute_together_command(
                     "Owner: {}\nShared at: {}",
                     response.owner_email, response.shared_at
                 )),
+                follow_up: None,
             })
         }
         "checkout" => {
@@ -9463,6 +9565,11 @@ async fn execute_together_command(
             Ok(TogetherCommandOutput {
                 message: format!("Checked out thread {} ({mode})", response.thread_id),
                 hint: Some(format!("Owner: {}\n{reason}", response.owner_email)),
+                follow_up: Some(TogetherCommandFollowUp::ResumeThread {
+                    thread_id: response.thread_id,
+                    writable: response.writable,
+                    owner_email: response.owner_email,
+                }),
             })
         }
         "fork" => {
@@ -9496,6 +9603,11 @@ async fn execute_together_command(
                     "Auto-entered child thread {} ({mode}).\nOwner: {}\nResume child with: codex resume {}",
                     child_checkout.thread_id, child_checkout.owner_email, response.child_thread_id
                 )),
+                follow_up: Some(TogetherCommandFollowUp::ResumeThread {
+                    thread_id: child_checkout.thread_id,
+                    writable: child_checkout.writable,
+                    owner_email: child_checkout.owner_email,
+                }),
             })
         }
         "delete" => {
@@ -9512,6 +9624,18 @@ async fn execute_together_command(
                     },
                 )
                 .await?;
+            let refreshed_threads = client
+                .call(
+                    METHOD_TOGETHER_THREAD_LIST,
+                    TogetherThreadListRequest {
+                        cursor: None,
+                        limit: Some(200),
+                        search_term: None,
+                    },
+                )
+                .await
+                .ok()
+                .map(|response: TogetherThreadListResponse| response.data);
             if current_together_checked_out_thread().as_deref() == Some(response.thread_id.as_str())
             {
                 clear_together_checked_out_thread();
@@ -9519,6 +9643,8 @@ async fn execute_together_command(
             Ok(TogetherCommandOutput {
                 message: format!("Deleted shared thread {}", response.thread_id),
                 hint: None,
+                follow_up: refreshed_threads
+                    .map(|threads| TogetherCommandFollowUp::RefreshThreadsViewIfActive { threads }),
             })
         }
         "list" => {
@@ -9543,6 +9669,7 @@ async fn execute_together_command(
                 return Ok(TogetherCommandOutput {
                     message: "No shared threads found.".to_string(),
                     hint: None,
+                    follow_up: None,
                 });
             }
             let mut lines = Vec::with_capacity(response.data.len() + 1);
@@ -9557,6 +9684,7 @@ async fn execute_together_command(
             Ok(TogetherCommandOutput {
                 message: "Shared threads".to_string(),
                 hint: Some(lines.join("\n")),
+                follow_up: None,
             })
         }
         "lineage" | "history" => {
@@ -9576,6 +9704,7 @@ async fn execute_together_command(
             Ok(TogetherCommandOutput {
                 message: format!("Lineage for {}", response.root),
                 hint: Some(render_lineage_tree(&response)),
+                follow_up: None,
             })
         }
         "status" => {
@@ -9621,6 +9750,7 @@ async fn execute_together_command(
                     response.public_base_url,
                     connected
                 )),
+                follow_up: None,
             })
         }
         _ => anyhow::bail!(
@@ -9653,7 +9783,7 @@ pub(crate) fn together_checked_out_thread_id() -> Option<String> {
     current_together_checked_out_thread()
 }
 
-async fn fetch_together_thread_replay(
+pub(crate) async fn fetch_together_thread_replay(
     thread_id: String,
 ) -> anyhow::Result<TogetherThreadReadResponse> {
     let endpoint = current_together_endpoint();
@@ -9686,6 +9816,13 @@ fn together_fork_child_target(command_args: &str, message: &str) -> Option<Strin
         .next()
         .filter(|value| !value.trim().is_empty())
         .map(ToString::to_string)
+}
+
+fn should_replay_together_thread(
+    replay_thread_id: Option<&str>,
+    current_thread_id: Option<&str>,
+) -> bool {
+    replay_thread_id.is_some_and(|thread_id| current_thread_id != Some(thread_id))
 }
 
 fn together_method_missing(err: &anyhow::Error) -> bool {

@@ -656,11 +656,7 @@ async fn update_member(
 
     if changed {
         let now = Utc::now().timestamp();
-        let role = if add {
-            StateTogetherRole::Member
-        } else {
-            StateTogetherRole::Member
-        };
+        let role = StateTogetherRole::Member;
         let removed_at = if add { None } else { Some(now) };
 
         if let Err(err) = state
@@ -1941,7 +1937,7 @@ fn rpc_error(id: Value, code: i64, message: impl Into<String>) -> JsonRpcRespons
 
 fn app_server_error_response(id: Value, err: AppServerError) -> JsonRpcResponse {
     match err {
-        AppServerError::Rpc { code, .. } if code == -32001 => {
+        AppServerError::Rpc { code: -32001, .. } => {
             rpc_error(id, RPC_ERR_OVERLOADED, "TOGETHER_OVERLOADED")
         }
         AppServerError::Rpc { code, message } if code == -32602 => rpc_error(id, code, message),
@@ -2350,15 +2346,27 @@ fn clear_stale_lock(path: &Path) -> Result<bool> {
 
 #[cfg(unix)]
 fn is_pid_running(pid: u32) -> bool {
+    let pid_text = pid.to_string();
+    if let Ok(output) = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid_text])
+        .output()
+        && output.status.success()
+    {
+        let stat = String::from_utf8_lossy(&output.stdout);
+        if stat.trim_start().starts_with('Z') {
+            return false;
+        }
+    }
+
     let rc = unsafe { libc::kill(pid as i32, 0) };
     if rc == 0 {
         return true;
     }
 
-    match std::io::Error::last_os_error().raw_os_error() {
-        Some(code) if code == libc::EPERM => true,
-        _ => false,
-    }
+    matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(code) if code == libc::EPERM
+    )
 }
 
 #[cfg(not(unix))]

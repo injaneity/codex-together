@@ -9488,6 +9488,9 @@ async fn execute_together_command(
                 .await;
             match close_result {
                 Ok(_) => {
+                    if is_local_endpoint(&endpoint)? {
+                        stop_local_together_server().await?;
+                    }
                     set_together_status(Some("disconnected".to_string()));
                     clear_together_endpoint();
                     clear_together_checked_out_thread();
@@ -9498,6 +9501,9 @@ async fn execute_together_command(
                     })
                 }
                 Err(err) if together_not_connected(&err) => {
+                    if is_local_endpoint(&endpoint)? {
+                        stop_local_together_server().await?;
+                    }
                     set_together_status(Some("disconnected".to_string()));
                     clear_together_endpoint();
                     clear_together_checked_out_thread();
@@ -10334,15 +10340,27 @@ fn remove_lock_if_stale(lock_path: &Path) {
 
 #[cfg(unix)]
 fn is_pid_running(pid: u32) -> bool {
+    let pid_text = pid.to_string();
+    if let Ok(output) = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid_text])
+        .output()
+        && output.status.success()
+    {
+        let stat = String::from_utf8_lossy(&output.stdout);
+        if stat.trim_start().starts_with('Z') {
+            return false;
+        }
+    }
+
     let rc = unsafe { libc::kill(pid as i32, 0) };
     if rc == 0 {
         return true;
     }
 
-    match std::io::Error::last_os_error().raw_os_error() {
-        Some(code) if code == libc::EPERM => true,
-        _ => false,
-    }
+    matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(code) if code == libc::EPERM
+    )
 }
 
 #[cfg(not(unix))]

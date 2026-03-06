@@ -21,6 +21,7 @@ pub(crate) fn builtins_for_input(
         .unwrap_or_else(|_| "disconnected".to_string())
         .to_ascii_lowercase();
     let connected = !status.trim().is_empty() && status != "disconnected";
+    let hosting = status.starts_with("together host:");
 
     built_in_slash_commands()
         .into_iter()
@@ -39,12 +40,12 @@ pub(crate) fn builtins_for_input(
                 || !matches!(
                     cmd,
                     SlashCommand::Leave
-                        | SlashCommand::Close
                         | SlashCommand::Share
                         | SlashCommand::Threads
                         | SlashCommand::History
                 )
         })
+        .filter(|(_, cmd)| hosting || *cmd != SlashCommand::Close)
         .collect()
 }
 
@@ -226,10 +227,19 @@ mod tests {
 
     #[test]
     fn close_visible_when_connected() {
-        let _guard = TogetherStatusGuard::set("together @owner@local");
+        let _guard = TogetherStatusGuard::set("together host:abc123");
         assert_eq!(
             find_builtin_command("close", true, true, true, false, true, false),
             Some(SlashCommand::Close)
+        );
+    }
+
+    #[test]
+    fn close_hidden_for_member() {
+        let _guard = TogetherStatusGuard::set("together @owner@local");
+        assert_eq!(
+            find_builtin_command("close", true, true, true, false, true, false),
+            None
         );
     }
 

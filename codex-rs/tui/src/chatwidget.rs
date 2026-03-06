@@ -52,6 +52,7 @@ use crate::version::CODEX_CLI_VERSION;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_backend_client::Client as BackendClient;
 use codex_chatgpt::connectors;
+use codex_core::RolloutRecorder;
 use codex_core::config::Config;
 use codex_core::config::Constrained;
 use codex_core::config::ConstraintResult;
@@ -61,6 +62,7 @@ use codex_core::config_loader::ConfigLayerStackOrdering;
 use codex_core::features::FEATURES;
 use codex_core::features::Feature;
 use codex_core::find_thread_name_by_id;
+use codex_core::find_thread_path_by_id_str;
 use codex_core::git_info::current_branch_name;
 use codex_core::git_info::get_git_repo_root;
 use codex_core::git_info::local_git_branches;
@@ -120,6 +122,7 @@ use codex_protocol::protocol::PatchApplyBeginEvent;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
+use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SkillMetadata as ProtocolSkillMetadata;
 use codex_protocol::protocol::StreamErrorEvent;
 use codex_protocol::protocol::TerminalInteractionEvent;
@@ -8593,7 +8596,7 @@ impl ChatWidget {
         let actor_for_keybind = actor.clone();
         let threads_for_keybind = Arc::new(threads.clone());
         let threads_for_footer = Arc::clone(&threads_for_keybind);
-        let actor_for_footer = actor.clone();
+        let actor_for_footer = actor;
         let mut items = Vec::with_capacity(threads.len());
         for thread in threads {
             let thread_id = thread.thread_id.clone();
@@ -8681,7 +8684,7 @@ impl ChatWidget {
         let actor_for_keybind = actor.clone();
         let rows_for_keybind = Arc::new(rows.clone());
         let rows_for_footer = Arc::clone(&rows_for_keybind);
-        let actor_for_footer = actor.clone();
+        let actor_for_footer = actor;
         let mut items = Vec::with_capacity(rows.len());
         for row in rows {
             let thread_id = row.thread_id.clone();
@@ -8763,10 +8766,20 @@ impl ChatWidget {
         let replay_command_args = trimmed.clone();
 
         let current_thread_id = self.thread_id.map(|id| id.to_string());
+        let current_rollout_path = self.rollout_path();
+        let codex_home = self.config.codex_home.clone();
         let cwd = self.config.cwd.clone();
         let tx = self.app_event_tx.clone();
         tokio::spawn(async move {
-            match execute_together_command(trimmed, current_thread_id.clone(), cwd).await {
+            match execute_together_command(
+                trimmed,
+                current_thread_id.clone(),
+                current_rollout_path,
+                codex_home,
+                cwd,
+            )
+            .await
+            {
                 Ok(output) => {
                     let replay_thread_id = replay_thread_id_from_command.or_else(|| {
                         together_fork_child_target(&replay_command_args, &output.message)
@@ -8778,11 +8791,13 @@ impl ChatWidget {
                         match follow_up {
                             TogetherCommandFollowUp::ResumeThread {
                                 thread_id,
+                                history,
                                 writable,
                                 owner_email,
                             } => {
                                 tx.send(AppEvent::ResumeTogetherThread {
                                     thread_id,
+                                    history,
                                     writable,
                                     owner_email,
                                 });
@@ -8996,6 +9011,7 @@ struct TogetherCommandOutput {
 enum TogetherCommandFollowUp {
     ResumeThread {
         thread_id: String,
+        history: Option<Vec<RolloutItem>>,
         writable: bool,
         owner_email: String,
     },
@@ -9175,6 +9191,8 @@ impl TogetherRpcClient {
 async fn execute_together_command(
     args: String,
     current_thread_id: Option<String>,
+    current_rollout_path: Option<PathBuf>,
+    codex_home: PathBuf,
     cwd: PathBuf,
 ) -> anyhow::Result<TogetherCommandOutput> {
     let argv = shlex::split(&args).ok_or_else(|| {
@@ -9510,12 +9528,47 @@ async fn execute_together_command(
             }
         }
         "share" => {
+            let checked_out_thread_id = current_together_checked_out_thread();
             let thread_id = rest
                 .first()
                 .cloned()
-                .or(current_thread_id)
-                .or_else(current_together_checked_out_thread)
+                .or_else(|| {
+                    if current_thread_id.as_deref() != checked_out_thread_id.as_deref() {
+                        checked_out_thread_id.clone()
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| current_thread_id.clone())
+                .or(checked_out_thread_id)
                 .ok_or_else(|| anyhow::anyhow!("usage: /share [thread-id]"))?;
+            let share_history = match local_together_share_history(
+                current_rollout_path.as_ref(),
+                current_thread_id.as_deref().unwrap_or(thread_id.as_str()),
+                codex_home.as_path(),
+            )
+            .await
+            {
+                Ok(history) => Some(history),
+                Err(err)
+                    if current_thread_id.as_deref() != Some(thread_id.as_str())
+                        && rest.is_empty() =>
+                {
+                    match local_together_share_history(
+                        current_rollout_path.as_ref(),
+                        thread_id.as_str(),
+                        codex_home.as_path(),
+                    )
+                    .await
+                    {
+                        Ok(history) => Some(history),
+                        Err(_) => {
+                            return Err(err);
+                        }
+                    }
+                }
+                Err(err) => return Err(err),
+            };
             let endpoint = current_together_endpoint();
             let mut client = connect_and_auth(&endpoint).await?;
             let response: TogetherThreadShareResponse = client
@@ -9523,6 +9576,7 @@ async fn execute_together_command(
                     METHOD_TOGETHER_THREAD_SHARE,
                     TogetherThreadShareRequest {
                         thread_id: thread_id.clone(),
+                        history: share_history,
                     },
                 )
                 .await?;
@@ -9551,6 +9605,7 @@ async fn execute_together_command(
                 )
                 .await?;
             set_together_checked_out_thread(Some(response.thread_id.clone()));
+            let checked_out_thread_id = response.thread_id.clone();
             let mode = if response.writable {
                 "writable"
             } else {
@@ -9566,7 +9621,11 @@ async fn execute_together_command(
                 message: format!("Checked out thread {} ({mode})", response.thread_id),
                 hint: Some(format!("Owner: {}\n{reason}", response.owner_email)),
                 follow_up: Some(TogetherCommandFollowUp::ResumeThread {
-                    thread_id: response.thread_id,
+                    thread_id: checked_out_thread_id.clone(),
+                    history: fetch_together_thread_replay(checked_out_thread_id)
+                        .await
+                        .ok()
+                        .and_then(|thread| thread.history),
                     writable: response.writable,
                     owner_email: response.owner_email,
                 }),
@@ -9579,17 +9638,7 @@ async fn execute_together_command(
                 );
             };
             let response = fork_thread_via_together(thread_id.clone(), cwd.clone()).await?;
-            let endpoint = current_together_endpoint();
-            let mut client = connect_and_auth(&endpoint).await?;
-            let child_checkout: TogetherThreadCheckoutResponse = client
-                .call(
-                    METHOD_TOGETHER_THREAD_CHECKOUT,
-                    TogetherThreadCheckoutRequest {
-                        thread_id: response.child_thread_id.clone(),
-                    },
-                )
-                .await?;
-            let mode = if child_checkout.writable {
+            let mode = if response.writable {
                 "writable"
             } else {
                 "read-only"
@@ -9601,12 +9650,13 @@ async fn execute_together_command(
                 ),
                 hint: Some(format!(
                     "Auto-entered child thread {} ({mode}).\nOwner: {}\nResume child with: codex resume {}",
-                    child_checkout.thread_id, child_checkout.owner_email, response.child_thread_id
+                    response.child_thread_id, response.owner_email, response.child_thread_id
                 )),
                 follow_up: Some(TogetherCommandFollowUp::ResumeThread {
-                    thread_id: child_checkout.thread_id,
-                    writable: child_checkout.writable,
-                    owner_email: child_checkout.owner_email,
+                    thread_id: response.child_thread_id.clone(),
+                    history: response.history,
+                    writable: response.writable,
+                    owner_email: response.owner_email,
                 }),
             })
         }
@@ -9708,7 +9758,7 @@ async fn execute_together_command(
             })
         }
         "status" => {
-            let explicit_endpoint = rest.first().is_some();
+            let explicit_endpoint = !rest.is_empty();
             let endpoint = if let Some(raw) = rest.first() {
                 normalize_together_ws_endpoint(raw)?
             } else {
@@ -9796,6 +9846,37 @@ pub(crate) async fn fetch_together_thread_replay(
         .await
 }
 
+async fn local_together_share_history(
+    current_rollout_path: Option<&PathBuf>,
+    thread_id: &str,
+    codex_home: &Path,
+) -> anyhow::Result<Vec<RolloutItem>> {
+    let rollout_path = if let Some(path) = current_rollout_path {
+        path.clone()
+    } else {
+        find_thread_path_by_id_str(codex_home, thread_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("failed to locate local thread {thread_id} for /share")
+            })?
+    };
+
+    let history = RolloutRecorder::get_rollout_history(rollout_path.as_path()).await?;
+    let items = match history {
+        codex_protocol::protocol::InitialHistory::New => Vec::new(),
+        codex_protocol::protocol::InitialHistory::Resumed(resumed) => resumed.history,
+        codex_protocol::protocol::InitialHistory::Forked(items) => items,
+    };
+
+    if items.is_empty() {
+        anyhow::bail!(
+            "cannot share thread: no persisted turns yet; send at least one message first"
+        );
+    }
+
+    Ok(items)
+}
+
 fn together_checkout_target(command_args: &str) -> Option<String> {
     let argv = shlex::split(command_args)?;
     let command = argv.first()?.to_ascii_lowercase();
@@ -9807,7 +9888,7 @@ fn together_checkout_target(command_args: &str) -> Option<String> {
 
 fn together_fork_child_target(command_args: &str, message: &str) -> Option<String> {
     let argv = shlex::split(command_args)?;
-    if argv.first()?.to_ascii_lowercase() != "fork" {
+    if !argv.first()?.eq_ignore_ascii_case("fork") {
         return None;
     }
     let (_, child) = message.split_once("->")?;
@@ -9955,7 +10036,7 @@ fn endpoint_candidate_from_target(target: &str) -> Option<String> {
     if Url::parse(target).is_ok() {
         return Some(target.to_string());
     }
-    if target.contains('.') && !target.chars().any(|ch| ch.is_whitespace()) {
+    if target.contains('.') && !target.chars().any(char::is_whitespace) {
         return Some(format!("https://{target}"));
     }
     None

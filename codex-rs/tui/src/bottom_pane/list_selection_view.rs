@@ -472,7 +472,7 @@ impl ListSelectionView {
 
     fn update_footer_hint_for_selection(&mut self) {
         if let Some(cb) = &self.on_selection_footer_hint {
-            self.footer_hint = self.selected_actual_idx().map(|idx| cb(idx));
+            self.footer_hint = self.selected_actual_idx().map(cb);
         }
     }
 

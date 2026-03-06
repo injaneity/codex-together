@@ -856,7 +856,8 @@ impl BottomPane {
     }
 
     pub(crate) fn active_view_id(&self) -> Option<&'static str> {
-        self.active_view().and_then(|view| view.view_id())
+        self.active_view()
+            .and_then(bottom_pane_view::BottomPaneView::view_id)
     }
 
     /// Return true when the pane is in the regular composer state without any

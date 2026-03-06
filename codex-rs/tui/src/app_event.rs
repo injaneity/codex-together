@@ -16,6 +16,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::RateLimitSnapshot;
+use codex_protocol::protocol::RolloutItem;
 use codex_together_protocol::TogetherHistoryLineageResponse;
 use codex_together_protocol::TogetherReplayMessage;
 use codex_together_protocol::TogetherServerInfoResponse;
@@ -455,6 +456,7 @@ pub(crate) enum AppEvent {
     /// Try to switch the active thread to a together checkout/fork target.
     ResumeTogetherThread {
         thread_id: String,
+        history: Option<Vec<RolloutItem>>,
         writable: bool,
         owner_email: String,
     },

@@ -9412,8 +9412,8 @@ async fn execute_together_command(
             let thread_id = rest
                 .first()
                 .cloned()
-                .or_else(current_together_checked_out_thread)
                 .or(current_thread_id)
+                .or_else(current_together_checked_out_thread)
                 .ok_or_else(|| anyhow::anyhow!("usage: /share [thread-id]"))?;
             let endpoint = current_together_endpoint();
             let mut client = connect_and_auth(&endpoint).await?;

@@ -738,7 +738,7 @@ async fn together_thread_share(
         .clone()
         .unwrap_or_else(|| "guest@local".to_string());
 
-    let existing_shared = {
+    let has_existing_shared = {
         let guard = state.inner.lock().await;
         let Some(hosted) = guard.hosted.as_ref() else {
             return rpc_error(req.id, RPC_ERR_NOT_CONNECTED, "TOGETHER_NOT_CONNECTED");
@@ -758,42 +758,37 @@ async fn together_thread_share(
             return rpc_error(req.id, RPC_ERR_FORBIDDEN, "TOGETHER_FORBIDDEN");
         }
 
-        hosted.threads.get(&payload.thread_id).cloned()
+        hosted.threads.contains_key(&payload.thread_id)
     };
 
-    let thread = {
+    let (thread, include_turns_available) = {
         let mut bridge = state.app_server.lock().await;
         match bridge.thread_read(payload.thread_id.clone(), true).await {
-            Ok(response) => response.thread,
+            Ok(response) => (response.thread, true),
             Err(err) => {
-                if app_server_thread_not_loaded(&err)
-                    && let Some(existing) = existing_shared
-                {
-                    return JsonRpcResponse::ok(
-                        req.id,
-                        TogetherThreadShareResponse {
-                            thread_id: existing.thread_id,
-                            owner_email: existing.owner_email,
-                            preview: existing.preview,
-                            shared_at: existing.shared_at,
-                        },
-                    )
-                    .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"));
-                }
-
                 if app_server_thread_not_loaded(&err) {
-                    return rpc_error(
-                        req.id,
-                        -32602,
-                        "thread is not loaded on this together host; if this thread was forked locally, fork it via together first",
-                    );
+                    match bridge.thread_read(payload.thread_id.clone(), false).await {
+                        Ok(response) => (response.thread, false),
+                        Err(fallback_err) if app_server_thread_not_loaded(&fallback_err) => {
+                            let reason = if has_existing_shared {
+                                "thread is not loaded on this together host; unable to refresh preview from latest turns"
+                            } else {
+                                "thread is not loaded on this together host; if this thread was forked locally, fork it via together first"
+                            };
+                            return rpc_error(req.id, -32602, reason);
+                        }
+                        Err(fallback_err) => {
+                            return app_server_error_response(req.id, fallback_err);
+                        }
+                    }
+                } else {
+                    return app_server_error_response(req.id, err);
                 }
-                return app_server_error_response(req.id, err);
             }
         }
     };
 
-    if thread.turns.is_empty() {
+    if include_turns_available && thread.turns.is_empty() {
         return rpc_error(
             req.id,
             -32602,

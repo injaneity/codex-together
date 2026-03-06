@@ -38,7 +38,11 @@ pub(crate) fn builtins_for_input(
             connected
                 || !matches!(
                     cmd,
-                    SlashCommand::Share | SlashCommand::Threads | SlashCommand::History
+                    SlashCommand::Leave
+                        | SlashCommand::Close
+                        | SlashCommand::Share
+                        | SlashCommand::Threads
+                        | SlashCommand::History
                 )
         })
         .collect()
@@ -190,6 +194,42 @@ mod tests {
         assert_eq!(
             find_builtin_command("host", true, true, true, false, true, false),
             None
+        );
+    }
+
+    #[test]
+    fn leave_hidden_when_disconnected() {
+        let _guard = TogetherStatusGuard::set("disconnected");
+        assert_eq!(
+            find_builtin_command("leave", true, true, true, false, true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn leave_visible_when_connected() {
+        let _guard = TogetherStatusGuard::set("together @owner@local");
+        assert_eq!(
+            find_builtin_command("leave", true, true, true, false, true, false),
+            Some(SlashCommand::Leave)
+        );
+    }
+
+    #[test]
+    fn close_hidden_when_disconnected() {
+        let _guard = TogetherStatusGuard::set("disconnected");
+        assert_eq!(
+            find_builtin_command("close", true, true, true, false, true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn close_visible_when_connected() {
+        let _guard = TogetherStatusGuard::set("together @owner@local");
+        assert_eq!(
+            find_builtin_command("close", true, true, true, false, true, false),
+            Some(SlashCommand::Close)
         );
     }
 

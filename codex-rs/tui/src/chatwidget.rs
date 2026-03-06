@@ -3826,6 +3826,26 @@ impl ChatWidget {
                     "join".to_string(),
                 );
             }
+            SlashCommand::Leave => {
+                if !self.together_enabled() {
+                    self.add_info_message(
+                        "Codex Together is disabled.".to_string(),
+                        Some("Enable the together feature in /experimental first.".to_string()),
+                    );
+                    return;
+                }
+                self.run_together_command("leave".to_string());
+            }
+            SlashCommand::Close => {
+                if !self.together_enabled() {
+                    self.add_info_message(
+                        "Codex Together is disabled.".to_string(),
+                        Some("Enable the together feature in /experimental first.".to_string()),
+                    );
+                    return;
+                }
+                self.run_together_command("close".to_string());
+            }
             SlashCommand::Share => {
                 if !self.together_enabled() {
                     self.add_info_message(

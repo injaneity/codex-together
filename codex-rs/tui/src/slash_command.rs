@@ -39,6 +39,8 @@ pub enum SlashCommand {
     Status,
     Host,
     Join,
+    Leave,
+    Close,
     Share,
     Threads,
     History,
@@ -88,6 +90,8 @@ impl SlashCommand {
             SlashCommand::Status => "show current session configuration and token usage",
             SlashCommand::Host => "start a codex-together app server",
             SlashCommand::Join => "join a codex-together app server",
+            SlashCommand::Leave => "leave the current codex-together app server",
+            SlashCommand::Close => "close the current hosted codex-together app server",
             SlashCommand::Share => "share the current thread to codex-together",
             SlashCommand::Threads => "browse shared threads and checkout/fork/delete",
             SlashCommand::History => "browse lineage for the current thread",
@@ -136,6 +140,7 @@ impl SlashCommand {
                 | SlashCommand::Plan
                 | SlashCommand::Together
                 | SlashCommand::Join
+                | SlashCommand::Leave
                 | SlashCommand::Share
                 | SlashCommand::SandboxReadRoot
         )
@@ -171,6 +176,8 @@ impl SlashCommand {
             | SlashCommand::Status
             | SlashCommand::Host
             | SlashCommand::Join
+            | SlashCommand::Leave
+            | SlashCommand::Close
             | SlashCommand::Share
             | SlashCommand::Threads
             | SlashCommand::History

@@ -1875,28 +1875,80 @@ impl InitialHistory {
     }
 
     pub fn get_event_msgs(&self) -> Option<Vec<EventMsg>> {
-        match self {
-            InitialHistory::New => None,
-            InitialHistory::Resumed(resumed) => Some(
-                resumed
-                    .history
-                    .iter()
-                    .filter_map(|ri| match ri {
-                        RolloutItem::EventMsg(ev) => Some(ev.clone()),
+        let history = match self {
+            InitialHistory::New => return None,
+            InitialHistory::Resumed(resumed) => &resumed.history,
+            InitialHistory::Forked(items) => items,
+        };
+
+        let has_explicit_message_events = history.iter().any(|item| {
+            matches!(
+                item,
+                RolloutItem::EventMsg(EventMsg::UserMessage(_) | EventMsg::AgentMessage(_))
+            )
+        });
+
+        Some(
+            history
+                .iter()
+                .filter_map(|item| match item {
+                    RolloutItem::EventMsg(ev) => Some(vec![ev.clone()]),
+                    RolloutItem::ResponseItem(ResponseItem::Message {
+                        role,
+                        content,
+                        phase,
+                        ..
+                    }) if !has_explicit_message_events => match role.as_str() {
+                        "user" => Some(vec![EventMsg::UserMessage(UserMessageEvent {
+                            message: content
+                                .iter()
+                                .filter_map(|entry| match entry {
+                                    ContentItem::InputText { text } => Some(text.clone()),
+                                    ContentItem::InputImage { .. }
+                                    | ContentItem::OutputText { .. } => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join(""),
+                            images: Some(
+                                content
+                                    .iter()
+                                    .filter_map(|entry| match entry {
+                                        ContentItem::InputImage { image_url } => {
+                                            Some(image_url.clone())
+                                        }
+                                        ContentItem::InputText { .. }
+                                        | ContentItem::OutputText { .. } => None,
+                                    })
+                                    .collect(),
+                            ),
+                            local_images: Vec::new(),
+                            text_elements: Vec::new(),
+                        })]),
+                        "assistant" => Some(
+                            content
+                                .iter()
+                                .filter_map(|entry| match entry {
+                                    ContentItem::OutputText { text } => {
+                                        Some(EventMsg::AgentMessage(AgentMessageEvent {
+                                            message: text.clone(),
+                                            phase: phase.clone(),
+                                        }))
+                                    }
+                                    ContentItem::InputText { .. }
+                                    | ContentItem::InputImage { .. } => None,
+                                })
+                                .collect(),
+                        ),
                         _ => None,
-                    })
-                    .collect(),
-            ),
-            InitialHistory::Forked(items) => Some(
-                items
-                    .iter()
-                    .filter_map(|ri| match ri {
-                        RolloutItem::EventMsg(ev) => Some(ev.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-            ),
-        }
+                    },
+                    RolloutItem::SessionMeta(_)
+                    | RolloutItem::ResponseItem(_)
+                    | RolloutItem::Compacted(_)
+                    | RolloutItem::TurnContext(_) => None,
+                })
+                .flatten()
+                .collect(),
+        )
     }
 
     pub fn get_base_instructions(&self) -> Option<BaseInstructions> {
@@ -3326,6 +3378,97 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn forked_history_synthesizes_message_events_from_response_items() {
+        let history = InitialHistory::Forked(vec![
+            RolloutItem::ResponseItem(ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![
+                    ContentItem::InputText {
+                        text: "hello".to_string(),
+                    },
+                    ContentItem::InputImage {
+                        image_url: "https://example.com/cat.png".to_string(),
+                    },
+                ],
+                end_turn: None,
+                phase: None,
+            }),
+            RolloutItem::ResponseItem(ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "octopus".to_string(),
+                }],
+                end_turn: None,
+                phase: Some(MessagePhase::FinalAnswer),
+            }),
+        ]);
+
+        let events = history
+            .get_event_msgs()
+            .expect("forked history should synthesize events");
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            EventMsg::UserMessage(UserMessageEvent {
+                message,
+                images,
+                local_images,
+                text_elements,
+            }) => {
+                assert_eq!(message, "hello");
+                assert_eq!(
+                    images.as_deref(),
+                    Some(&["https://example.com/cat.png".to_string()][..])
+                );
+                assert!(local_images.is_empty());
+                assert!(text_elements.is_empty());
+            }
+            other => panic!("expected synthesized user message, got {other:?}"),
+        }
+        match &events[1] {
+            EventMsg::AgentMessage(AgentMessageEvent { message, phase }) => {
+                assert_eq!(message, "octopus");
+                assert_eq!(*phase, Some(MessagePhase::FinalAnswer));
+            }
+            other => panic!("expected synthesized agent message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_message_events_prevent_synthesized_duplicates() {
+        let explicit = EventMsg::UserMessage(UserMessageEvent {
+            message: "from event".to_string(),
+            images: None,
+            local_images: Vec::new(),
+            text_elements: Vec::new(),
+        });
+        let history = InitialHistory::Forked(vec![
+            RolloutItem::EventMsg(explicit),
+            RolloutItem::ResponseItem(ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "from response".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            }),
+        ]);
+
+        let events = history
+            .get_event_msgs()
+            .expect("forked history should preserve explicit events");
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            EventMsg::UserMessage(UserMessageEvent { message, .. }) => {
+                assert_eq!(message, "from event");
+            }
+            other => panic!("expected explicit user message, got {other:?}"),
+        }
     }
 
     #[test]

@@ -44,6 +44,7 @@ use codex_core::config::find_codex_home;
 use codex_core::git_info::get_git_repo_root;
 use codex_core::git_info::get_head_commit_hash;
 use codex_protocol::ThreadId;
+use codex_protocol::items::TurnItem;
 use codex_state::StateRuntime;
 use codex_state::TogetherClientMode as StateTogetherClientMode;
 use codex_state::TogetherClientSession as StateTogetherClientSession;
@@ -1852,21 +1853,20 @@ fn canonicalize_shared_history(
 
 fn rollout_history_preview(history: &[codex_protocol::protocol::RolloutItem]) -> Option<String> {
     history.iter().find_map(|item| match item {
-        codex_protocol::protocol::RolloutItem::ResponseItem(
-            codex_protocol::models::ResponseItem::Message { role, content, .. },
-        ) if role == "user" => non_empty_string(
-            content
-                .iter()
-                .filter_map(|entry| match entry {
-                    codex_protocol::models::ContentItem::InputText { text }
-                    | codex_protocol::models::ContentItem::OutputText { text } => {
-                        Some(text.clone())
-                    }
-                    codex_protocol::models::ContentItem::InputImage { .. } => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
+        codex_protocol::protocol::RolloutItem::ResponseItem(response_item) => {
+            let TurnItem::UserMessage(user_message) = codex_core::parse_turn_item(response_item)?
+            else {
+                return None;
+            };
+            let message = user_message.message();
+            let preview = match message.find(codex_protocol::protocol::USER_MESSAGE_BEGIN) {
+                Some(idx) => {
+                    message[idx + codex_protocol::protocol::USER_MESSAGE_BEGIN.len()..].trim()
+                }
+                None => message.trim(),
+            };
+            non_empty_string(preview.to_string())
+        }
         _ => None,
     })
 }
@@ -2372,4 +2372,53 @@ fn is_pid_running(pid: u32) -> bool {
 #[cfg(not(unix))]
 fn is_pid_running(_pid: u32) -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rollout_history_preview;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseItem;
+    use codex_protocol::protocol::RolloutItem;
+    use codex_protocol::protocol::USER_MESSAGE_BEGIN;
+
+    #[test]
+    fn rollout_history_preview_skips_contextual_messages() {
+        let history = vec![
+            RolloutItem::ResponseItem(ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "# AGENTS.md instructions for /tmp/project\n\n<INSTRUCTIONS>\nhide me\n</INSTRUCTIONS>"
+                        .to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            }),
+            RolloutItem::ResponseItem(ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "<environment_context>\n<cwd>/tmp/project</cwd>\n</environment_context>"
+                        .to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            }),
+            RolloutItem::ResponseItem(ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: format!("{USER_MESSAGE_BEGIN} can we like hide the system prompt and stuff lol"),
+                }],
+                end_turn: None,
+                phase: None,
+            }),
+        ];
+
+        assert_eq!(
+            rollout_history_preview(&history),
+            Some("can we like hide the system prompt and stuff lol".to_string())
+        );
+    }
 }

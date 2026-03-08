@@ -96,6 +96,9 @@ use codex_protocol::protocol::ViewImageToolCallEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::TextElement;
 use codex_protocol::user_input::UserInput;
+use codex_together_protocol::LineageEdge;
+use codex_together_protocol::LineageNode;
+use codex_together_protocol::TogetherHistoryLineageResponse;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_approval_presets::builtin_approval_presets;
 use crossterm::event::KeyCode;
@@ -8867,4 +8870,41 @@ async fn review_queues_user_messages_snapshot() {
     })
     .unwrap();
     assert_snapshot!(term.backend().vt100().screen().contents());
+}
+
+#[test]
+fn render_lineage_tree_includes_ancestors_and_marks_focused_thread() {
+    let response = TogetherHistoryLineageResponse {
+        root: "thread-child".to_string(),
+        nodes: vec![
+            LineageNode {
+                thread_id: "thread-parent".to_string(),
+                owner_email: "owner@example.com".to_string(),
+            },
+            LineageNode {
+                thread_id: "thread-child".to_string(),
+                owner_email: "alice@example.com".to_string(),
+            },
+            LineageNode {
+                thread_id: "thread-grandchild".to_string(),
+                owner_email: "bob@example.com".to_string(),
+            },
+        ],
+        edges: vec![
+            LineageEdge {
+                parent_thread_id: "thread-parent".to_string(),
+                child_thread_id: "thread-child".to_string(),
+                actor_email: "alice@example.com".to_string(),
+                created_at: "2026-03-08T10:00:00Z".to_string(),
+            },
+            LineageEdge {
+                parent_thread_id: "thread-child".to_string(),
+                child_thread_id: "thread-grandchild".to_string(),
+                actor_email: "bob@example.com".to_string(),
+                created_at: "2026-03-08T11:00:00Z".to_string(),
+            },
+        ],
+    };
+
+    assert_snapshot!(render_lineage_tree(&response));
 }

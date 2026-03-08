@@ -1,0 +1,7 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: render_lineage_tree(&response)
+---
+● thread-paren  owner=owner@example.com · thread=thread-parent · root
+└─● thread-child (HEAD)  owner=alice@example.com · thread=thread-child · forked_by=alice@example.com · 2026-03-08 10:00:00Z
+  └─● thread-grand  owner=bob@example.com · thread=thread-grandchild · forked_by=bob@example.com · 2026-03-08 11:00:00Z

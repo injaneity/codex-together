@@ -8729,8 +8729,10 @@ impl ChatWidget {
         }
 
         let actor = local_together_actor_id();
-        let initial_can_delete = rows
-            .first()
+        let initial_selected_idx = rows.iter().position(|row| row.thread_id == lineage.root);
+        let initial_can_delete = initial_selected_idx
+            .and_then(|idx| rows.get(idx))
+            .or_else(|| rows.first())
             .is_some_and(|selected| selected.owner_email == actor);
         let actor_for_keybind = actor.clone();
         let rows_for_keybind = Arc::new(rows.clone());
@@ -8798,6 +8800,7 @@ impl ChatWidget {
             is_searchable: true,
             search_placeholder: Some("Search by thread id, owner, or fork actor".to_string()),
             col_width_mode: ColumnWidthMode::AutoAllRows,
+            initial_selected_idx,
             on_selection_footer_hint,
             on_char_key,
             ..Default::default()
@@ -10754,8 +10757,9 @@ fn lineage_selection_rows(
     let mut out = Vec::new();
     let mut lanes = Vec::new();
     let mut visited = HashSet::new();
+    let root_thread_id = lineage_tree_root(response);
     lineage_selection_row_walk(
-        &response.root,
+        root_thread_id.as_str(),
         None,
         true,
         &mut lanes,
@@ -10766,6 +10770,30 @@ fn lineage_selection_rows(
         &mut out,
     );
     out
+}
+
+fn lineage_tree_root(response: &TogetherHistoryLineageResponse) -> String {
+    let parents: HashMap<&str, &str> = response
+        .edges
+        .iter()
+        .map(|edge| {
+            (
+                edge.child_thread_id.as_str(),
+                edge.parent_thread_id.as_str(),
+            )
+        })
+        .collect();
+
+    let mut current = response.root.as_str();
+    let mut seen = HashSet::new();
+    while seen.insert(current) {
+        let Some(parent) = parents.get(current).copied() else {
+            break;
+        };
+        current = parent;
+    }
+
+    current.to_string()
 }
 
 fn lineage_selection_row_walk(

@@ -175,6 +175,7 @@ struct HostedServer {
 struct SharedThread {
     thread_id: String,
     owner_email: String,
+    shared_by_email: String,
     preview: Option<String>,
     shared_at: String,
     history: Option<Vec<codex_protocol::protocol::RolloutItem>>,
@@ -861,6 +862,7 @@ async fn together_thread_share(
                 SharedThread {
                     thread_id: payload.thread_id.clone(),
                     owner_email: owner_email.clone(),
+                    shared_by_email: caller_email.clone(),
                     preview: preview.clone(),
                     shared_at: shared_at.clone(),
                     history: shared_history.clone(),
@@ -1077,10 +1079,15 @@ async fn together_thread_fork(
         let child_thread_id = ThreadId::default().to_string();
         let child_thread_owner_email = caller_email.clone();
         let preview = rollout_history_preview(history.as_slice());
-        let child_history = Some(history.clone());
         let now = Utc::now();
         let created_at = now.to_rfc3339();
         let created_at_epoch = now.timestamp();
+        let child_history = Some(canonicalize_forked_history(
+            &child_thread_id,
+            &payload.thread_id,
+            &created_at,
+            history.clone(),
+        ));
 
         let server_id = {
             let mut guard = state.inner.lock().await;
@@ -1094,6 +1101,7 @@ async fn together_thread_fork(
                     SharedThread {
                         thread_id: child_thread_id.clone(),
                         owner_email: caller_email.clone(),
+                        shared_by_email: caller_email.clone(),
                         preview,
                         shared_at: created_at.clone(),
                         history: child_history.clone(),
@@ -1160,7 +1168,7 @@ async fn together_thread_fork(
                 parent_thread_id: payload.thread_id,
                 child_thread_id,
                 owner_email: child_thread_owner_email,
-                history: Some(history),
+                history: child_history,
                 writable: true,
             },
         )
@@ -1213,6 +1221,7 @@ async fn together_thread_fork(
                 SharedThread {
                     thread_id: child_thread_id.clone(),
                     owner_email: caller_email.clone(),
+                    shared_by_email: caller_email.clone(),
                     preview,
                     shared_at: created_at.clone(),
                     history: child_history.clone(),
@@ -1451,7 +1460,7 @@ async fn together_history_lineage(
                 .threads
                 .get(&thread_id)
                 .map(|thread| thread.owner_email.clone())
-                .unwrap_or_else(|| hosted.owner_email.clone());
+                .unwrap_or_else(|| "unknown".to_string());
             LineageNode {
                 thread_id,
                 owner_email,
@@ -1728,43 +1737,100 @@ fn notify_connection_revoked(state: &ServerState, target_email: &str) {
 }
 
 fn lineage_edges(hosted: &HostedServer, root: &str) -> Vec<LineageEdge> {
-    let mut out = Vec::new();
-    let mut frontier = HashSet::from([root.to_string()]);
-    let mut seen_edges: HashSet<(String, String)> = HashSet::new();
+    let all_edges = merged_lineage_edges(hosted);
+    let mut connected_nodes = HashSet::from([root.to_string()]);
+    let mut frontier = vec![root.to_string()];
 
-    loop {
-        let mut progressed = false;
-        for edge in &hosted.forks {
-            if !frontier.contains(&edge.parent_thread_id) {
-                continue;
+    while let Some(node_id) = frontier.pop() {
+        for edge in &all_edges {
+            let neighbor = if edge.parent_thread_id == node_id {
+                Some(edge.child_thread_id.clone())
+            } else if edge.child_thread_id == node_id {
+                Some(edge.parent_thread_id.clone())
+            } else {
+                None
+            };
+
+            if let Some(neighbor) = neighbor
+                && connected_nodes.insert(neighbor.clone())
+            {
+                frontier.push(neighbor);
             }
-
-            if seen_edges.insert((edge.parent_thread_id.clone(), edge.child_thread_id.clone())) {
-                out.push(LineageEdge {
-                    parent_thread_id: edge.parent_thread_id.clone(),
-                    child_thread_id: edge.child_thread_id.clone(),
-                    actor_email: edge.actor_email.clone(),
-                    created_at: edge.created_at.clone(),
-                });
-            }
-
-            if frontier.insert(edge.child_thread_id.clone()) {
-                progressed = true;
-            }
-        }
-
-        if !progressed {
-            break;
         }
     }
 
-    out.sort_by(|a, b| {
+    all_edges
+        .into_iter()
+        .filter(|edge| {
+            connected_nodes.contains(&edge.parent_thread_id)
+                && connected_nodes.contains(&edge.child_thread_id)
+        })
+        .collect()
+}
+
+fn merged_lineage_edges(hosted: &HostedServer) -> Vec<LineageEdge> {
+    let mut by_child = HashMap::new();
+    for edge in &hosted.forks {
+        by_child.insert(
+            edge.child_thread_id.clone(),
+            LineageEdge {
+                parent_thread_id: edge.parent_thread_id.clone(),
+                child_thread_id: edge.child_thread_id.clone(),
+                actor_email: edge.actor_email.clone(),
+                created_at: edge.created_at.clone(),
+            },
+        );
+    }
+
+    for thread in hosted.threads.values() {
+        let Some(edge) = implicit_lineage_edge(thread) else {
+            continue;
+        };
+        by_child.entry(edge.child_thread_id.clone()).or_insert(edge);
+    }
+
+    let mut edges: Vec<_> = by_child.into_values().collect();
+    edges.sort_by(|a, b| {
         a.created_at
             .cmp(&b.created_at)
             .then_with(|| a.parent_thread_id.cmp(&b.parent_thread_id))
             .then_with(|| a.child_thread_id.cmp(&b.child_thread_id))
     });
-    out
+    edges
+}
+
+fn implicit_lineage_edge(thread: &SharedThread) -> Option<LineageEdge> {
+    let meta = history_session_meta(thread.history.as_deref()?)?;
+    let child_thread_id = thread.thread_id.clone();
+    let history_thread_id = meta.id.to_string();
+    let (parent_thread_id, created_at) = if history_thread_id == child_thread_id {
+        (
+            meta.forked_from_id.as_ref()?.to_string(),
+            non_empty_string(meta.timestamp.clone()).unwrap_or_else(|| thread.shared_at.clone()),
+        )
+    } else {
+        (history_thread_id, thread.shared_at.clone())
+    };
+
+    if parent_thread_id == child_thread_id {
+        return None;
+    }
+
+    Some(LineageEdge {
+        parent_thread_id,
+        child_thread_id,
+        actor_email: thread.shared_by_email.clone(),
+        created_at,
+    })
+}
+
+fn history_session_meta(
+    history: &[codex_protocol::protocol::RolloutItem],
+) -> Option<&codex_protocol::protocol::SessionMeta> {
+    history.iter().find_map(|item| match item {
+        codex_protocol::protocol::RolloutItem::SessionMeta(meta_line) => Some(&meta_line.meta),
+        _ => None,
+    })
 }
 
 fn replay_messages_from_turns(turns: &[Turn]) -> Vec<TogetherReplayMessage> {
@@ -1847,6 +1913,25 @@ fn canonicalize_shared_history(
             .find(|item| matches!(item, codex_protocol::protocol::RolloutItem::SessionMeta(_)))
     {
         meta_line.meta.id = shared_thread_id;
+    }
+    history
+}
+
+fn canonicalize_forked_history(
+    thread_id: &str,
+    parent_thread_id: &str,
+    created_at: &str,
+    mut history: Vec<codex_protocol::protocol::RolloutItem>,
+) -> Vec<codex_protocol::protocol::RolloutItem> {
+    if let Some(codex_protocol::protocol::RolloutItem::SessionMeta(meta_line)) = history
+        .iter_mut()
+        .find(|item| matches!(item, codex_protocol::protocol::RolloutItem::SessionMeta(_)))
+    {
+        if let Ok(shared_thread_id) = ThreadId::from_string(thread_id) {
+            meta_line.meta.id = shared_thread_id;
+        }
+        meta_line.meta.forked_from_id = ThreadId::from_string(parent_thread_id).ok();
+        meta_line.meta.timestamp = created_at.to_string();
     }
     history
 }
@@ -2376,11 +2461,22 @@ fn is_pid_running(_pid: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::ForkEdge;
+    use super::HostedServer;
+    use super::SharedThread;
+    use super::canonicalize_forked_history;
+    use super::lineage_edges;
     use super::rollout_history_preview;
+    use codex_protocol::ThreadId;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseItem;
     use codex_protocol::protocol::RolloutItem;
+    use codex_protocol::protocol::SessionMeta;
+    use codex_protocol::protocol::SessionMetaLine;
     use codex_protocol::protocol::USER_MESSAGE_BEGIN;
+    use std::collections::HashMap;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
 
     #[test]
     fn rollout_history_preview_skips_contextual_messages() {
@@ -2420,5 +2516,133 @@ mod tests {
             rollout_history_preview(&history),
             Some("can we like hide the system prompt and stuff lol".to_string())
         );
+    }
+
+    #[test]
+    fn lineage_edges_include_ancestors_for_focused_child() {
+        let parent_thread_id = ThreadId::new().to_string();
+        let child_thread_id = ThreadId::new().to_string();
+        let grandchild_thread_id = ThreadId::new().to_string();
+        let hosted = HostedServer {
+            server_id: "srv_test".to_string(),
+            owner_email: "owner@example.com".to_string(),
+            public_base_url: "https://example.com".to_string(),
+            members: HashSet::new(),
+            threads: HashMap::new(),
+            forks: vec![
+                ForkEdge {
+                    parent_thread_id: parent_thread_id.clone(),
+                    child_thread_id: child_thread_id.clone(),
+                    actor_email: "owner@example.com".to_string(),
+                    created_at: "2026-03-08T10:00:00Z".to_string(),
+                },
+                ForkEdge {
+                    parent_thread_id: child_thread_id.clone(),
+                    child_thread_id: grandchild_thread_id.clone(),
+                    actor_email: "owner@example.com".to_string(),
+                    created_at: "2026-03-08T11:00:00Z".to_string(),
+                },
+            ],
+        };
+
+        let edges = lineage_edges(&hosted, &child_thread_id);
+
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[0].parent_thread_id, parent_thread_id);
+        assert_eq!(edges[0].child_thread_id, child_thread_id);
+        assert_eq!(edges[1].child_thread_id, grandchild_thread_id);
+    }
+
+    #[test]
+    fn lineage_edges_recover_republished_parent_from_shared_history() {
+        let parent_thread_id = ThreadId::new();
+        let child_thread_id = ThreadId::new();
+        let history = vec![RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                id: child_thread_id,
+                forked_from_id: Some(parent_thread_id),
+                timestamp: "2026-03-08T12:00:00Z".to_string(),
+                cwd: PathBuf::from("/tmp/project"),
+                originator: "codex".to_string(),
+                cli_version: "0.0.0".to_string(),
+                source: Default::default(),
+                agent_nickname: None,
+                agent_role: None,
+                model_provider: None,
+                base_instructions: None,
+                dynamic_tools: None,
+            },
+            git: None,
+        })];
+        let child_thread_id = child_thread_id.to_string();
+        let parent_thread_id = parent_thread_id.to_string();
+        let mut threads = HashMap::new();
+        threads.insert(
+            child_thread_id.clone(),
+            SharedThread {
+                thread_id: child_thread_id.clone(),
+                owner_email: "alice@example.com".to_string(),
+                shared_by_email: "alice@example.com".to_string(),
+                preview: Some("forked child".to_string()),
+                shared_at: "2026-03-08T12:05:00Z".to_string(),
+                history: Some(history),
+            },
+        );
+        let hosted = HostedServer {
+            server_id: "srv_test".to_string(),
+            owner_email: "owner@example.com".to_string(),
+            public_base_url: "https://example.com".to_string(),
+            members: HashSet::new(),
+            threads,
+            forks: Vec::new(),
+        };
+
+        let edges = lineage_edges(&hosted, &child_thread_id);
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].parent_thread_id, parent_thread_id);
+        assert_eq!(edges[0].child_thread_id, child_thread_id);
+        assert_eq!(edges[0].actor_email, "alice@example.com");
+        assert_eq!(edges[0].created_at, "2026-03-08T12:00:00Z");
+    }
+
+    #[test]
+    fn canonicalize_forked_history_rewrites_child_session_metadata() {
+        let original_parent_thread_id = ThreadId::new();
+        let child_thread_id = ThreadId::new();
+        let mut history = vec![RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                id: original_parent_thread_id,
+                forked_from_id: None,
+                timestamp: "2026-03-08T09:00:00Z".to_string(),
+                cwd: PathBuf::from("/tmp/project"),
+                originator: "codex".to_string(),
+                cli_version: "0.0.0".to_string(),
+                source: Default::default(),
+                agent_nickname: None,
+                agent_role: None,
+                model_provider: None,
+                base_instructions: None,
+                dynamic_tools: None,
+            },
+            git: None,
+        })];
+
+        history = canonicalize_forked_history(
+            &child_thread_id.to_string(),
+            &original_parent_thread_id.to_string(),
+            "2026-03-08T10:00:00Z",
+            history,
+        );
+
+        let RolloutItem::SessionMeta(meta_line) = &history[0] else {
+            panic!("expected session meta");
+        };
+        assert_eq!(meta_line.meta.id, child_thread_id);
+        assert_eq!(
+            meta_line.meta.forked_from_id,
+            Some(original_parent_thread_id)
+        );
+        assert_eq!(meta_line.meta.timestamp, "2026-03-08T10:00:00Z");
     }
 }

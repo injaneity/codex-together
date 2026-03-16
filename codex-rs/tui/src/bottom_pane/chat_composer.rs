@@ -4395,7 +4395,7 @@ fn context_ref_from_search_result(result: &ContextSearchResult) -> ContextRef {
 
 fn context_row_description(result: &ContextSearchResult) -> String {
     let kind = match result.kind {
-        codex_together_protocol::ContextKind::SharedThread => "shared thread",
+        codex_together_protocol::ContextKind::SharedThread => "thread",
         codex_together_protocol::ContextKind::RepoContextFile => "repo context",
     };
     match (&result.location, &result.summary) {
@@ -5679,9 +5679,7 @@ mod tests {
                         ref_id: "ctx:file:.codex/context/overview.md".to_string(),
                         kind: codex_together_protocol::ContextKind::RepoContextFile,
                         title: "Planning Overview".to_string(),
-                        summary: Some(
-                            "plan · public · Ship the context browser first.".to_string(),
-                        ),
+                        summary: Some("plan · Ship the context browser first.".to_string()),
                         location: Some(".codex/context/overview.md".to_string()),
                         body: None,
                     },
@@ -5689,9 +5687,7 @@ mod tests {
                         ref_id: "ctx:thread:thread-1".to_string(),
                         kind: codex_together_protocol::ContextKind::SharedThread,
                         title: "planning sync".to_string(),
-                        summary: Some(
-                            "owner=owner@example.com · shared_by=owner@example.com".to_string(),
-                        ),
+                        summary: Some("cwd=/tmp/repo · updated_at=1741422760".to_string()),
                         location: Some("thread/thread-1".to_string()),
                         body: None,
                     },
@@ -5726,7 +5722,7 @@ mod tests {
             ref_id: "ctx:file:.codex/context/overview.md".to_string(),
             kind: codex_together_protocol::ContextKind::RepoContextFile,
             title: "Planning Overview".to_string(),
-            summary: Some("plan · public".to_string()),
+            summary: Some("plan".to_string()),
             location: Some(".codex/context/overview.md".to_string()),
             body: None,
         };
@@ -10036,18 +10032,5 @@ mod tests {
             height: 5,
         };
         assert_eq!(composer.cursor_pos(area), None);
-    }
-
-    #[test]
-    fn input_disabled_together_checkout_snapshot() {
-        snapshot_composer_state("input_disabled_together_checkout", true, |composer| {
-            composer.set_input_enabled(
-                false,
-                Some(
-                    "Read-only together checkout owned by owner@example.com. Press f to fork or Esc to leave."
-                        .to_string(),
-                ),
-            );
-        });
     }
 }

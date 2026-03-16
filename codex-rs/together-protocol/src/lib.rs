@@ -1,5 +1,4 @@
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SandboxPolicy;
 use serde::Deserialize;
 use serde::Serialize;
@@ -17,9 +16,6 @@ pub const METHOD_HOST_STATUS: &str = "host/status";
 pub const METHOD_HOST_STOP: &str = "host/stop";
 pub const METHOD_SESSION_JOIN: &str = "session/join";
 pub const METHOD_SESSION_LEAVE: &str = "session/leave";
-pub const METHOD_THREAD_SHARE: &str = "thread/share";
-pub const METHOD_THREAD_LIST: &str = "thread/list";
-pub const METHOD_THREAD_INSPECT: &str = "thread/inspect";
 pub const METHOD_CONTEXT_SEARCH: &str = "context/search";
 pub const METHOD_CONTEXT_GRAPH: &str = "context/graph";
 pub const METHOD_CONTEXT_PREVIEW: &str = "context/preview";
@@ -30,9 +26,6 @@ pub const METHOD_CONTEXT_WRITE_PLAN: &str = "context/writePlan";
 pub const METHOD_CONTEXT_WRITE_COMMIT: &str = "context/writeCommit";
 
 pub const NOTIFY_HOST_STOPPED: &str = "host/stopped";
-pub const NOTIFY_TOGETHER_MEMBER_UPDATED: &str = "together/memberUpdated";
-pub const NOTIFY_TOGETHER_THREAD_SHARED: &str = "together/threadShared";
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
@@ -164,103 +157,6 @@ pub struct TogetherServerInfoResponse {
     pub commit: Option<String>,
     pub role: TogetherRole,
     pub connected_members: Vec<ConnectedMember>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TogetherThreadShareRequest {
-    pub thread_id: String,
-    #[serde(default)]
-    pub history: Option<Vec<RolloutItem>>,
-    #[serde(default)]
-    pub visibility: Option<String>,
-    #[serde(default)]
-    pub repo_root: Option<String>,
-    #[serde(default)]
-    pub git_branch: Option<String>,
-    #[serde(default)]
-    pub git_sha: Option<String>,
-    #[serde(default)]
-    pub git_origin_url: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TogetherThreadShareResponse {
-    pub thread_id: String,
-    pub owner_email: String,
-    #[serde(default)]
-    pub preview: Option<String>,
-    pub shared_at: String,
-    #[serde(default)]
-    pub visibility: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TogetherThreadReadRequest {
-    pub thread_id: String,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum TogetherReplayRole {
-    User,
-    Assistant,
-    System,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TogetherReplayMessage {
-    pub role: TogetherReplayRole,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TogetherThreadReadResponse {
-    pub thread_id: String,
-    pub owner_email: String,
-    pub history: Option<Vec<RolloutItem>>,
-    pub messages: Vec<TogetherReplayMessage>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TogetherThreadListRequest {
-    #[serde(default)]
-    pub cursor: Option<String>,
-    #[serde(default)]
-    pub limit: Option<u32>,
-    #[serde(default)]
-    pub search_term: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TogetherThreadSummary {
-    pub thread_id: String,
-    pub owner_email: String,
-    #[serde(default)]
-    pub preview: Option<String>,
-    pub created_at: String,
-    #[serde(default)]
-    pub repo_root: Option<String>,
-    #[serde(default)]
-    pub git_branch: Option<String>,
-    #[serde(default)]
-    pub git_sha: Option<String>,
-    #[serde(default)]
-    pub git_origin_url: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TogetherThreadListResponse {
-    pub data: Vec<TogetherThreadSummary>,
-    #[serde(default)]
-    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

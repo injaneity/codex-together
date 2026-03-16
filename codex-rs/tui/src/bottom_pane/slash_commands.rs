@@ -35,13 +35,7 @@ pub(crate) fn builtins_for_input(
         .filter(|(_, cmd)| realtime_conversation_enabled || *cmd != SlashCommand::Realtime)
         .filter(|(_, cmd)| audio_device_selection_enabled || *cmd != SlashCommand::Settings)
         .filter(|(_, cmd)| !connected || hosting || *cmd != SlashCommand::Host)
-        .filter(|(_, cmd)| {
-            connected
-                || !matches!(
-                    cmd,
-                    SlashCommand::Leave | SlashCommand::Share | SlashCommand::Threads
-                )
-        })
+        .filter(|(_, cmd)| connected || *cmd != SlashCommand::Leave)
         .collect()
 }
 
@@ -159,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn threads_hidden_when_disconnected() {
+    fn threads_command_is_pruned_while_disconnected() {
         let _guard = TogetherStatusGuard::set("disconnected");
         assert_eq!(
             find_builtin_command("threads", true, true, true, false, true, false),
@@ -168,11 +162,11 @@ mod tests {
     }
 
     #[test]
-    fn threads_visible_when_connected() {
+    fn threads_command_is_pruned_while_connected() {
         let _guard = TogetherStatusGuard::set("together @owner@local");
         assert_eq!(
             find_builtin_command("threads", true, true, true, false, true, false),
-            Some(SlashCommand::Threads)
+            None
         );
     }
 
@@ -240,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn share_hidden_when_disconnected() {
+    fn share_command_is_pruned_while_disconnected() {
         let _guard = TogetherStatusGuard::set("disconnected");
         assert_eq!(
             find_builtin_command("share", true, true, true, false, true, false),
@@ -249,11 +243,11 @@ mod tests {
     }
 
     #[test]
-    fn share_visible_when_connected() {
+    fn share_command_is_pruned_while_connected() {
         let _guard = TogetherStatusGuard::set("together @owner@local");
         assert_eq!(
             find_builtin_command("share", true, true, true, false, true, false),
-            Some(SlashCommand::Share)
+            None
         );
     }
 }

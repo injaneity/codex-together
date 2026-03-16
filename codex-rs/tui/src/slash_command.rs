@@ -39,8 +39,6 @@ pub enum SlashCommand {
     Host,
     Join,
     Leave,
-    Share,
-    Threads,
     Context,
     Handoff,
     DebugConfig,
@@ -87,12 +85,10 @@ impl SlashCommand {
             SlashCommand::Mention => "mention a file",
             SlashCommand::Skills => "use skills to improve how Codex performs specific tasks",
             SlashCommand::Status => "show current session configuration and token usage",
-            SlashCommand::Host => "start or manage the collaboration host",
-            SlashCommand::Join => "join a collaboration host",
-            SlashCommand::Leave => "leave the current collaboration host",
-            SlashCommand::Share => "toggle visibility for the current thread",
-            SlashCommand::Threads => "browse shared threads and inspect them",
-            SlashCommand::Context => "open the collaboration context graph",
+            SlashCommand::Host => "start or manage repo collaboration",
+            SlashCommand::Join => "join repo collaboration",
+            SlashCommand::Leave => "leave repo collaboration",
+            SlashCommand::Context => "open the repo context graph",
             SlashCommand::Handoff => "create a fresh thread from selected context",
             SlashCommand::DebugConfig => "show config layers and requirement sources for debugging",
             SlashCommand::Statusline => "configure which items appear in the status line",
@@ -139,7 +135,6 @@ impl SlashCommand {
                 | SlashCommand::Host
                 | SlashCommand::Join
                 | SlashCommand::Leave
-                | SlashCommand::Share
                 | SlashCommand::Context
                 | SlashCommand::Handoff
                 | SlashCommand::SandboxReadRoot
@@ -177,8 +172,6 @@ impl SlashCommand {
             | SlashCommand::Host
             | SlashCommand::Join
             | SlashCommand::Leave
-            | SlashCommand::Share
-            | SlashCommand::Threads
             | SlashCommand::Context
             | SlashCommand::Handoff
             | SlashCommand::DebugConfig

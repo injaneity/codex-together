@@ -33,11 +33,7 @@ pub use thread_metadata::ThreadMetadataBuilder;
 pub use thread_metadata::ThreadsPage;
 pub use together::TogetherClientMode;
 pub use together::TogetherClientSession;
-pub use together::TogetherMemberRecord;
-pub use together::TogetherRole;
 pub use together::TogetherServerRecord;
-pub use together::TogetherThreadAclRecord;
-pub use together::TogetherThreadForkRecord;
 
 pub(crate) use agent_job::AgentJobItemRow;
 pub(crate) use agent_job::AgentJobRow;

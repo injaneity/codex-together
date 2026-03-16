@@ -803,16 +803,6 @@ impl BottomPane {
         self.push_view(Box::new(view));
     }
 
-    /// Dismiss any active bottom-pane view stack and return focus to composer.
-    pub(crate) fn dismiss_active_view(&mut self) {
-        if self.view_stack.is_empty() {
-            return;
-        }
-        self.view_stack.clear();
-        self.on_active_view_complete();
-        self.request_redraw();
-    }
-
     /// Replace the active selection view when it matches `view_id`.
     pub(crate) fn replace_selection_view_if_active(
         &mut self,
@@ -889,11 +879,6 @@ impl BottomPane {
     #[cfg(test)]
     pub(crate) fn has_active_view(&self) -> bool {
         !self.view_stack.is_empty()
-    }
-
-    pub(crate) fn active_view_id(&self) -> Option<&'static str> {
-        self.active_view()
-            .and_then(bottom_pane_view::BottomPaneView::view_id)
     }
 
     /// Return true when the pane is in the regular composer state without any

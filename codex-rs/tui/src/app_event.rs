@@ -16,12 +16,10 @@ use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::RateLimitSnapshot;
-use codex_protocol::protocol::RolloutItem;
 use codex_together_protocol::ContextRef;
 use codex_together_protocol::ContextResolveBundleResponse;
 use codex_together_protocol::ContextSearchResult;
 use codex_together_protocol::HandoffPlanResponse;
-use codex_together_protocol::TogetherThreadSummary;
 use codex_utils_approval_presets::ApprovalPreset;
 
 use crate::bottom_pane::ApprovalRequest;
@@ -418,16 +416,6 @@ pub(crate) enum AppEvent {
         args: String,
     },
 
-    /// Open an interactive shared-threads list for collaboration operations.
-    OpenTogetherThreadsView {
-        threads: Vec<TogetherThreadSummary>,
-    },
-
-    /// Refresh the shared-threads list when that picker is currently open.
-    RefreshTogetherThreadsViewIfActive {
-        threads: Vec<TogetherThreadSummary>,
-    },
-
     /// Async search request for `##` composer context attach.
     StartTogetherComposerContextSearch {
         query: String,
@@ -491,17 +479,6 @@ pub(crate) enum AppEvent {
     CommitTogetherContextWrite {
         plan_id: String,
     },
-
-    /// Try to switch the active thread to a together checkout/fork target.
-    ResumeTogetherThread {
-        thread_id: String,
-        history: Option<Vec<RolloutItem>>,
-        writable: bool,
-        owner_email: String,
-    },
-
-    /// Leave the current read-only together checkout and return to the prior local session.
-    ExitReadOnlyTogetherCheckout,
 
     /// Submit a user message with an explicit collaboration mask.
     SubmitUserMessageWithMode {

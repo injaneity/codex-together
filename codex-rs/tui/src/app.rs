@@ -12,10 +12,8 @@ use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ExternalEditorState;
-use crate::chatwidget::clear_together_checked_out_thread_id;
 use crate::chatwidget::commit_together_context_write_plan;
 use crate::chatwidget::commit_together_handoff_plan;
-use crate::chatwidget::fetch_together_thread_replay;
 use crate::chatwidget::plan_together_context_handoff;
 use crate::chatwidget::plan_together_context_write;
 use crate::chatwidget::search_together_context;
@@ -47,6 +45,7 @@ use codex_ansi_escape::ansi_escape_line;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
+#[cfg(test)]
 use codex_core::NewThread;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
@@ -79,9 +78,11 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::FinalOutput;
+#[cfg(test)]
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::ListSkillsResponseEvent;
 use codex_protocol::protocol::Op;
+#[cfg(test)]
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
@@ -703,7 +704,6 @@ pub(crate) struct App {
     primary_thread_id: Option<ThreadId>,
     primary_session_configured: Option<SessionConfiguredEvent>,
     pending_primary_events: VecDeque<Event>,
-    read_only_together_checkout_return_path: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -755,95 +755,7 @@ impl App {
         }
     }
 
-    async fn resume_together_thread(
-        &mut self,
-        tui: &mut tui::Tui,
-        thread_id: String,
-        history: Option<Vec<RolloutItem>>,
-        writable: bool,
-        owner_email: String,
-    ) {
-        let previous_rollout_path = if writable {
-            None
-        } else {
-            existing_together_checkout_return_path(self.chat_widget.rollout_path())
-        };
-        if self.chat_widget.thread_id().map(|id| id.to_string()) == Some(thread_id.clone()) {
-            self.reset_backtrack_state();
-            self.chat_widget
-                .set_together_checkout_mode(writable, owner_email.as_str());
-            if writable {
-                self.read_only_together_checkout_return_path = None;
-            } else if self.read_only_together_checkout_return_path.is_none() {
-                self.read_only_together_checkout_return_path = previous_rollout_path;
-            }
-            return;
-        }
-
-        if let Some(history) = history
-            && !history.is_empty()
-        {
-            match self.resume_thread_from_rollout_items(history).await {
-                Ok(resumed) => {
-                    self.swap_in_existing_thread(tui, resumed).await;
-                    self.chat_widget
-                        .set_together_checkout_mode(writable, owner_email.as_str());
-                    self.read_only_together_checkout_return_path = previous_rollout_path;
-                }
-                Err(err) => {
-                    self.chat_widget.add_error_message(format!(
-                        "Failed to open together thread {thread_id} from shared history: {err}"
-                    ));
-                }
-            }
-            return;
-        }
-
-        match find_thread_path_by_id_str(self.config.codex_home.as_path(), &thread_id).await {
-            Ok(Some(path)) => match self
-                .server
-                .resume_thread_from_rollout(
-                    self.config.clone(),
-                    path.clone(),
-                    self.auth_manager.clone(),
-                )
-                .await
-            {
-                Ok(resumed) => {
-                    self.swap_in_existing_thread(tui, resumed).await;
-                    self.chat_widget
-                        .set_together_checkout_mode(writable, owner_email.as_str());
-                    self.read_only_together_checkout_return_path = previous_rollout_path;
-                }
-                Err(err) => {
-                    let path_display = path.display();
-                    self.chat_widget.add_error_message(format!(
-                        "Failed to open together thread {thread_id} from {path_display}: {err}"
-                    ));
-                }
-            },
-            Ok(None) => match fetch_together_thread_replay(thread_id.clone()).await {
-                Ok(replay) => {
-                    self.chat_widget
-                        .replay_together_thread_messages(thread_id.clone(), replay.messages);
-                    self.chat_widget
-                        .set_together_checkout_mode(writable, owner_email.as_str());
-                    self.read_only_together_checkout_return_path = previous_rollout_path;
-                }
-                Err(err) => {
-                    self.chat_widget.add_error_message(format!(
-                        "Failed to load together thread {thread_id}: {err}"
-                    ));
-                }
-            },
-            Err(err) => {
-                self.chat_widget.add_error_message(format!(
-                    "Failed to locate together thread {thread_id}: {err}"
-                ));
-            }
-        }
-    }
-
+    #[cfg(test)]
     async fn resume_thread_from_rollout_items(
         &self,
         history: Vec<RolloutItem>,
@@ -947,9 +859,6 @@ impl App {
                     ChatWidget::new_from_existing(init, resumed.thread, resumed.session_configured);
                 self.reset_thread_event_state();
                 self.reset_backtrack_state();
-                clear_together_checked_out_thread_id();
-                self.read_only_together_checkout_return_path = None;
-                self.chat_widget.set_together_checkout_mode(true, "");
                 self.chat_widget
                     .set_composer_text_with_context_bindings(draft_text, context_refs);
                 self.chat_widget.add_info_message(
@@ -1048,47 +957,6 @@ impl App {
                 }
             }
         });
-    }
-
-    async fn swap_in_existing_thread(&mut self, tui: &mut tui::Tui, resumed: NewThread) {
-        self.shutdown_current_thread().await;
-        let init = self.chatwidget_init_for_forked_or_resumed_thread(tui, self.config.clone());
-        self.chat_widget =
-            ChatWidget::new_from_existing(init, resumed.thread, resumed.session_configured);
-        self.reset_thread_event_state();
-        self.reset_backtrack_state();
-    }
-
-    async fn exit_read_only_together_checkout(&mut self, tui: &mut tui::Tui) {
-        clear_together_checked_out_thread_id();
-        let Some(path) = existing_together_checkout_return_path(
-            self.read_only_together_checkout_return_path.take(),
-        ) else {
-            self.start_fresh_session_with_summary_hint(tui).await;
-            return;
-        };
-
-        match self
-            .server
-            .resume_thread_from_rollout(
-                self.config.clone(),
-                path.clone(),
-                self.auth_manager.clone(),
-            )
-            .await
-        {
-            Ok(resumed) => {
-                self.swap_in_existing_thread(tui, resumed).await;
-                self.chat_widget.set_together_checkout_mode(true, "");
-            }
-            Err(err) => {
-                let path_display = path.display();
-                self.chat_widget.add_error_message(format!(
-                    "Failed to restore the previous local thread from {path_display}: {err}"
-                ));
-                self.start_fresh_session_with_summary_hint(tui).await;
-            }
-        }
     }
 
     async fn rebuild_config_for_cwd(&self, cwd: PathBuf) -> Result<Config> {
@@ -2078,7 +1946,6 @@ impl App {
             primary_thread_id: None,
             primary_session_configured: None,
             pending_primary_events: VecDeque::new(),
-            read_only_together_checkout_return_path: None,
         };
 
         // On startup, if Agent mode (workspace-write) or ReadOnly is active, warn about world-writable dirs on Windows.
@@ -3405,13 +3272,6 @@ impl App {
             AppEvent::RunTogetherCommand { args } => {
                 self.chat_widget.run_together_command(args);
             }
-            AppEvent::OpenTogetherThreadsView { threads } => {
-                self.chat_widget.show_together_threads_view(threads);
-            }
-            AppEvent::RefreshTogetherThreadsViewIfActive { threads } => {
-                self.chat_widget
-                    .refresh_together_threads_view_if_open(threads);
-            }
             AppEvent::StartTogetherComposerContextSearch { query } => {
                 self.start_together_composer_context_search(query);
             }
@@ -3456,18 +3316,6 @@ impl App {
             }
             AppEvent::CommitTogetherContextWrite { plan_id } => {
                 self.commit_together_context_write(plan_id).await;
-            }
-            AppEvent::ResumeTogetherThread {
-                thread_id,
-                history,
-                writable,
-                owner_email,
-            } => {
-                self.resume_together_thread(tui, thread_id, history, writable, owner_email)
-                    .await;
-            }
-            AppEvent::ExitReadOnlyTogetherCheckout => {
-                self.exit_read_only_together_checkout(tui).await;
             }
             AppEvent::SubmitUserMessageWithMode {
                 text,
@@ -4003,10 +3851,6 @@ impl App {
             }
         });
     }
-}
-
-fn existing_together_checkout_return_path(path: Option<PathBuf>) -> Option<PathBuf> {
-    path.filter(|path| path.exists())
 }
 
 #[cfg(test)]
@@ -4843,7 +4687,6 @@ mod tests {
             primary_thread_id: None,
             primary_session_configured: None,
             pending_primary_events: VecDeque::new(),
-            read_only_together_checkout_return_path: None,
         }
     }
 
@@ -4904,7 +4747,6 @@ mod tests {
                 primary_thread_id: None,
                 primary_session_configured: None,
                 pending_primary_events: VecDeque::new(),
-                read_only_together_checkout_return_path: None,
             },
             rx,
             op_rx,
@@ -5314,24 +5156,6 @@ mod tests {
             app.chat_widget.config_ref().tui_theme.as_deref(),
             Some("dracula")
         );
-    }
-
-    #[test]
-    fn existing_together_checkout_return_path_filters_missing_paths() {
-        let temp_dir = tempdir().expect("tempdir");
-        let existing = temp_dir.path().join("existing.jsonl");
-        std::fs::write(&existing, "").expect("write existing path");
-        let missing = temp_dir.path().join("missing.jsonl");
-
-        assert_eq!(
-            super::existing_together_checkout_return_path(Some(existing.clone())),
-            Some(existing)
-        );
-        assert_eq!(
-            super::existing_together_checkout_return_path(Some(missing)),
-            None
-        );
-        assert_eq!(super::existing_together_checkout_return_path(None), None);
     }
 
     #[tokio::test]

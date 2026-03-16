@@ -46,11 +46,7 @@ pub use model::ThreadMetadataBuilder;
 pub use model::ThreadsPage;
 pub use model::TogetherClientMode;
 pub use model::TogetherClientSession;
-pub use model::TogetherMemberRecord;
-pub use model::TogetherRole;
 pub use model::TogetherServerRecord;
-pub use model::TogetherThreadAclRecord;
-pub use model::TogetherThreadForkRecord;
 pub use runtime::state_db_filename;
 pub use runtime::state_db_path;
 

@@ -1769,7 +1769,6 @@ async fn make_chatwidget_manual(
         feedback: codex_feedback::CodexFeedback::new(),
         feedback_audience: FeedbackAudience::External,
         current_rollout_path: None,
-        read_only_together_checkout_owner: None,
         current_cwd: None,
         session_network_proxy: None,
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
@@ -1808,58 +1807,6 @@ fn assert_no_submit_op(op_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Op>) {
 }
 
 #[tokio::test]
-async fn together_threads_view_refresh_snapshot() {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
-    let owner_email = "owner@example.com".to_string();
-
-    chat.show_together_threads_view(vec![
-        TogetherThreadSummary {
-            thread_id: "thread-1".to_string(),
-            owner_email: owner_email.clone(),
-            preview: Some("first preview".to_string()),
-            created_at: "2026-03-06T12:00:00Z".to_string(),
-            repo_root: None,
-            git_branch: None,
-            git_sha: None,
-            git_origin_url: None,
-        },
-        TogetherThreadSummary {
-            thread_id: "thread-2".to_string(),
-            owner_email: owner_email.clone(),
-            preview: Some("second preview".to_string()),
-            created_at: "2026-03-06T12:05:00Z".to_string(),
-            repo_root: None,
-            git_branch: None,
-            git_sha: None,
-            git_origin_url: None,
-        },
-    ]);
-
-    chat.refresh_together_threads_view_if_open(vec![TogetherThreadSummary {
-        thread_id: "thread-2".to_string(),
-        owner_email,
-        preview: Some("second preview".to_string()),
-        created_at: "2026-03-06T12:05:00Z".to_string(),
-        repo_root: None,
-        git_branch: None,
-        git_sha: None,
-        git_origin_url: None,
-    }]);
-
-    let mut terminal = Terminal::new(TestBackend::new(100, 16)).expect("create terminal");
-    terminal
-        .draw(|f| chat.render(f.area(), f.buffer_mut()))
-        .expect("draw refreshed threads view");
-    assert_snapshot!(
-        "together_threads_view_refresh_after_delete",
-        terminal.backend()
-    );
-}
-
-#[tokio::test]
 async fn together_context_view_snapshot() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1873,7 +1820,7 @@ async fn together_context_view_snapshot() {
                 ref_id: "ctx:file:.codex/context/overview.md".to_string(),
                 kind: ContextKind::RepoContextFile,
                 title: "Planning Overview".to_string(),
-                summary: Some("plan · public · Ship the context browser first.".to_string()),
+                summary: Some("plan · Ship the context browser first.".to_string()),
                 location: Some(".codex/context/overview.md".to_string()),
                 body: Some(
                     "# Planning Overview\n\nShip the context browser first.\nThen wire handoff on top."
@@ -1884,13 +1831,10 @@ async fn together_context_view_snapshot() {
                 ref_id: "ctx:thread:thread-1".to_string(),
                 kind: ContextKind::SharedThread,
                 title: "planning sync".to_string(),
-                summary: Some(
-                    "owner=owner@example.com · shared_by=owner@example.com · shared_at=2026-03-08T12:05:00Z"
-                        .to_string(),
-                ),
+                summary: Some("cwd=/tmp/repo · updated_at=1741422760".to_string()),
                 location: Some("thread/thread-1".to_string()),
                 body: Some(
-                    "Thread: thread-1\nOwner: owner@example.com\n\nRecent transcript:\nUser: Scope the rewrite.\nAssistant: Start with /context."
+                    "Thread: thread-1\nCwd: /tmp/repo\nUpdated at: 1741422760\n\nRecent transcript:\nUser: Scope the rewrite.\nAssistant: Start with /context."
                         .to_string(),
                 ),
             },
@@ -1914,7 +1858,7 @@ async fn together_context_view_emits_attach_mark_and_write_events() {
             ref_id: "ctx:file:.codex/context/overview.md".to_string(),
             kind: ContextKind::RepoContextFile,
             title: "Planning Overview".to_string(),
-            summary: Some("plan · public".to_string()),
+            summary: Some("plan".to_string()),
             location: Some(".codex/context/overview.md".to_string()),
             body: Some("# Planning Overview".to_string()),
         }],
@@ -1950,7 +1894,7 @@ async fn together_context_marked_attach_inserts_all_marked_tokens() {
                 ref_id: "ctx:file:.codex/context/overview.md".to_string(),
                 kind: ContextKind::RepoContextFile,
                 title: "Planning Overview".to_string(),
-                summary: Some("plan · public".to_string()),
+                summary: Some("plan".to_string()),
                 location: Some(".codex/context/overview.md".to_string()),
                 body: Some("# Planning Overview".to_string()),
             },
@@ -1986,7 +1930,7 @@ async fn together_context_source_thread_id_prefers_selected_shared_thread() {
                 ref_id: "ctx:file:.codex/context/overview.md".to_string(),
                 kind: ContextKind::RepoContextFile,
                 title: "Planning Overview".to_string(),
-                summary: Some("plan · public".to_string()),
+                summary: Some("plan".to_string()),
                 location: Some(".codex/context/overview.md".to_string()),
                 body: Some("# Planning Overview".to_string()),
             },
@@ -2015,19 +1959,6 @@ async fn together_context_source_thread_id_prefers_selected_shared_thread() {
 }
 
 #[tokio::test]
-async fn local_together_share_history_returns_none_for_missing_rollout_path() {
-    let temp = tempdir().expect("tempdir");
-    let missing_rollout_path = temp.path().join("sessions").join("missing.jsonl");
-
-    let history =
-        local_together_share_history(Some(&missing_rollout_path), "thread-1", temp.path())
-            .await
-            .expect("missing rollout path should fall back to app-server thread reads");
-
-    assert!(history.is_none());
-}
-
-#[tokio::test]
 async fn together_context_write_review_snapshot() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -2042,7 +1973,7 @@ async fn together_context_write_review_snapshot() {
                 title: "Planning Overview".to_string(),
                 kind: "concept".to_string(),
                 exists: false,
-                content: "---\nid: \"planning-overview\"\nkind: \"concept\"\ntitle: \"Planning Overview\"\napplies_to:\n  branches:\n    - \"rewrite-codex-2gether-v2\"\nsource_threads: []\nsource_files: []\nlast_validated_at: 2026-03-16\nvisibility: \"repo\"\n---\n\n# Planning Overview\n"
+                content: "---\nid: \"planning-overview\"\nkind: \"concept\"\ntitle: \"Planning Overview\"\napplies_to:\n  branches:\n    - \"rewrite-codex-2gether-v2\"\nsource_threads: []\nsource_files: []\nlast_validated_at: 2026-03-16\n---\n\n# Planning Overview\n"
                     .to_string(),
             },
             ContextWriteFilePlan {
@@ -2206,6 +2137,16 @@ fn together_server_health_matches_expected_build_identity() {
 }
 
 #[test]
+fn missing_ngrok_error_is_actionable() {
+    let err = ngrok_http_launch_error(8788, std::io::Error::from(std::io::ErrorKind::NotFound));
+
+    assert_eq!(
+        err.to_string(),
+        "`/host` requires `ngrok` on your PATH to expose the local together server on port 8788; install ngrok, authenticate it, and retry"
+    );
+}
+
+#[test]
 fn together_status_hint_includes_server_build_identity() {
     let hint = render_together_server_status_hint(
         &TogetherServerInfoResponse {
@@ -2227,7 +2168,7 @@ fn together_status_hint_includes_server_build_identity() {
             ],
         },
         "wss://example.ngrok-free.app/ws",
-        "zanechee@local (owner), weisintai@local (member)",
+        "zanechee@local, weisintai@local",
     );
 
     assert_snapshot!("together_status_hint_with_build_identity", hint);
@@ -5362,6 +5303,20 @@ async fn slash_exit_requests_exit() {
     assert_matches!(rx.try_recv(), Ok(AppEvent::Exit(ExitMode::ShutdownFirst)));
 }
 
+#[test]
+fn together_exit_command_stops_for_hosts() {
+    let _guard = TogetherStatusGuard::set("together host:srv_123");
+
+    assert_eq!(together_exit_command(), Some("stop"));
+}
+
+#[test]
+fn together_exit_command_leaves_for_members() {
+    let _guard = TogetherStatusGuard::set("together server:srv_123");
+
+    assert_eq!(together_exit_command(), Some("leave"));
+}
+
 #[tokio::test]
 async fn slash_clean_submits_background_terminal_cleanup() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
@@ -5442,37 +5397,6 @@ async fn slash_fork_requests_current_fork() {
     chat.dispatch_command(SlashCommand::Fork);
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::ForkCurrentSession));
-}
-
-#[tokio::test]
-async fn read_only_together_inspect_does_not_request_fork() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
-    chat.set_together_checkout_mode(false, "owner@example.com");
-
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
-
-    assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
-}
-
-#[tokio::test]
-async fn read_only_together_checkout_escape_requests_exit() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
-    chat.set_together_checkout_mode(false, "owner@example.com");
-
-    chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-
-    assert_matches!(rx.try_recv(), Ok(AppEvent::ExitReadOnlyTogetherCheckout));
-}
-
-#[tokio::test]
-async fn read_only_together_checkout_disables_normal_backtrack_mode() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
-
-    assert!(chat.is_normal_backtrack_mode());
-
-    chat.set_together_checkout_mode(false, "owner@example.com");
-
-    assert!(!chat.is_normal_backtrack_mode());
 }
 
 #[tokio::test]

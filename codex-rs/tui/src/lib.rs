@@ -41,11 +41,7 @@ use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
-use codex_state::StateRuntime;
-use codex_state::TogetherClientMode;
-use codex_state::TogetherClientSession;
 use codex_state::log_db;
-use codex_together_client::status_env_key;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_oss::ensure_oss_provider_ready;
 use codex_utils_oss::get_default_model_for_oss_provider;
@@ -906,8 +902,6 @@ async fn run_ratatui_app(
     ) {
         config.startup_warnings.push(w);
     }
-    hydrate_together_status_from_state(&config).await;
-
     set_default_client_residency_requirement(config.enforce_residency.value());
     let active_profile = config.active_profile.clone();
     let should_show_trust_screen = should_show_trust_screen(&config);
@@ -946,70 +940,6 @@ async fn run_ratatui_app(
     session_log::log_session_end();
     // ignore error when collecting usage – report underlying error instead
     app_result
-}
-
-async fn hydrate_together_status_from_state(config: &Config) {
-    let runtime = match StateRuntime::init(config.sqlite_home.clone(), "together".to_string(), None)
-        .await
-    {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            tracing::debug!(error = %err, "failed to init together state runtime for startup hydration");
-            return;
-        }
-    };
-
-    match runtime.get_together_client_session().await {
-        Ok(Some(session)) => {
-            #[cfg(unix)]
-            let stale_host_session = matches!(session.mode, TogetherClientMode::Host)
-                && session.host_pid.is_some_and(|pid| {
-                    if pid <= 0 {
-                        return true;
-                    }
-                    let rc = unsafe { libc::kill(pid as i32, 0) };
-                    if rc == 0 {
-                        return false;
-                    }
-                    !matches!(
-                        std::io::Error::last_os_error().raw_os_error(),
-                        Some(code) if code == libc::EPERM
-                    )
-                });
-            #[cfg(not(unix))]
-            let stale_host_session = false;
-
-            if stale_host_session {
-                let now = chrono::Utc::now().timestamp();
-                if let Err(err) = runtime
-                    .upsert_together_client_session(&TogetherClientSession {
-                        mode: TogetherClientMode::Disconnected,
-                        server_id: None,
-                        owner_email: None,
-                        endpoint: None,
-                        checked_out_thread_id: None,
-                        host_pid: None,
-                        created_at: now,
-                        updated_at: now,
-                    })
-                    .await
-                {
-                    tracing::debug!(
-                        error = %err,
-                        "failed to clear stale together host session during startup hydration"
-                    );
-                }
-            }
-        }
-        Ok(None) => {}
-        Err(err) => {
-            tracing::debug!(error = %err, "failed to read together startup session");
-        }
-    };
-
-    unsafe {
-        std::env::set_var(status_env_key(), "disconnected");
-    }
 }
 
 pub(crate) async fn resolve_session_thread_id(

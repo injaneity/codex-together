@@ -3962,6 +3962,14 @@ impl ChatComposer {
                         codex_together_protocol::ContextKind::SharedThread => {
                             "[Thread]".to_string()
                         }
+                        codex_together_protocol::ContextKind::ThreadInsight => {
+                            "[Insight]".to_string()
+                        }
+                        codex_together_protocol::ContextKind::ThreadFile => "[File]".to_string(),
+                        codex_together_protocol::ContextKind::ThreadSearch => {
+                            "[Search]".to_string()
+                        }
+                        codex_together_protocol::ContextKind::ThreadTool => "[Tool]".to_string(),
                         codex_together_protocol::ContextKind::RepoContextFile => {
                             "[Repo]".to_string()
                         }
@@ -4370,14 +4378,19 @@ fn skill_description(skill: &SkillMetadata) -> Option<String> {
 }
 
 fn context_ref_from_search_result(result: &ContextSearchResult) -> ContextRef {
-    let source_thread_id = (result.kind == codex_together_protocol::ContextKind::SharedThread)
-        .then(|| {
-            result
-                .ref_id
-                .strip_prefix("ctx:thread:")
-                .map(str::to_string)
-        })
-        .flatten();
+    let source_thread_id = match result.kind {
+        codex_together_protocol::ContextKind::SharedThread => result
+            .ref_id
+            .strip_prefix("ctx:thread:")
+            .map(str::to_string),
+        codex_together_protocol::ContextKind::ThreadInsight
+        | codex_together_protocol::ContextKind::ThreadFile
+        | codex_together_protocol::ContextKind::ThreadSearch
+        | codex_together_protocol::ContextKind::ThreadTool => {
+            result.ref_id.split(':').nth(2).map(str::to_string)
+        }
+        codex_together_protocol::ContextKind::RepoContextFile => None,
+    };
     let repo_context_id = (result.kind == codex_together_protocol::ContextKind::RepoContextFile)
         .then(|| result.location.clone())
         .flatten();
@@ -4396,6 +4409,10 @@ fn context_ref_from_search_result(result: &ContextSearchResult) -> ContextRef {
 fn context_row_description(result: &ContextSearchResult) -> String {
     let kind = match result.kind {
         codex_together_protocol::ContextKind::SharedThread => "thread",
+        codex_together_protocol::ContextKind::ThreadInsight => "thread insight",
+        codex_together_protocol::ContextKind::ThreadFile => "thread file",
+        codex_together_protocol::ContextKind::ThreadSearch => "thread search result",
+        codex_together_protocol::ContextKind::ThreadTool => "thread tool result",
         codex_together_protocol::ContextKind::RepoContextFile => "repo context",
     };
     match (&result.location, &result.summary) {

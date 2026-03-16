@@ -41,7 +41,11 @@ Removed v1 commands:
 
 ### Context
 
-- `/context` searches shared threads and tracked repo context files under `.codex/context/`.
+- `/context` opens a current-thread worktree rooted on the active thread.
+- The graph keeps retained thread-local artifacts such as insights, linked files, retained command search output, and retained tool output.
+- Linked persistent repo notes are read from tracked Markdown under `.codex/context/`.
+- `/context [query]` searches both thread-local artifacts and persistent repo notes.
+- Raw prompt text, raw transcript previews, and raw search queries are not treated as durable context.
 - `Enter` attaches the current context item into the composer.
 - `Space` marks context items for multi-item actions.
 - `Shift+H` creates a handoff plan from the current or marked items.
@@ -127,5 +131,6 @@ The control flow is:
 
 The remaining rewrite work is:
 
-- replace the current `/context` picker with the planned graph-native UI
+- deepen the `/context` graph beyond the current-thread component
+- improve graph navigation and routing ergonomics for agent handoff
 - finish broader docs/config cleanup around the new collaboration model

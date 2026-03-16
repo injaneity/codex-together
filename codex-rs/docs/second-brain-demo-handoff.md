@@ -45,6 +45,7 @@ These are the decisions the next thread should treat as settled unless the user 
 
 - Repo-backed notes are the canonical second brain.
 - `.codex/context/` is still the intended long-term canonical location.
+- Thread-local context should keep extracted artifacts, not raw prompts or raw search queries.
 - `codex-together` should be pruned back toward native Codex CLI behavior before adding graph/handoff demo features.
 - The graph should eventually include both repo-specific and agent-specific nodes.
 
@@ -86,7 +87,8 @@ At a high level, the current branch has already been pushed much closer to the d
 - `/share` and `/threads` were removed from the TUI slash-command surface
 - read-only "inspect/checkout shared thread" flows were removed
 - thread visibility concepts were removed from repo-context metadata and related UI copy
-- context search in together-server now derives thread context from app-server `thread/list` instead of explicit "shared thread" state
+- `/context` now roots on the current thread and keeps retained artifacts plus linked repo notes
+- context search now indexes thread-local artifacts and persistent repo notes instead of prompt previews
 - persisted member bookkeeping was pruned from the state layer
 - unused member-update notifications were removed
 - user-facing Together status copy was simplified toward "server + participants" instead of "owner + member"

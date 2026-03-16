@@ -16,6 +16,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::RateLimitSnapshot;
+use codex_together_protocol::ContextGraphResponse;
 use codex_together_protocol::ContextRef;
 use codex_together_protocol::ContextResolveBundleResponse;
 use codex_together_protocol::ContextSearchResult;
@@ -440,7 +441,7 @@ pub(crate) enum AppEvent {
     /// Open the collaboration context picker with the latest search results.
     OpenTogetherContextView {
         query: Option<String>,
-        results: Vec<ContextSearchResult>,
+        graph: ContextGraphResponse,
     },
 
     /// Toggle whether the selected collaboration context row is marked.

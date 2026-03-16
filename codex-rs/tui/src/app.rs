@@ -943,8 +943,9 @@ impl App {
 
     fn start_together_composer_context_search(&self, query: String) {
         let tx = self.app_event_tx.clone();
+        let current_thread_id = self.chat_widget.thread_id().map(|id| id.to_string());
         tokio::spawn(async move {
-            match search_together_context(Some(query.clone()), Some(50)).await {
+            match search_together_context(Some(query.clone()), Some(50), current_thread_id).await {
                 Ok(results) => {
                     tx.send(AppEvent::TogetherComposerContextSearchResult { query, results });
                 }
@@ -3287,8 +3288,8 @@ impl App {
                 self.chat_widget
                     .on_together_context_bundle_resolve_failed(error);
             }
-            AppEvent::OpenTogetherContextView { query, results } => {
-                self.chat_widget.show_together_context_view(query, results);
+            AppEvent::OpenTogetherContextView { query, graph } => {
+                self.chat_widget.show_together_context_view(query, graph);
             }
             AppEvent::ToggleTogetherContextMark { actual_idx } => {
                 self.chat_widget.toggle_together_context_mark(actual_idx);

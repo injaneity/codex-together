@@ -166,12 +166,18 @@ pub struct ContextSearchParams {
     pub query: Option<String>,
     #[serde(default)]
     pub limit: Option<u32>,
+    #[serde(default)]
+    pub current_thread_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ContextKind {
     SharedThread,
+    ThreadInsight,
+    ThreadFile,
+    ThreadSearch,
+    ThreadTool,
     RepoContextFile,
 }
 
@@ -202,6 +208,8 @@ pub struct ContextGraphParams {
     pub query: Option<String>,
     #[serde(default)]
     pub limit: Option<u32>,
+    #[serde(default)]
+    pub current_thread_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

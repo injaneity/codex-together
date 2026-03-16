@@ -1,0 +1,13 @@
+---
+source: tui/src/bottom_pane/chat_composer.rs
+expression: terminal.backend()
+---
+"                                                                                                    "
+"› ##plan                                                                                            "
+"                                                                                                    "
+"                                                                                                    "
+"                                                                                                    "
+"  Planning Overview  repo context · .codex/context/overview.md · plan · public · Ship the context b…"
+"  planning sync      shared thread · thread/thread-1 · owner=owner@example.com · shared_by=owner@ex…"
+"                                                                                                    "
+"  Press enter to insert or esc to close                                                             "

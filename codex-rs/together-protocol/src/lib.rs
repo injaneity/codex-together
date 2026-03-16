@@ -1,4 +1,6 @@
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::SandboxPolicy;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -8,26 +10,28 @@ pub const METHOD_INITIALIZE: &str = "initialize";
 pub const METHOD_INITIALIZED: &str = "initialized";
 
 pub const METHOD_TOGETHER_AUTH: &str = "together/auth";
-pub const METHOD_TOGETHER_SERVER_CREATE: &str = "together/server/create";
-pub const METHOD_TOGETHER_SERVER_CLOSE: &str = "together/server/close";
-pub const METHOD_TOGETHER_MEMBER_ADD: &str = "together/member/add";
-pub const METHOD_TOGETHER_MEMBER_REMOVE: &str = "together/member/remove";
-pub const METHOD_TOGETHER_SERVER_INFO: &str = "together/server/info";
-pub const METHOD_TOGETHER_THREAD_SHARE: &str = "together/thread/share";
-pub const METHOD_TOGETHER_THREAD_CHECKOUT: &str = "together/thread/checkout";
-pub const METHOD_TOGETHER_THREAD_READ: &str = "together/thread/read";
-pub const METHOD_TOGETHER_THREAD_FORK: &str = "together/thread/fork";
-pub const METHOD_TOGETHER_THREAD_DELETE: &str = "together/thread/delete";
-pub const METHOD_TOGETHER_THREAD_LIST: &str = "together/thread/list";
-pub const METHOD_TOGETHER_HISTORY_LINEAGE: &str = "together/history/lineage";
-pub const METHOD_TOGETHER_JOIN: &str = "together/join";
-pub const METHOD_TOGETHER_LEAVE: &str = "together/leave";
 
-pub const NOTIFY_TOGETHER_SERVER_CLOSED: &str = "together/serverClosed";
+// V2 collaboration RPC surface.
+pub const METHOD_HOST_START: &str = "host/start";
+pub const METHOD_HOST_STATUS: &str = "host/status";
+pub const METHOD_HOST_STOP: &str = "host/stop";
+pub const METHOD_SESSION_JOIN: &str = "session/join";
+pub const METHOD_SESSION_LEAVE: &str = "session/leave";
+pub const METHOD_THREAD_SHARE: &str = "thread/share";
+pub const METHOD_THREAD_LIST: &str = "thread/list";
+pub const METHOD_THREAD_INSPECT: &str = "thread/inspect";
+pub const METHOD_CONTEXT_SEARCH: &str = "context/search";
+pub const METHOD_CONTEXT_GRAPH: &str = "context/graph";
+pub const METHOD_CONTEXT_PREVIEW: &str = "context/preview";
+pub const METHOD_CONTEXT_RESOLVE_BUNDLE: &str = "context/resolveBundle";
+pub const METHOD_HANDOFF_PLAN: &str = "handoff/plan";
+pub const METHOD_HANDOFF_COMMIT: &str = "handoff/commit";
+pub const METHOD_CONTEXT_WRITE_PLAN: &str = "context/writePlan";
+pub const METHOD_CONTEXT_WRITE_COMMIT: &str = "context/writeCommit";
+
+pub const NOTIFY_HOST_STOPPED: &str = "host/stopped";
 pub const NOTIFY_TOGETHER_MEMBER_UPDATED: &str = "together/memberUpdated";
 pub const NOTIFY_TOGETHER_THREAD_SHARED: &str = "together/threadShared";
-pub const NOTIFY_TOGETHER_THREAD_FORKED: &str = "together/threadForked";
-pub const NOTIFY_TOGETHER_CONNECTION_REVOKED: &str = "together/connectionRevoked";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
@@ -103,12 +107,6 @@ pub enum TogetherClientMode {
     Member,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CheckoutReason {
-    NonOwnerMustFork,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TogetherAuthRequest {
@@ -143,20 +141,8 @@ pub struct TogetherServerCreateResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TogetherServerCloseResponse {
-    pub closed: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TogetherMemberUpdateRequest {
-    pub email: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TogetherMemberUpdateResponse {
-    pub updated: bool,
+pub struct HostStopResponse {
+    pub stopped: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,6 +172,16 @@ pub struct TogetherThreadShareRequest {
     pub thread_id: String,
     #[serde(default)]
     pub history: Option<Vec<RolloutItem>>,
+    #[serde(default)]
+    pub visibility: Option<String>,
+    #[serde(default)]
+    pub repo_root: Option<String>,
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    #[serde(default)]
+    pub git_sha: Option<String>,
+    #[serde(default)]
+    pub git_origin_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,22 +192,8 @@ pub struct TogetherThreadShareResponse {
     #[serde(default)]
     pub preview: Option<String>,
     pub shared_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TogetherThreadCheckoutRequest {
-    pub thread_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TogetherThreadCheckoutResponse {
-    pub thread_id: String,
-    pub writable: bool,
-    pub owner_email: String,
     #[serde(default)]
-    pub reason: Option<CheckoutReason>,
+    pub visibility: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,38 +228,6 @@ pub struct TogetherThreadReadResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TogetherThreadForkRequest {
-    pub thread_id: String,
-    #[serde(default)]
-    pub cwd: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TogetherThreadForkResponse {
-    pub parent_thread_id: String,
-    pub child_thread_id: String,
-    #[serde(default)]
-    pub owner_email: String,
-    pub history: Option<Vec<RolloutItem>>,
-    pub writable: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TogetherThreadDeleteRequest {
-    pub thread_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TogetherThreadDeleteResponse {
-    pub thread_id: String,
-    pub deleted: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TogetherThreadListRequest {
     #[serde(default)]
     pub cursor: Option<String>,
@@ -295,6 +245,14 @@ pub struct TogetherThreadSummary {
     #[serde(default)]
     pub preview: Option<String>,
     pub created_at: String,
+    #[serde(default)]
+    pub repo_root: Option<String>,
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    #[serde(default)]
+    pub git_sha: Option<String>,
+    #[serde(default)]
+    pub git_origin_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,32 +265,204 @@ pub struct TogetherThreadListResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TogetherHistoryLineageRequest {
-    pub root_thread_id: String,
+pub struct ContextSearchParams {
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ContextKind {
+    SharedThread,
+    RepoContextFile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LineageNode {
+pub struct ContextSearchResult {
+    pub ref_id: String,
+    pub kind: ContextKind,
+    pub title: String,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub location: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSearchResponse {
+    pub data: Vec<ContextSearchResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextGraphParams {
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextGraphEdge {
+    pub from_ref_id: String,
+    pub to_ref_id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextGraphResponse {
+    pub nodes: Vec<ContextSearchResult>,
+    pub edges: Vec<ContextGraphEdge>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextPreviewParams {
+    pub ref_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextPreviewResponse {
+    #[serde(default)]
+    pub item: Option<ContextSearchResult>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ContextStaleState {
+    Fresh,
+    BranchMismatch,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextRef {
+    pub ref_id: String,
+    pub kind: ContextKind,
+    pub display_label: String,
+    #[serde(default)]
+    pub source_thread_id: Option<String>,
+    #[serde(default)]
+    pub repo_context_id: Option<String>,
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    #[serde(default)]
+    pub stale_state: Option<ContextStaleState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextResolveBundleParams {
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    #[serde(default)]
+    pub context_refs: Vec<ContextRef>,
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextResolveBundleResponse {
+    pub bundle_text: String,
+    pub kept_refs: Vec<ContextRef>,
+    pub dropped_refs: Vec<ContextRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextWritePlanParams {
+    #[serde(default)]
+    pub selected_ref_ids: Vec<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextWriteFilePlan {
+    pub path: String,
+    pub title: String,
+    pub kind: String,
+    pub exists: bool,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextWritePlanResponse {
+    pub plan_id: String,
+    pub files: Vec<ContextWriteFilePlan>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextWriteCommitParams {
+    pub plan_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextWriteCommitResponse {
+    pub written_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffPlanParams {
+    #[serde(default)]
+    pub source_thread_id: Option<String>,
+    #[serde(default)]
+    pub selected_ref_ids: Vec<String>,
+    #[serde(default)]
+    pub goal: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffPlanResponse {
+    pub plan_id: String,
+    pub source_thread_id: String,
+    #[serde(default)]
+    pub goal: Option<String>,
+    pub selected_node_ids: Vec<String>,
+    pub kept_refs: Vec<ContextRef>,
+    pub dropped_refs: Vec<ContextRef>,
+    pub token_estimate: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffCommitParams {
+    pub plan_id: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub approval_policy: Option<AskForApproval>,
+    #[serde(default)]
+    pub sandbox: Option<SandboxPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffCommitResponse {
     pub thread_id: String,
-    pub owner_email: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LineageEdge {
-    pub parent_thread_id: String,
-    pub child_thread_id: String,
-    pub actor_email: String,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TogetherHistoryLineageResponse {
-    pub root: String,
-    pub nodes: Vec<LineageNode>,
-    pub edges: Vec<LineageEdge>,
+    pub source_thread_id: String,
+    #[serde(default)]
+    pub rollout_path: Option<String>,
+    pub cwd: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,7 +491,6 @@ pub struct TogetherLeaveResponse {
 pub enum TogetherErrorCode {
     NotConnected,
     Forbidden,
-    NonOwnerMustFork,
     MemberNotAllowed,
     ServerClosed,
     SingletonConflict,
@@ -375,8 +504,6 @@ pub enum TogetherError {
     NotConnected,
     #[error("forbidden")]
     Forbidden,
-    #[error("non-owner must fork before writing")]
-    NonOwnerMustFork,
     #[error("server closed")]
     ServerClosed,
     #[error("chatgpt email required for together in v1")]
@@ -388,7 +515,6 @@ impl TogetherError {
         match self {
             Self::NotConnected => -39000,
             Self::Forbidden => -39001,
-            Self::NonOwnerMustFork => -39002,
             Self::ServerClosed => -39003,
             Self::IdentityUnavailable => -39004,
         }

@@ -33,6 +33,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -64,7 +65,9 @@ use codex_core::features::Feature;
 use codex_core::find_thread_name_by_id;
 use codex_core::find_thread_path_by_id_str;
 use codex_core::git_info::current_branch_name;
+use codex_core::git_info::get_git_remote_urls_assume_git_repo;
 use codex_core::git_info::get_git_repo_root;
+use codex_core::git_info::get_head_commit_hash;
 use codex_core::git_info::local_git_branches;
 use codex_core::models_manager::manager::ModelsManager;
 use codex_core::project_doc::DEFAULT_PROJECT_DOC_FILENAME;
@@ -154,7 +157,6 @@ use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
-use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use tokio::sync::mpsc::UnboundedSender;
@@ -172,6 +174,9 @@ const PLAN_MODE_REASONING_SCOPE_PLAN_ONLY: &str = "Apply to Plan mode override";
 const PLAN_MODE_REASONING_SCOPE_ALL_MODES: &str = "Apply to global default and Plan mode override";
 const CONNECTORS_SELECTION_VIEW_ID: &str = "connectors-selection";
 const TOGETHER_THREADS_SELECTION_VIEW_ID: &str = "together-threads-selection";
+const TOGETHER_CONTEXT_SELECTION_VIEW_ID: &str = "together-context-selection";
+const TOGETHER_HANDOFF_SELECTION_VIEW_ID: &str = "together-handoff-selection";
+const TOGETHER_CONTEXT_WRITE_SELECTION_VIEW_ID: &str = "together-context-write-selection";
 
 /// Choose the keybinding used to edit the most-recently queued message.
 ///
@@ -213,6 +218,7 @@ use crate::bottom_pane::BottomPaneParams;
 use crate::bottom_pane::CancellationEvent;
 use crate::bottom_pane::CollaborationModeIndicator;
 use crate::bottom_pane::ColumnWidthMode;
+use crate::bottom_pane::ContextBinding;
 use crate::bottom_pane::DOUBLE_PRESS_QUIT_SHORTCUT_ENABLED;
 use crate::bottom_pane::ExperimentalFeatureItem;
 use crate::bottom_pane::ExperimentalFeaturesView;
@@ -224,10 +230,7 @@ use crate::bottom_pane::QUIT_SHORTCUT_TIMEOUT;
 use crate::bottom_pane::SelectionAction;
 use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
-use crate::bottom_pane::TOGETHER_CENTER_VIEW_ID;
-use crate::bottom_pane::TogetherCenterView;
-use crate::bottom_pane::TogetherCenterViewParams;
-use crate::bottom_pane::TogetherPresenceState;
+use crate::bottom_pane::SideContentWidth;
 use crate::bottom_pane::custom_prompt_view::CustomPromptView;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::clipboard_paste::paste_image_to_temp_png;
@@ -297,43 +300,50 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_together_client::decode_invite;
 use codex_together_client::status_env_key;
-use codex_together_protocol::CheckoutReason;
-use codex_together_protocol::ConnectedMember;
+use codex_together_protocol::ContextKind;
+use codex_together_protocol::ContextRef;
+use codex_together_protocol::ContextResolveBundleParams;
+use codex_together_protocol::ContextResolveBundleResponse;
+use codex_together_protocol::ContextSearchParams;
+use codex_together_protocol::ContextSearchResponse;
+use codex_together_protocol::ContextSearchResult;
+use codex_together_protocol::ContextWriteCommitParams;
+use codex_together_protocol::ContextWriteCommitResponse;
+use codex_together_protocol::ContextWritePlanParams;
+use codex_together_protocol::ContextWritePlanResponse;
+use codex_together_protocol::HandoffCommitParams;
+use codex_together_protocol::HandoffCommitResponse;
+use codex_together_protocol::HandoffPlanParams;
+use codex_together_protocol::HandoffPlanResponse;
+use codex_together_protocol::HostStopResponse;
 use codex_together_protocol::JsonRpcRequest as TogetherJsonRpcRequest;
 use codex_together_protocol::JsonRpcResponse as TogetherJsonRpcResponse;
+use codex_together_protocol::METHOD_CONTEXT_RESOLVE_BUNDLE;
+use codex_together_protocol::METHOD_CONTEXT_SEARCH;
+use codex_together_protocol::METHOD_CONTEXT_WRITE_COMMIT;
+use codex_together_protocol::METHOD_CONTEXT_WRITE_PLAN;
+use codex_together_protocol::METHOD_HANDOFF_COMMIT;
+use codex_together_protocol::METHOD_HANDOFF_PLAN;
+use codex_together_protocol::METHOD_HOST_START;
+use codex_together_protocol::METHOD_HOST_STATUS;
+use codex_together_protocol::METHOD_HOST_STOP;
 use codex_together_protocol::METHOD_INITIALIZE;
 use codex_together_protocol::METHOD_INITIALIZED;
+use codex_together_protocol::METHOD_SESSION_JOIN;
+use codex_together_protocol::METHOD_SESSION_LEAVE;
+use codex_together_protocol::METHOD_THREAD_INSPECT;
+use codex_together_protocol::METHOD_THREAD_LIST;
+use codex_together_protocol::METHOD_THREAD_SHARE;
 use codex_together_protocol::METHOD_TOGETHER_AUTH;
-use codex_together_protocol::METHOD_TOGETHER_HISTORY_LINEAGE;
-use codex_together_protocol::METHOD_TOGETHER_JOIN;
-use codex_together_protocol::METHOD_TOGETHER_LEAVE;
-use codex_together_protocol::METHOD_TOGETHER_SERVER_CLOSE;
-use codex_together_protocol::METHOD_TOGETHER_SERVER_CREATE;
-use codex_together_protocol::METHOD_TOGETHER_SERVER_INFO;
-use codex_together_protocol::METHOD_TOGETHER_THREAD_CHECKOUT;
-use codex_together_protocol::METHOD_TOGETHER_THREAD_DELETE;
-use codex_together_protocol::METHOD_TOGETHER_THREAD_FORK;
-use codex_together_protocol::METHOD_TOGETHER_THREAD_LIST;
-use codex_together_protocol::METHOD_TOGETHER_THREAD_READ;
-use codex_together_protocol::METHOD_TOGETHER_THREAD_SHARE;
 use codex_together_protocol::TogetherAuthRequest;
-use codex_together_protocol::TogetherHistoryLineageRequest;
-use codex_together_protocol::TogetherHistoryLineageResponse;
 use codex_together_protocol::TogetherJoinRequest;
 use codex_together_protocol::TogetherJoinResponse;
 use codex_together_protocol::TogetherReplayMessage;
 use codex_together_protocol::TogetherReplayRole;
 use codex_together_protocol::TogetherRole;
-use codex_together_protocol::TogetherServerCloseResponse;
 use codex_together_protocol::TogetherServerCreateRequest;
 use codex_together_protocol::TogetherServerCreateResponse;
 use codex_together_protocol::TogetherServerInfoResponse;
-use codex_together_protocol::TogetherThreadCheckoutRequest;
-use codex_together_protocol::TogetherThreadCheckoutResponse;
-use codex_together_protocol::TogetherThreadDeleteRequest;
-use codex_together_protocol::TogetherThreadDeleteResponse;
-use codex_together_protocol::TogetherThreadForkRequest;
-use codex_together_protocol::TogetherThreadForkResponse;
 use codex_together_protocol::TogetherThreadListRequest;
 use codex_together_protocol::TogetherThreadListResponse;
 use codex_together_protocol::TogetherThreadReadRequest;
@@ -349,6 +359,7 @@ use futures::StreamExt;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use strum::IntoEnumIterator;
+use textwrap::wrap;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 use url::Url;
@@ -363,91 +374,7 @@ const TOGETHER_ENDPOINT_ENV_KEY: &str = "CODEX_TOGETHER_ENDPOINT";
 const TOGETHER_ENDPOINT_ALIASES_ENV_KEY: &str = "CODEX_TOGETHER_ENDPOINT_ALIASES";
 const TOGETHER_CHECKED_OUT_THREAD_ENV_KEY: &str = "CODEX_TOGETHER_CHECKED_OUT_THREAD";
 const TOGETHER_ACTOR_ENV_KEY: &str = "CODEX_TOGETHER_ACTOR";
-const TOGETHER_MASCOT_ENABLED_ENV_KEY: &str = "CODEX_TOGETHER_MASCOT_ENABLED";
-const TOGETHER_MASCOT_MOTION_ENV_KEY: &str = "CODEX_TOGETHER_MASCOT_MOTION";
-const TOGETHER_MASCOT_LABELS_ENV_KEY: &str = "CODEX_TOGETHER_MASCOT_LABELS";
-const MAX_VISIBLE_CREW: usize = 5;
-const MASK_EMAIL_LABELS_BY_DEFAULT: bool = true;
-const TOGETHER_PRESENCE_POLL_INTERVAL: Duration = Duration::from_secs(2);
-const TOGETHER_PRESENCE_STALE_AFTER: Duration = Duration::from_secs(12);
 const NGROK_TUNNELS_API_URL: &str = "http://127.0.0.1:4040/api/tunnels";
-#[derive(Clone, Copy)]
-struct HandshakeRow {
-    left: &'static str,
-    middle: &'static str,
-    right: &'static str,
-}
-
-const TOGETHER_JOIN_HANDSHAKE_VARIANTS: [[HandshakeRow; 3]; 4] = [
-    [
-        HandshakeRow {
-            left: "\\(•.•)",
-            middle: "  ",
-            right: "(•.•)/",
-        },
-        HandshakeRow {
-            left: " (   )",
-            middle: "--",
-            right: "(   )",
-        },
-        HandshakeRow {
-            left: " /   \\",
-            middle: "  ",
-            right: "/   \\",
-        },
-    ],
-    [
-        HandshakeRow {
-            left: "\\(•.•)",
-            middle: "   ",
-            right: "(•.•)/",
-        },
-        HandshakeRow {
-            left: " (   ",
-            middle: "|---|",
-            right: "   )",
-        },
-        HandshakeRow {
-            left: " /   \\",
-            middle: "   ",
-            right: "/   \\",
-        },
-    ],
-    [
-        HandshakeRow {
-            left: " (•.•)",
-            middle: "  ",
-            right: "(•.•)",
-        },
-        HandshakeRow {
-            left: "<)   )",
-            middle: "\\/",
-            right: "(   (>",
-        },
-        HandshakeRow {
-            left: " /   \\",
-            middle: "  ",
-            right: "/   \\",
-        },
-    ],
-    [
-        HandshakeRow {
-            left: " (•.•)",
-            middle: "     ",
-            right: "(•.•)",
-        },
-        HandshakeRow {
-            left: "<)   )",
-            middle: "o---o",
-            right: "(   )>",
-        },
-        HandshakeRow {
-            left: " /   \\",
-            middle: "     ",
-            right: "/   \\",
-        },
-    ],
-];
 // Track information about an in-flight exec command.
 struct RunningCommand {
     command: Vec<String>,
@@ -765,6 +692,8 @@ pub(crate) struct ChatWidget {
     suppress_session_configured_redraw: bool,
     // User messages queued while a turn is in progress
     queued_user_messages: VecDeque<UserMessage>,
+    pending_together_context_submission: Option<UserMessage>,
+    together_context_view_state: Option<Arc<Mutex<TogetherContextViewState>>>,
     /// Terminal-appropriate keybinding for popping the most-recently queued
     /// message back into the composer.  Determined once at construction time via
     /// [`queued_message_edit_binding_for_terminal`] and propagated to
@@ -833,10 +762,6 @@ pub(crate) struct ChatWidget {
     status_line_branch_lookup_complete: bool,
     external_editor_state: ExternalEditorState,
     realtime_conversation: RealtimeConversationUiState,
-    together_member_emails: HashSet<String>,
-    together_member_roles: HashMap<String, TogetherRole>,
-    together_presence_seen_once: bool,
-    together_presence_monitor: Option<JoinHandle<()>>,
     last_rendered_user_message_event: Option<RenderedUserMessageEvent>,
 }
 
@@ -864,6 +789,7 @@ pub(crate) struct ActiveCellTranscriptKey {
     pub(crate) animation_tick: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct UserMessage {
     text: String,
     local_images: Vec<LocalImageAttachment>,
@@ -875,6 +801,7 @@ pub(crate) struct UserMessage {
     remote_image_urls: Vec<String>,
     text_elements: Vec<TextElement>,
     mention_bindings: Vec<MentionBinding>,
+    context_bindings: Vec<ContextBinding>,
 }
 
 impl From<String> for UserMessage {
@@ -886,6 +813,7 @@ impl From<String> for UserMessage {
             // Plain text conversion has no UI element ranges.
             text_elements: Vec::new(),
             mention_bindings: Vec::new(),
+            context_bindings: Vec::new(),
         }
     }
 }
@@ -899,6 +827,7 @@ impl From<&str> for UserMessage {
             // Plain text conversion has no UI element ranges.
             text_elements: Vec::new(),
             mention_bindings: Vec::new(),
+            context_bindings: Vec::new(),
         }
     }
 }
@@ -926,6 +855,7 @@ pub(crate) fn create_initial_user_message(
             remote_image_urls: Vec::new(),
             text_elements,
             mention_bindings: Vec::new(),
+            context_bindings: Vec::new(),
         })
     }
 }
@@ -941,6 +871,7 @@ fn remap_placeholders_for_message(message: UserMessage, next_label: &mut usize) 
         local_images,
         remote_image_urls,
         mention_bindings,
+        context_bindings,
     } = message;
     if local_images.is_empty() {
         return UserMessage {
@@ -949,6 +880,7 @@ fn remap_placeholders_for_message(message: UserMessage, next_label: &mut usize) 
             local_images,
             remote_image_urls,
             mention_bindings,
+            context_bindings,
         };
     }
 
@@ -1005,6 +937,7 @@ fn remap_placeholders_for_message(message: UserMessage, next_label: &mut usize) 
         remote_image_urls,
         text_elements: rebuilt_elements,
         mention_bindings,
+        context_bindings,
     }
 }
 
@@ -2014,6 +1947,7 @@ impl ChatWidget {
             local_images: self.bottom_pane.composer_local_images(),
             remote_image_urls: self.bottom_pane.remote_image_urls(),
             mention_bindings: self.bottom_pane.composer_mention_bindings(),
+            context_bindings: self.bottom_pane.composer_context_bindings(),
         };
 
         let mut to_merge: Vec<UserMessage> = self.queued_user_messages.drain(..).collect();
@@ -2030,6 +1964,7 @@ impl ChatWidget {
             local_images: Vec::new(),
             remote_image_urls: Vec::new(),
             mention_bindings: Vec::new(),
+            context_bindings: Vec::new(),
         };
         let mut combined_offset = 0usize;
         let total_remote_images = to_merge
@@ -2057,6 +1992,7 @@ impl ChatWidget {
             combined.local_images.extend(message.local_images);
             combined.remote_image_urls.extend(message.remote_image_urls);
             combined.mention_bindings.extend(message.mention_bindings);
+            combined.context_bindings.extend(message.context_bindings);
         }
 
         Some(combined)
@@ -2069,14 +2005,16 @@ impl ChatWidget {
             remote_image_urls,
             text_elements,
             mention_bindings,
+            context_bindings,
         } = user_message;
         let local_image_paths = local_images.into_iter().map(|img| img.path).collect();
         self.set_remote_image_urls(remote_image_urls);
-        self.bottom_pane.set_composer_text_with_mention_bindings(
+        self.bottom_pane.set_composer_text_with_bindings(
             text,
             text_elements,
             local_image_paths,
             mention_bindings,
+            context_bindings,
         );
     }
 
@@ -3031,6 +2969,8 @@ impl ChatWidget {
             thread_name: None,
             forked_from: None,
             queued_user_messages: VecDeque::new(),
+            pending_together_context_submission: None,
+            together_context_view_state: None,
             queued_message_edit_binding,
             show_welcome_banner: is_first_run,
             startup_tooltip_override,
@@ -3062,10 +3002,6 @@ impl ChatWidget {
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
             realtime_conversation: RealtimeConversationUiState::default(),
-            together_member_emails: HashSet::new(),
-            together_member_roles: HashMap::new(),
-            together_presence_seen_once: false,
-            together_presence_monitor: None,
             last_rendered_user_message_event: None,
         };
 
@@ -3219,6 +3155,8 @@ impl ChatWidget {
             plan_delta_buffer: String::new(),
             plan_item_active: false,
             queued_user_messages: VecDeque::new(),
+            pending_together_context_submission: None,
+            together_context_view_state: None,
             queued_message_edit_binding,
             show_welcome_banner: is_first_run,
             startup_tooltip_override,
@@ -3246,10 +3184,6 @@ impl ChatWidget {
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
             realtime_conversation: RealtimeConversationUiState::default(),
-            together_member_emails: HashSet::new(),
-            together_member_roles: HashMap::new(),
-            together_presence_seen_once: false,
-            together_presence_monitor: None,
             last_rendered_user_message_event: None,
         };
 
@@ -3388,6 +3322,8 @@ impl ChatWidget {
             thread_name: None,
             forked_from: None,
             queued_user_messages: VecDeque::new(),
+            pending_together_context_submission: None,
+            together_context_view_state: None,
             queued_message_edit_binding,
             show_welcome_banner: false,
             startup_tooltip_override: None,
@@ -3419,10 +3355,6 @@ impl ChatWidget {
             status_line_branch_lookup_complete: false,
             external_editor_state: ExternalEditorState::Closed,
             realtime_conversation: RealtimeConversationUiState::default(),
-            together_member_emails: HashSet::new(),
-            together_member_roles: HashMap::new(),
-            together_presence_seen_once: false,
-            together_presence_monitor: None,
             last_rendered_user_message_event: None,
         };
 
@@ -3532,27 +3464,15 @@ impl ChatWidget {
             && self.read_only_together_checkout_owner.is_some()
             && self.bottom_pane.no_modal_or_popup_active()
             && !self.bottom_pane.is_task_running()
+            && let KeyEvent {
+                code: KeyCode::Esc,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } = key_event
         {
-            match key_event {
-                KeyEvent {
-                    code: KeyCode::Char('f'),
-                    modifiers: KeyModifiers::NONE,
-                    ..
-                } => {
-                    self.app_event_tx.send(AppEvent::ForkCurrentSession);
-                    return;
-                }
-                KeyEvent {
-                    code: KeyCode::Esc,
-                    modifiers: KeyModifiers::NONE,
-                    ..
-                } => {
-                    self.app_event_tx
-                        .send(AppEvent::ExitReadOnlyTogetherCheckout);
-                    return;
-                }
-                _ => {}
-            }
+            self.app_event_tx
+                .send(AppEvent::ExitReadOnlyTogetherCheckout);
+            return;
         }
 
         match key_event {
@@ -3583,6 +3503,9 @@ impl ChatWidget {
                         mention_bindings: self
                             .bottom_pane
                             .take_recent_submission_mention_bindings(),
+                        context_bindings: self
+                            .bottom_pane
+                            .take_recent_submission_context_bindings(),
                     };
                     let Some(user_message) =
                         self.maybe_defer_user_message_for_realtime(user_message)
@@ -3623,6 +3546,9 @@ impl ChatWidget {
                         mention_bindings: self
                             .bottom_pane
                             .take_recent_submission_mention_bindings(),
+                        context_bindings: self
+                            .bottom_pane
+                            .take_recent_submission_context_bindings(),
                     };
                     let Some(user_message) =
                         self.maybe_defer_user_message_for_realtime(user_message)
@@ -3683,10 +3609,6 @@ impl ChatWidget {
     pub(crate) fn show_selection_view(&mut self, params: SelectionViewParams) {
         self.bottom_pane.show_selection_view(params);
         self.request_redraw();
-    }
-
-    pub(crate) fn dismiss_active_bottom_pane_view(&mut self) {
-        self.bottom_pane.dismiss_active_view();
     }
 
     pub(crate) fn can_launch_external_editor(&self) -> bool {
@@ -3821,9 +3743,9 @@ impl ChatWidget {
                     return;
                 }
                 self.show_together_prompt(
-                    "Join app server".to_string(),
-                    "Enter ngrok URL or invite id and press Enter".to_string(),
-                    "join".to_string(),
+                    "Join collaboration host".to_string(),
+                    "Enter an invite, URL, or short id and press Enter".to_string(),
+                    "session join".to_string(),
                 );
             }
             SlashCommand::Leave => {
@@ -3834,17 +3756,7 @@ impl ChatWidget {
                     );
                     return;
                 }
-                self.run_together_command("leave".to_string());
-            }
-            SlashCommand::Close => {
-                if !self.together_enabled() {
-                    self.add_info_message(
-                        "Codex Together is disabled.".to_string(),
-                        Some("Enable the together feature in /experimental first.".to_string()),
-                    );
-                    return;
-                }
-                self.run_together_command("close".to_string());
+                self.run_together_command("session leave".to_string());
             }
             SlashCommand::Share => {
                 if !self.together_enabled() {
@@ -3854,7 +3766,11 @@ impl ChatWidget {
                     );
                     return;
                 }
-                self.run_together_command("share".to_string());
+                self.show_together_prompt(
+                    "Set thread visibility".to_string(),
+                    "Enter `on` to share this thread or `off` to hide it".to_string(),
+                    "thread share".to_string(),
+                );
             }
             SlashCommand::Host => {
                 if !self.together_enabled() {
@@ -3864,7 +3780,7 @@ impl ChatWidget {
                     );
                     return;
                 }
-                self.run_together_command("create".to_string());
+                self.run_together_command("host start".to_string());
             }
             SlashCommand::Threads => {
                 if !self.together_enabled() {
@@ -3876,7 +3792,7 @@ impl ChatWidget {
                 }
                 self.open_together_threads_view();
             }
-            SlashCommand::History => {
+            SlashCommand::Context => {
                 if !self.together_enabled() {
                     self.add_info_message(
                         "Codex Together is disabled.".to_string(),
@@ -3884,9 +3800,9 @@ impl ChatWidget {
                     );
                     return;
                 }
-                self.open_together_history_view();
+                self.run_together_command("context".to_string());
             }
-            SlashCommand::Together => {
+            SlashCommand::Handoff => {
                 if !self.together_enabled() {
                     self.add_info_message(
                         "Codex Together is disabled.".to_string(),
@@ -3894,7 +3810,7 @@ impl ChatWidget {
                     );
                     return;
                 }
-                self.open_together_center_view();
+                self.run_together_command("handoff".to_string());
             }
             SlashCommand::Agent => {
                 self.app_event_tx.send(AppEvent::OpenAgentPicker);
@@ -4194,6 +4110,7 @@ impl ChatWidget {
                     remote_image_urls,
                     text_elements: prepared_elements,
                     mention_bindings: self.bottom_pane.take_recent_submission_mention_bindings(),
+                    context_bindings: self.bottom_pane.take_recent_submission_context_bindings(),
                 };
                 if self.is_session_configured() {
                     self.reasoning_buffer.clear();
@@ -4245,7 +4162,23 @@ impl ChatWidget {
                 else {
                     return;
                 };
-                self.run_together_command(format!("join {prepared_args}"));
+                self.run_together_command(format!("session join {prepared_args}"));
+                self.bottom_pane.drain_pending_submission_state();
+            }
+            SlashCommand::Host if !trimmed.is_empty() => {
+                if !self.together_enabled() {
+                    self.add_info_message(
+                        "Codex Together is disabled.".to_string(),
+                        Some("Enable the together feature in /experimental first.".to_string()),
+                    );
+                    return;
+                }
+                let Some((prepared_args, _prepared_elements)) =
+                    self.bottom_pane.prepare_inline_args_submission(false)
+                else {
+                    return;
+                };
+                self.run_together_command(format!("host {prepared_args}"));
                 self.bottom_pane.drain_pending_submission_state();
             }
             SlashCommand::Share if !trimmed.is_empty() => {
@@ -4261,10 +4194,10 @@ impl ChatWidget {
                 else {
                     return;
                 };
-                self.run_together_command(format!("share {prepared_args}"));
+                self.run_together_command(format!("thread share {prepared_args}"));
                 self.bottom_pane.drain_pending_submission_state();
             }
-            SlashCommand::Together if !trimmed.is_empty() => {
+            SlashCommand::Context if !trimmed.is_empty() => {
                 if !self.together_enabled() {
                     self.add_info_message(
                         "Codex Together is disabled.".to_string(),
@@ -4277,7 +4210,23 @@ impl ChatWidget {
                 else {
                     return;
                 };
-                self.run_together_command(prepared_args);
+                self.run_together_command(format!("context {prepared_args}"));
+                self.bottom_pane.drain_pending_submission_state();
+            }
+            SlashCommand::Handoff if !trimmed.is_empty() => {
+                if !self.together_enabled() {
+                    self.add_info_message(
+                        "Codex Together is disabled.".to_string(),
+                        Some("Enable the together feature in /experimental first.".to_string()),
+                    );
+                    return;
+                }
+                let Some((prepared_args, _prepared_elements)) =
+                    self.bottom_pane.prepare_inline_args_submission(false)
+                else {
+                    return;
+                };
+                self.run_together_command(format!("handoff {prepared_args}"));
                 self.bottom_pane.drain_pending_submission_state();
             }
             _ => self.dispatch_command(cmd),
@@ -4386,13 +4335,20 @@ impl ChatWidget {
             return;
         }
 
+        if self.pending_together_context_submission.is_some() {
+            self.queued_user_messages.push_back(user_message);
+            self.refresh_queued_user_messages();
+            return;
+        }
+
         let UserMessage {
             text,
             local_images,
             remote_image_urls,
             text_elements,
             mention_bindings,
-        } = user_message;
+            context_bindings,
+        } = &user_message;
         if text.is_empty() && local_images.is_empty() && remote_image_urls.is_empty() {
             return;
         }
@@ -4400,19 +4356,92 @@ impl ChatWidget {
             && !self.current_model_supports_images()
         {
             self.restore_blocked_image_submission(
-                text,
-                text_elements,
-                local_images,
-                mention_bindings,
-                remote_image_urls,
+                text.clone(),
+                text_elements.clone(),
+                local_images.clone(),
+                mention_bindings.clone(),
+                context_bindings.clone(),
+                remote_image_urls.clone(),
             );
+            return;
+        }
+
+        if !context_bindings.is_empty() {
+            let thread_id = self.thread_id.map(|id| id.to_string());
+            let context_refs = context_bindings
+                .iter()
+                .map(|binding| binding.context_ref.clone())
+                .collect::<Vec<_>>();
+            let tx = self.app_event_tx.clone();
+            self.pending_together_context_submission = Some(user_message);
+            tokio::spawn(async move {
+                match resolve_together_context_bundle(thread_id, context_refs).await {
+                    Ok(response) => {
+                        tx.send(AppEvent::TogetherContextBundleResolved { response });
+                    }
+                    Err(err) => {
+                        tx.send(AppEvent::TogetherContextBundleResolveFailed {
+                            error: err.to_string(),
+                        });
+                    }
+                }
+            });
+            return;
+        }
+
+        self.submit_user_message_with_resolved_context(user_message, None);
+    }
+
+    fn submit_user_message_with_resolved_context(
+        &mut self,
+        user_message: UserMessage,
+        bundle_response: Option<ContextResolveBundleResponse>,
+    ) {
+        let UserMessage {
+            text: display_text,
+            local_images,
+            remote_image_urls,
+            text_elements: display_text_elements,
+            mention_bindings,
+            context_bindings,
+        } = user_message;
+        let (submitted_text, submitted_text_elements, bundle_text) =
+            if let Some(bundle_response) = bundle_response {
+                let (stripped_text, stripped_text_elements) = strip_context_tokens_from_submission(
+                    display_text.clone(),
+                    display_text_elements.clone(),
+                    &context_bindings,
+                );
+                if !bundle_response.dropped_refs.is_empty() {
+                    let dropped = bundle_response
+                        .dropped_refs
+                        .iter()
+                        .map(|context_ref| context_ref.display_label.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.add_info_message(format!("Skipped unavailable context: {dropped}."), None);
+                }
+                (
+                    stripped_text,
+                    stripped_text_elements,
+                    Some(bundle_response.bundle_text),
+                )
+            } else {
+                (display_text.clone(), display_text_elements.clone(), None)
+            };
+        if submitted_text.is_empty()
+            && local_images.is_empty()
+            && remote_image_urls.is_empty()
+            && bundle_text.as_deref().is_none_or(str::is_empty)
+        {
             return;
         }
 
         let mut items: Vec<UserInput> = Vec::new();
 
-        // Special-case: "!cmd" executes a local shell command instead of sending to the model.
-        if let Some(stripped) = text.strip_prefix('!') {
+        if bundle_text.as_deref().is_none_or(str::is_empty)
+            && let Some(stripped) = submitted_text.strip_prefix('!')
+        {
             let cmd = stripped.trim();
             if cmd.is_empty() {
                 self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
@@ -4441,14 +4470,23 @@ impl ChatWidget {
             });
         }
 
-        if !text.is_empty() {
+        if let Some(bundle_text) = bundle_text
+            && !bundle_text.is_empty()
+        {
             items.push(UserInput::Text {
-                text: text.clone(),
-                text_elements: text_elements.clone(),
+                text: collaboration_context_bundle_message(bundle_text),
+                text_elements: Vec::new(),
             });
         }
 
-        let mentions = collect_tool_mentions(&text, &HashMap::new());
+        if !submitted_text.is_empty() {
+            items.push(UserInput::Text {
+                text: submitted_text.clone(),
+                text_elements: submitted_text_elements,
+            });
+        }
+
+        let mentions = collect_tool_mentions(&submitted_text, &HashMap::new());
         let bound_names: HashSet<String> = mention_bindings
             .iter()
             .map(|binding| binding.mention.clone())
@@ -4559,8 +4597,7 @@ impl ChatWidget {
             tracing::error!("failed to send message: {e}");
         });
 
-        // Persist the text to cross-session message history.
-        if !text.is_empty() {
+        if !display_text.is_empty() {
             let encoded_mentions = mention_bindings
                 .iter()
                 .map(|binding| LinkedMention {
@@ -4568,7 +4605,7 @@ impl ChatWidget {
                     path: binding.path.clone(),
                 })
                 .collect::<Vec<_>>();
-            let history_text = encode_history_mentions(&text, &encoded_mentions);
+            let history_text = encode_history_mentions(&display_text, &encoded_mentions);
             self.codex_op_tx
                 .send(Op::AddToHistory { text: history_text })
                 .unwrap_or_else(|e| {
@@ -4576,22 +4613,21 @@ impl ChatWidget {
                 });
         }
 
-        // Show replayable user content in conversation history.
-        if !text.is_empty() {
+        if !display_text.is_empty() {
             let local_image_paths = local_images
                 .into_iter()
                 .map(|img| img.path)
                 .collect::<Vec<_>>();
             self.last_rendered_user_message_event =
                 Some(Self::rendered_user_message_event_from_parts(
-                    text.clone(),
-                    text_elements.clone(),
+                    display_text.clone(),
+                    display_text_elements.clone(),
                     local_image_paths.clone(),
                     remote_image_urls.clone(),
                 ));
             self.add_to_history(history_cell::new_user_prompt(
-                text,
-                text_elements,
+                display_text,
+                display_text_elements,
                 local_image_paths,
                 remote_image_urls,
             ));
@@ -4614,6 +4650,25 @@ impl ChatWidget {
         self.needs_final_message_separator = false;
     }
 
+    pub(crate) fn on_together_context_bundle_resolved(
+        &mut self,
+        response: ContextResolveBundleResponse,
+    ) {
+        let Some(user_message) = self.pending_together_context_submission.take() else {
+            return;
+        };
+        self.submit_user_message_with_resolved_context(user_message, Some(response));
+    }
+
+    pub(crate) fn on_together_context_bundle_resolve_failed(&mut self, error: String) {
+        if let Some(user_message) = self.pending_together_context_submission.take() {
+            self.restore_user_message_to_composer(user_message);
+        }
+        self.add_error_message(format!(
+            "Failed to resolve attached collaboration context: {error}"
+        ));
+    }
+
     /// Restore the blocked submission draft without losing mention resolution state.
     ///
     /// The blocked-image path intentionally keeps the draft in the composer so
@@ -4627,16 +4682,18 @@ impl ChatWidget {
         text_elements: Vec<TextElement>,
         local_images: Vec<LocalImageAttachment>,
         mention_bindings: Vec<MentionBinding>,
+        context_bindings: Vec<ContextBinding>,
         remote_image_urls: Vec<String>,
     ) {
         // Preserve the user's composed payload so they can retry after changing models.
         let local_image_paths = local_images.iter().map(|img| img.path.clone()).collect();
         self.set_remote_image_urls(remote_image_urls);
-        self.bottom_pane.set_composer_text_with_mention_bindings(
+        self.bottom_pane.set_composer_text_with_bindings(
             text,
             text_elements,
             local_image_paths,
             mention_bindings,
+            context_bindings,
         );
         self.add_to_history(history_cell::new_warning_event(
             self.image_inputs_not_supported_message(),
@@ -7882,6 +7939,7 @@ impl ChatWidget {
             remote_image_urls: Vec::new(),
             text_elements: Vec::new(),
             mention_bindings: Vec::new(),
+            context_bindings: Vec::new(),
         };
         if should_queue {
             self.queue_user_message(user_message);
@@ -7894,7 +7952,8 @@ impl ChatWidget {
     /// no modal overlay (e.g. approvals or status indicator), and no composer popups.
     /// In this state Esc-Esc backtracking is enabled.
     pub(crate) fn is_normal_backtrack_mode(&self) -> bool {
-        self.bottom_pane.is_normal_backtrack_mode()
+        self.read_only_together_checkout_owner.is_none()
+            && self.bottom_pane.is_normal_backtrack_mode()
     }
 
     pub(crate) fn insert_str(&mut self, text: &str) {
@@ -8241,287 +8300,6 @@ impl ChatWidget {
         self.bottom_pane.show_view(Box::new(view));
     }
 
-    pub(crate) fn open_together_center_view(&mut self) {
-        if !together_status_is_connected() {
-            self.show_together_center_view(None);
-            return;
-        }
-
-        let endpoint = current_together_endpoint();
-        let tx = self.app_event_tx.clone();
-        tokio::spawn(async move {
-            let response = async {
-                let mut client = connect_and_auth(&endpoint).await?;
-                let response: TogetherServerInfoResponse = client
-                    .call(METHOD_TOGETHER_SERVER_INFO, serde_json::json!({}))
-                    .await?;
-                Ok::<TogetherServerInfoResponse, anyhow::Error>(response)
-            }
-            .await;
-
-            match response {
-                Ok(server_info) => {
-                    tx.send(AppEvent::OpenTogetherCenterView {
-                        server_info: Some(server_info),
-                    });
-                }
-                Err(err) => {
-                    tx.send(AppEvent::InsertHistoryCell(Box::new(
-                        history_cell::new_error_event(format!(
-                            "Failed to load Together Center: {err}"
-                        )),
-                    )));
-                    tx.send(AppEvent::OpenTogetherCenterView { server_info: None });
-                }
-            }
-        });
-    }
-
-    pub(crate) fn show_together_center_view(
-        &mut self,
-        server_info: Option<TogetherServerInfoResponse>,
-    ) {
-        let state = if server_info.is_some() {
-            TogetherPresenceState::Connected
-        } else {
-            TogetherPresenceState::Disconnected
-        };
-        self.render_together_center_with_state(server_info, state);
-        match state {
-            TogetherPresenceState::Connected => self.ensure_together_presence_monitor(),
-            TogetherPresenceState::Disconnected => self.stop_together_presence_monitor(),
-            TogetherPresenceState::Reconnecting | TogetherPresenceState::Stale => {}
-        }
-    }
-
-    pub(crate) fn handle_together_presence_update(
-        &mut self,
-        server_info: Option<TogetherServerInfoResponse>,
-        state: TogetherPresenceState,
-    ) {
-        if !self.is_together_center_active() {
-            self.stop_together_presence_monitor();
-            if state == TogetherPresenceState::Disconnected {
-                self.together_member_emails.clear();
-                self.together_member_roles.clear();
-                self.together_presence_seen_once = false;
-            }
-            return;
-        }
-        self.render_together_center_with_state(server_info, state);
-        if state == TogetherPresenceState::Disconnected {
-            self.stop_together_presence_monitor();
-        }
-    }
-
-    fn ensure_together_presence_monitor(&mut self) {
-        if self
-            .together_presence_monitor
-            .as_ref()
-            .is_some_and(|handle| !handle.is_finished())
-        {
-            return;
-        }
-
-        let endpoint = current_together_endpoint();
-        let tx = self.app_event_tx.clone();
-        self.together_presence_monitor = Some(tokio::spawn(async move {
-            let mut last_success: Option<Instant> = None;
-            let mut last_state = TogetherPresenceState::Disconnected;
-            let mut last_signature: Option<String> = None;
-
-            loop {
-                if !together_status_is_connected() {
-                    if last_state != TogetherPresenceState::Disconnected {
-                        tx.send(AppEvent::TogetherPresenceUpdated {
-                            server_info: None,
-                            state: TogetherPresenceState::Disconnected,
-                        });
-                    }
-                    break;
-                }
-
-                let response = async {
-                    let mut client = connect_and_auth(&endpoint).await?;
-                    let info: TogetherServerInfoResponse = client
-                        .call(METHOD_TOGETHER_SERVER_INFO, serde_json::json!({}))
-                        .await?;
-                    Ok::<TogetherServerInfoResponse, anyhow::Error>(info)
-                }
-                .await;
-
-                match response {
-                    Ok(info) => {
-                        let signature = together_presence_signature(&info);
-                        if last_state != TogetherPresenceState::Connected
-                            || last_signature.as_ref() != Some(&signature)
-                        {
-                            tx.send(AppEvent::TogetherPresenceUpdated {
-                                server_info: Some(info),
-                                state: TogetherPresenceState::Connected,
-                            });
-                        }
-                        last_success = Some(Instant::now());
-                        last_state = TogetherPresenceState::Connected;
-                        last_signature = Some(signature);
-                    }
-                    Err(_) => {
-                        let state = match last_success {
-                            Some(ts) if ts.elapsed() >= TOGETHER_PRESENCE_STALE_AFTER => {
-                                TogetherPresenceState::Stale
-                            }
-                            _ => TogetherPresenceState::Reconnecting,
-                        };
-                        if state != last_state {
-                            tx.send(AppEvent::TogetherPresenceUpdated {
-                                server_info: None,
-                                state,
-                            });
-                            last_state = state;
-                        }
-                    }
-                }
-
-                tokio::time::sleep(TOGETHER_PRESENCE_POLL_INTERVAL).await;
-            }
-        }));
-    }
-
-    fn stop_together_presence_monitor(&mut self) {
-        if let Some(handle) = self.together_presence_monitor.take() {
-            handle.abort();
-        }
-    }
-
-    fn is_together_center_active(&self) -> bool {
-        self.bottom_pane.active_view_id() == Some(TOGETHER_CENTER_VIEW_ID)
-    }
-
-    fn render_together_center_with_state(
-        &mut self,
-        server_info: Option<TogetherServerInfoResponse>,
-        state: TogetherPresenceState,
-    ) {
-        let mascot_enabled = together_mascot_enabled();
-        let motion_enabled = together_mascot_motion_enabled();
-        let mask_email_labels = together_mascot_masked_labels();
-
-        let had_fresh_snapshot = server_info.is_some();
-        let (owner_email, endpoint, mut connected_members) = if let Some(info) = server_info {
-            (
-                Some(info.owner_email),
-                Some(info.public_base_url),
-                info.connected_members,
-            )
-        } else {
-            (None, Some(current_together_endpoint()), Vec::new())
-        };
-        if !had_fresh_snapshot
-            && matches!(
-                state,
-                TogetherPresenceState::Reconnecting | TogetherPresenceState::Stale
-            )
-        {
-            connected_members = self
-                .together_member_roles
-                .iter()
-                .map(|(email, role)| ConnectedMember {
-                    email: email.clone(),
-                    role: *role,
-                })
-                .collect();
-        }
-        connected_members.sort_by(|a, b| a.email.cmp(&b.email));
-
-        let mut landing_emails = Vec::new();
-        let mut departing_members = Vec::new();
-        if had_fresh_snapshot {
-            let current_member_emails: HashSet<String> = connected_members
-                .iter()
-                .map(|member| member.email.clone())
-                .collect();
-            let current_member_roles: HashMap<String, TogetherRole> = connected_members
-                .iter()
-                .map(|member| (member.email.clone(), member.role))
-                .collect();
-            let mut joined: Vec<String> = current_member_emails
-                .difference(&self.together_member_emails)
-                .cloned()
-                .collect();
-            let mut left: Vec<String> = self
-                .together_member_emails
-                .difference(&current_member_emails)
-                .cloned()
-                .collect();
-            joined.sort();
-            left.sort();
-            if self.together_presence_seen_once {
-                let local_actor = local_together_actor_id();
-                for email in &joined {
-                    self.add_info_message(
-                        format!("join: {email}"),
-                        Some("Crew member landed in Together Center.".to_string()),
-                    );
-                    self.add_plain_history_lines(together_join_handshake_lines(
-                        local_actor.as_str(),
-                        email,
-                        &connected_members,
-                    ));
-                }
-                for email in &left {
-                    self.add_info_message(
-                        format!("leave: {email}"),
-                        Some("Crew member stepped out of Together Center.".to_string()),
-                    );
-                }
-            }
-            landing_emails = joined;
-            departing_members = left
-                .iter()
-                .map(|email| ConnectedMember {
-                    email: email.clone(),
-                    role: self
-                        .together_member_roles
-                        .get(email)
-                        .copied()
-                        .unwrap_or(TogetherRole::Member),
-                })
-                .collect();
-
-            self.together_member_emails = current_member_emails;
-            self.together_member_roles = current_member_roles;
-            if !self.together_presence_seen_once {
-                self.together_presence_seen_once = true;
-            }
-        } else if state == TogetherPresenceState::Disconnected {
-            self.together_member_emails.clear();
-            self.together_member_roles.clear();
-            self.together_presence_seen_once = false;
-        }
-
-        let params = TogetherCenterViewParams {
-            state,
-            owner_email,
-            endpoint,
-            connected_members,
-            max_visible: MAX_VISIBLE_CREW,
-            mask_email_labels,
-            mascot_enabled,
-            motion_enabled,
-            landing_emails,
-            departing_members,
-        };
-        let view = Box::new(TogetherCenterView::new(params));
-        if self.is_together_center_active() {
-            let _ = self
-                .bottom_pane
-                .replace_view_if_active(TOGETHER_CENTER_VIEW_ID, view);
-        } else {
-            self.bottom_pane.show_view(view);
-        }
-        self.request_redraw();
-    }
-
     pub(crate) fn open_together_threads_view(&mut self) {
         let tx = self.app_event_tx.clone();
         tokio::spawn(async move {
@@ -8530,7 +8308,7 @@ impl ChatWidget {
                 let mut client = connect_and_auth(&endpoint).await?;
                 let response: TogetherThreadListResponse = client
                     .call(
-                        METHOD_TOGETHER_THREAD_LIST,
+                        METHOD_THREAD_LIST,
                         TogetherThreadListRequest {
                             cursor: None,
                             limit: Some(200),
@@ -8553,47 +8331,6 @@ impl ChatWidget {
                         history_cell::new_error_event(format!(
                             "Failed to load shared threads: {err}"
                         )),
-                    )));
-                }
-            }
-        });
-    }
-
-    pub(crate) fn open_together_history_view(&mut self) {
-        let root_thread_id = current_together_checked_out_thread()
-            .or_else(|| self.thread_id.map(|id| id.to_string()));
-        let Some(root_thread_id) = root_thread_id else {
-            self.add_error_message(
-                "No together thread selected for /history. Use /threads and checkout first."
-                    .to_string(),
-            );
-            return;
-        };
-
-        let tx = self.app_event_tx.clone();
-        tokio::spawn(async move {
-            let endpoint = current_together_endpoint();
-            let response = async {
-                let mut client = connect_and_auth(&endpoint).await?;
-                let response: TogetherHistoryLineageResponse = client
-                    .call(
-                        METHOD_TOGETHER_HISTORY_LINEAGE,
-                        TogetherHistoryLineageRequest {
-                            root_thread_id: root_thread_id.clone(),
-                        },
-                    )
-                    .await?;
-                Ok::<TogetherHistoryLineageResponse, anyhow::Error>(response)
-            }
-            .await;
-
-            match response {
-                Ok(lineage) => {
-                    tx.send(AppEvent::OpenTogetherHistoryView { lineage });
-                }
-                Err(err) => {
-                    tx.send(AppEvent::InsertHistoryCell(Box::new(
-                        history_cell::new_error_event(format!("Failed to load history: {err}")),
                     )));
                 }
             }
@@ -8636,18 +8373,249 @@ impl ChatWidget {
         );
     }
 
+    pub(crate) fn show_together_context_view(
+        &mut self,
+        query: Option<String>,
+        results: Vec<ContextSearchResult>,
+    ) {
+        if results.is_empty() {
+            let scope = query.unwrap_or_else(|| "current repo".to_string());
+            self.add_info_message(format!("No collaboration context found for {scope}."), None);
+            return;
+        }
+
+        let state = Arc::new(Mutex::new(TogetherContextViewState {
+            query: query.clone(),
+            results: results.clone(),
+            selected_actual_idx: 0,
+            marked_ref_ids: HashSet::new(),
+        }));
+        self.together_context_view_state = Some(Arc::clone(&state));
+        self.bottom_pane
+            .show_selection_view(self.together_context_view_params(query, results, state));
+    }
+
+    pub(crate) fn apply_together_context_search_result(
+        &mut self,
+        query: String,
+        results: Vec<ContextSearchResult>,
+    ) {
+        self.bottom_pane
+            .on_together_context_search_result(query, results);
+    }
+
+    pub(crate) fn insert_together_context_binding(&mut self, context_ref: ContextRef) {
+        self.bottom_pane.insert_context_binding(context_ref);
+    }
+
+    pub(crate) fn toggle_together_context_mark(&mut self, actual_idx: usize) {
+        let Some(state) = self.together_context_view_state.as_ref() else {
+            return;
+        };
+        let mut state = lock_together_context_view_state(state);
+        let Some(ref_id) = state
+            .results
+            .get(actual_idx)
+            .map(|result| result.ref_id.clone())
+        else {
+            return;
+        };
+        if !state.marked_ref_ids.insert(ref_id.clone()) {
+            state.marked_ref_ids.remove(&ref_id);
+        }
+        drop(state);
+        self.request_redraw();
+    }
+
+    pub(crate) fn together_context_action_ref_ids(&self, actual_idx: usize) -> Vec<String> {
+        let Some(state) = self.together_context_view_state.as_ref() else {
+            return Vec::new();
+        };
+        let state = lock_together_context_view_state(state);
+        if state.marked_ref_ids.is_empty() {
+            return state
+                .results
+                .get(actual_idx)
+                .map(|result| vec![result.ref_id.clone()])
+                .unwrap_or_default();
+        }
+        state
+            .results
+            .iter()
+            .filter(|result| state.marked_ref_ids.contains(&result.ref_id))
+            .map(|result| result.ref_id.clone())
+            .collect()
+    }
+
+    pub(crate) fn together_context_source_thread_id(&self, actual_idx: usize) -> Option<String> {
+        let state = self.together_context_view_state.as_ref()?;
+        let state = lock_together_context_view_state(state);
+        let results = if state.marked_ref_ids.is_empty() {
+            state
+                .results
+                .get(actual_idx)
+                .cloned()
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            state
+                .results
+                .iter()
+                .filter(|result| state.marked_ref_ids.contains(&result.ref_id))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        results.into_iter().find_map(|result| {
+            if result.kind == ContextKind::SharedThread {
+                result
+                    .ref_id
+                    .strip_prefix("ctx:thread:")
+                    .map(str::to_string)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub(crate) fn attach_together_context_selection(&mut self, actual_idx: usize) {
+        let Some(state) = self.together_context_view_state.as_ref() else {
+            return;
+        };
+        let state = lock_together_context_view_state(state);
+        let results = if state.marked_ref_ids.is_empty() {
+            state
+                .results
+                .get(actual_idx)
+                .cloned()
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            state
+                .results
+                .iter()
+                .filter(|result| state.marked_ref_ids.contains(&result.ref_id))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        drop(state);
+
+        for result in results {
+            self.insert_together_context_binding(together_context_ref(&result));
+        }
+    }
+
+    pub(crate) fn set_composer_text_with_context_bindings(
+        &mut self,
+        text: String,
+        context_refs: Vec<ContextRef>,
+    ) {
+        let context_bindings = context_refs
+            .into_iter()
+            .map(|context_ref| ContextBinding { context_ref })
+            .collect::<Vec<_>>();
+        self.bottom_pane.set_composer_text_with_bindings(
+            text,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            context_bindings,
+        );
+        self.bottom_pane.move_composer_cursor_to_end();
+    }
+
+    pub(crate) fn show_together_handoff_review(&mut self, plan: HandoffPlanResponse) {
+        let kept_count = plan.kept_refs.len();
+        let title = match kept_count {
+            0 => "Empty handoff plan".to_string(),
+            1 => "Handoff includes 1 context item".to_string(),
+            _ => format!("Handoff includes {kept_count} context items"),
+        };
+        let draft = together_handoff_draft(&plan);
+        let plan_id = plan.plan_id.clone();
+        let context_refs = plan.kept_refs.clone();
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            view_id: Some(TOGETHER_HANDOFF_SELECTION_VIEW_ID),
+            title: Some("Handoff".to_string()),
+            subtitle: Some(title),
+            footer_hint: Some("Enter create · Esc cancel".into()),
+            items: vec![
+                SelectionItem {
+                    name: "Create fresh thread".to_string(),
+                    description: Some(
+                        "Start a new writable thread from this handoff bundle".to_string(),
+                    ),
+                    actions: vec![Box::new(move |tx: &AppEventSender| {
+                        tx.send(AppEvent::CommitTogetherHandoff {
+                            plan_id: plan_id.clone(),
+                            draft_text: draft.clone(),
+                            context_refs: context_refs.clone(),
+                        });
+                    })],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+                SelectionItem {
+                    name: "Cancel".to_string(),
+                    description: Some("Keep the current thread unchanged".to_string()),
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+            ],
+            side_content: Box::new(TogetherHandoffPreviewRenderable { plan }),
+            side_content_width: SideContentWidth::Half,
+            side_content_min_width: 32,
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn show_together_context_write_review(&mut self, plan: ContextWritePlanResponse) {
+        let file_count = plan.files.len();
+        let subtitle = match file_count {
+            0 => "No repo-context files to write".to_string(),
+            1 => "Review 1 repo-context file".to_string(),
+            _ => format!("Review {file_count} repo-context files"),
+        };
+        let plan_id = plan.plan_id.clone();
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            view_id: Some(TOGETHER_CONTEXT_WRITE_SELECTION_VIEW_ID),
+            title: Some("Write Repo Context".to_string()),
+            subtitle: Some(subtitle),
+            footer_hint: Some("Enter write · Esc cancel".into()),
+            items: vec![
+                SelectionItem {
+                    name: "Write tracked files".to_string(),
+                    description: Some(
+                        "Create or update tracked Markdown under .codex/context".to_string(),
+                    ),
+                    actions: vec![Box::new(move |tx: &AppEventSender| {
+                        tx.send(AppEvent::CommitTogetherContextWrite {
+                            plan_id: plan_id.clone(),
+                        });
+                    })],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+                SelectionItem {
+                    name: "Cancel".to_string(),
+                    description: Some("Leave the working tree unchanged".to_string()),
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+            ],
+            side_content: Box::new(TogetherContextWritePreviewRenderable { plan }),
+            side_content_width: SideContentWidth::Half,
+            side_content_min_width: 32,
+            ..Default::default()
+        });
+    }
+
     fn together_threads_view_params(
         &self,
         threads: Vec<TogetherThreadSummary>,
     ) -> SelectionViewParams {
-        let actor = local_together_actor_id();
-        let initial_can_delete = threads
-            .first()
-            .is_some_and(|selected| selected.owner_email == actor);
-        let actor_for_keybind = actor.clone();
-        let threads_for_keybind = Arc::new(threads.clone());
-        let threads_for_footer = Arc::clone(&threads_for_keybind);
-        let actor_for_footer = actor;
         let mut items = Vec::with_capacity(threads.len());
         for thread in threads {
             let thread_id = thread.thread_id.clone();
@@ -8657,100 +8625,41 @@ impl ChatWidget {
                 .clone()
                 .unwrap_or_else(|| "no preview".to_string());
             let created_at = thread.created_at.clone();
+            let git_branch = thread.git_branch.clone();
+            let git_sha = thread.git_sha.clone();
+            let mut description =
+                format!("owner={owner_email} · {preview} · shared_at={created_at}");
+            if let Some(git_branch) = git_branch.as_deref() {
+                description.push_str(&format!(" · branch={git_branch}"));
+            }
+            if let Some(git_sha) = git_sha.as_deref() {
+                description.push_str(&format!(" · sha={}", &git_sha[..git_sha.len().min(12)]));
+            }
+            let mut search_value = format!("{thread_id} {owner_email} {preview}");
+            if let Some(repo_root) = thread.repo_root.as_deref() {
+                search_value.push(' ');
+                search_value.push_str(repo_root);
+            }
+            if let Some(git_branch) = git_branch.as_deref() {
+                search_value.push(' ');
+                search_value.push_str(git_branch);
+            }
+            if let Some(git_sha) = git_sha.as_deref() {
+                search_value.push(' ');
+                search_value.push_str(git_sha);
+            }
+            if let Some(git_origin_url) = thread.git_origin_url.as_deref() {
+                search_value.push(' ');
+                search_value.push_str(git_origin_url);
+            }
 
             items.push(SelectionItem {
                 name: thread_id.clone(),
-                description: Some(format!(
-                    "owner={owner_email} · {preview} · shared_at={created_at}"
-                )),
-                search_value: Some(format!("{thread_id} {owner_email} {preview}")),
-                actions: vec![Box::new(move |tx: &AppEventSender| {
-                    tx.send(AppEvent::RunTogetherCommand {
-                        args: format!("checkout {thread_id}"),
-                    });
-                })],
-                dismiss_on_select: true,
-                ..Default::default()
-            });
-        }
-
-        let on_char_key = Some(Box::new(move |ch: char, idx: usize, tx: &AppEventSender| {
-            let Some(selected) = threads_for_keybind.get(idx) else {
-                return false;
-            };
-            match ch.to_ascii_lowercase() {
-                'f' => {
-                    tx.send(AppEvent::DismissBottomPaneView);
-                    tx.send(AppEvent::RunTogetherCommand {
-                        args: format!("fork {}", selected.thread_id),
-                    });
-                    true
-                }
-                'd' => {
-                    if selected.owner_email == actor_for_keybind {
-                        tx.send(AppEvent::RunTogetherCommand {
-                            args: format!("delete {}", selected.thread_id),
-                        });
-                    }
-                    true
-                }
-                _ => false,
-            }
-        })
-            as Box<dyn Fn(char, usize, &AppEventSender) -> bool + Send + Sync>);
-        let on_selection_footer_hint = Some(Box::new(move |idx: usize| {
-            let can_delete = threads_for_footer
-                .get(idx)
-                .is_some_and(|selected| selected.owner_email == actor_for_footer);
-            together_threads_footer_hint(can_delete)
-        })
-            as Box<dyn Fn(usize) -> Line<'static> + Send + Sync>);
-
-        SelectionViewParams {
-            view_id: Some(TOGETHER_THREADS_SELECTION_VIEW_ID),
-            title: Some("Shared Threads".to_string()),
-            subtitle: Some("Search, checkout, fork, or delete owner-owned threads".to_string()),
-            footer_hint: Some(together_threads_footer_hint(initial_can_delete)),
-            items,
-            is_searchable: true,
-            search_placeholder: Some("Search by thread id, owner, or preview".to_string()),
-            col_width_mode: ColumnWidthMode::AutoAllRows,
-            on_selection_footer_hint,
-            on_char_key,
-            ..Default::default()
-        }
-    }
-
-    pub(crate) fn show_together_history_view(&mut self, lineage: TogetherHistoryLineageResponse) {
-        let rows = lineage_selection_rows(&lineage);
-        if rows.is_empty() {
-            self.add_info_message("No lineage nodes found.".to_string(), None);
-            return;
-        }
-
-        let actor = local_together_actor_id();
-        let initial_selected_idx = rows.iter().position(|row| row.thread_id == lineage.root);
-        let initial_can_delete = initial_selected_idx
-            .and_then(|idx| rows.get(idx))
-            .or_else(|| rows.first())
-            .is_some_and(|selected| selected.owner_email == actor);
-        let actor_for_keybind = actor.clone();
-        let rows_for_keybind = Arc::new(rows.clone());
-        let rows_for_footer = Arc::clone(&rows_for_keybind);
-        let actor_for_footer = actor;
-        let mut items = Vec::with_capacity(rows.len());
-        for row in rows {
-            let thread_id = row.thread_id.clone();
-            let description = row.description.clone();
-            let search_value = row.search_value.clone();
-            items.push(SelectionItem {
-                name: row.display_name,
-                name_prefix_spans: row.display_prefix_spans,
                 description: Some(description),
                 search_value: Some(search_value),
                 actions: vec![Box::new(move |tx: &AppEventSender| {
                     tx.send(AppEvent::RunTogetherCommand {
-                        args: format!("checkout {thread_id}"),
+                        args: format!("thread inspect {thread_id}"),
                     });
                 })],
                 dismiss_on_select: true,
@@ -8758,53 +8667,97 @@ impl ChatWidget {
             });
         }
 
-        let on_char_key = Some(Box::new(move |ch: char, idx: usize, tx: &AppEventSender| {
-            let Some(selected) = rows_for_keybind.get(idx) else {
-                return false;
-            };
-            match ch.to_ascii_lowercase() {
-                'f' => {
-                    tx.send(AppEvent::DismissBottomPaneView);
-                    tx.send(AppEvent::RunTogetherCommand {
-                        args: format!("fork {}", selected.thread_id),
-                    });
-                    true
-                }
-                'd' => {
-                    if selected.owner_email == actor_for_keybind {
-                        tx.send(AppEvent::RunTogetherCommand {
-                            args: format!("delete {}", selected.thread_id),
-                        });
-                    }
-                    true
-                }
-                _ => false,
-            }
-        })
-            as Box<dyn Fn(char, usize, &AppEventSender) -> bool + Send + Sync>);
-        let on_selection_footer_hint = Some(Box::new(move |idx: usize| {
-            let can_delete = rows_for_footer
-                .get(idx)
-                .is_some_and(|selected| selected.owner_email == actor_for_footer);
-            together_threads_footer_hint(can_delete)
-        })
-            as Box<dyn Fn(usize) -> Line<'static> + Send + Sync>);
-        self.bottom_pane.show_selection_view(SelectionViewParams {
-            title: Some("Thread History".to_string()),
-            subtitle: Some(format!(
-                "Lazygit-style worktree for current thread {}",
-                short_thread_id(&lineage.root)
-            )),
-            footer_hint: Some(together_threads_footer_hint(initial_can_delete)),
+        SelectionViewParams {
+            view_id: Some(TOGETHER_THREADS_SELECTION_VIEW_ID),
+            title: Some("Shared Threads".to_string()),
+            subtitle: Some("Search shared work and inspect it read-only".to_string()),
+            footer_hint: Some(together_threads_footer_hint(false)),
             items,
             is_searchable: true,
-            search_placeholder: Some("Search by thread id, owner, or fork actor".to_string()),
+            search_placeholder: Some(
+                "Search by thread id, owner, preview, or git metadata".to_string(),
+            ),
             col_width_mode: ColumnWidthMode::AutoAllRows,
-            initial_selected_idx,
-            on_selection_footer_hint,
-            on_char_key,
             ..Default::default()
-        });
+        }
+    }
+
+    fn together_context_view_params(
+        &self,
+        query: Option<String>,
+        results: Vec<ContextSearchResult>,
+        state: Arc<Mutex<TogetherContextViewState>>,
+    ) -> SelectionViewParams {
+        let items = results
+            .iter()
+            .enumerate()
+            .map(|(actual_idx, result)| {
+                let mut search_value = format!(
+                    "{} {} {}",
+                    result.title,
+                    result.location.clone().unwrap_or_default(),
+                    result.summary.clone().unwrap_or_default()
+                );
+                if let Some(body) = &result.body {
+                    search_value.push(' ');
+                    search_value.push_str(body);
+                }
+                SelectionItem {
+                    name: result.title.clone(),
+                    description: Some(together_context_row_description(result)),
+                    search_value: Some(search_value),
+                    actions: vec![Box::new(move |tx: &AppEventSender| {
+                        tx.send(AppEvent::AttachTogetherContextSelection { actual_idx });
+                    })],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                }
+            })
+            .collect();
+
+        SelectionViewParams {
+            view_id: Some(TOGETHER_CONTEXT_SELECTION_VIEW_ID),
+            title: Some("Collaboration Context".to_string()),
+            subtitle: Some(match query {
+                Some(query) => format!("Search results for {query}"),
+                None => "Browse shared threads and repo context".to_string(),
+            }),
+            footer_hint: Some(
+                "Enter attach · Space mark · H handoff · W write · Esc dismiss".into(),
+            ),
+            items,
+            is_searchable: true,
+            search_placeholder: Some("Search by title, location, or content".to_string()),
+            col_width_mode: ColumnWidthMode::AutoAllRows,
+            side_content: Box::new(TogetherContextPreviewRenderable {
+                state: Arc::clone(&state),
+            }),
+            side_content_width: SideContentWidth::Half,
+            side_content_min_width: 32,
+            on_selection_changed: Some(Box::new(move |idx, _tx| {
+                if let Ok(mut state) = state.lock() {
+                    state.selected_actual_idx = idx;
+                }
+            })),
+            on_char_key: Some(Box::new(
+                move |pressed, actual_idx, tx: &AppEventSender| match pressed {
+                    ' ' => {
+                        tx.send(AppEvent::ToggleTogetherContextMark { actual_idx });
+                        true
+                    }
+                    'H' => {
+                        tx.send(AppEvent::PlanTogetherContextHandoff { actual_idx });
+                        true
+                    }
+                    'W' => {
+                        tx.send(AppEvent::PlanTogetherContextWrite { actual_idx });
+                        true
+                    }
+                    _ => false,
+                },
+            )),
+            ..Default::default()
+        }
     }
 
     pub(crate) fn run_together_command(&mut self, args: String) {
@@ -8816,8 +8769,6 @@ impl ChatWidget {
             );
             return;
         }
-        let replay_thread_id_from_command = together_checkout_target(&trimmed);
-        let replay_command_args = trimmed.clone();
 
         let current_thread_id = self.thread_id.map(|id| id.to_string());
         let current_rollout_path = self.rollout_path();
@@ -8835,9 +8786,6 @@ impl ChatWidget {
             .await
             {
                 Ok(output) => {
-                    let replay_thread_id = replay_thread_id_from_command.or_else(|| {
-                        together_fork_child_target(&replay_command_args, &output.message)
-                    });
                     tx.send(AppEvent::InsertHistoryCell(Box::new(
                         history_cell::new_info_event(output.message, output.hint),
                     )));
@@ -8859,35 +8807,11 @@ impl ChatWidget {
                             TogetherCommandFollowUp::RefreshThreadsViewIfActive { threads } => {
                                 tx.send(AppEvent::RefreshTogetherThreadsViewIfActive { threads });
                             }
-                        }
-                    } else if let Some(thread_id) = replay_thread_id
-                        && should_replay_together_thread(
-                            Some(thread_id.as_str()),
-                            current_thread_id.as_deref(),
-                        )
-                    {
-                        match fetch_together_thread_replay(thread_id.clone()).await {
-                            Ok(replay) => tx.send(AppEvent::ReplayTogetherThread {
-                                thread_id,
-                                messages: replay.messages,
-                            }),
-                            Err(err) if together_method_missing(&err) => {
-                                tx.send(AppEvent::InsertHistoryCell(Box::new(
-                                    history_cell::new_info_event(
-                                        "Thread replay unavailable on this app server.".to_string(),
-                                        Some(
-                                            "Host is running an older codex-together build. Ask them to restart /host (or restart codex together-server), then checkout again."
-                                                .to_string(),
-                                        ),
-                                    ),
-                                )));
+                            TogetherCommandFollowUp::OpenContextView { query, results } => {
+                                tx.send(AppEvent::OpenTogetherContextView { query, results });
                             }
-                            Err(err) => {
-                                tx.send(AppEvent::InsertHistoryCell(Box::new(
-                                    history_cell::new_error_event(format!(
-                                        "Failed to replay checked-out thread {thread_id}: {err}"
-                                    )),
-                                )));
+                            TogetherCommandFollowUp::OpenHandoffReview { plan } => {
+                                tx.send(AppEvent::OpenTogetherHandoffReview { plan });
                             }
                         }
                     }
@@ -8899,7 +8823,7 @@ impl ChatWidget {
                             history_cell::new_info_event(
                                 "Your selected together thread is no longer shared.".to_string(),
                                 Some(
-                                    "Thread context was reset. Open /threads and checkout again."
+                                    "Thread context was reset. Open /threads and inspect another shared thread."
                                         .to_string(),
                                 ),
                             ),
@@ -8962,7 +8886,7 @@ impl ChatWidget {
             self.bottom_pane.set_composer_input_enabled(
                 false,
                 Some(format!(
-                    "Read-only together checkout owned by {owner_email}. Press f to fork or Esc to leave."
+                    "Inspecting a shared thread owned by {owner_email}. Press Esc to return."
                 )),
             );
         }
@@ -9074,24 +8998,351 @@ enum TogetherCommandFollowUp {
     RefreshThreadsViewIfActive {
         threads: Vec<TogetherThreadSummary>,
     },
+    OpenContextView {
+        query: Option<String>,
+        results: Vec<ContextSearchResult>,
+    },
+    OpenHandoffReview {
+        plan: HandoffPlanResponse,
+    },
 }
 
-#[derive(Debug, Clone)]
-struct TogetherLineageSelectionRow {
-    thread_id: String,
-    owner_email: String,
-    display_name: String,
-    display_prefix_plain: String,
-    display_prefix_spans: Vec<Span<'static>>,
-    description: String,
-    search_value: String,
+#[derive(Debug, Clone, Default)]
+struct TogetherContextViewState {
+    query: Option<String>,
+    results: Vec<ContextSearchResult>,
+    selected_actual_idx: usize,
+    marked_ref_ids: HashSet<String>,
 }
 
-#[derive(Debug, Clone)]
-struct TogetherLineageChildEdge {
-    child_thread_id: String,
-    actor_email: String,
-    created_at: String,
+struct TogetherContextPreviewRenderable {
+    state: Arc<Mutex<TogetherContextViewState>>,
+}
+
+impl Renderable for TogetherContextPreviewRenderable {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        let state = lock_together_context_view_state(&self.state);
+        let lines = together_context_preview_lines(&state, area.width);
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(area, buf);
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        let state = lock_together_context_view_state(&self.state);
+        together_context_preview_lines(&state, width).len() as u16
+    }
+}
+
+fn lock_together_context_view_state(
+    state: &Arc<Mutex<TogetherContextViewState>>,
+) -> std::sync::MutexGuard<'_, TogetherContextViewState> {
+    match state.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn together_context_preview_lines(
+    state: &TogetherContextViewState,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let selected = state.results.get(state.selected_actual_idx);
+    let wrap_width = width.max(1) as usize;
+    let mut lines = vec![Line::from(
+        selected
+            .map(|result| result.title.clone())
+            .unwrap_or_else(|| "Collaboration Context".to_string())
+            .bold(),
+    )];
+
+    if let Some(query) = &state.query {
+        for line in wrap(format!("Search: {query}").as_str(), wrap_width) {
+            lines.push(Line::from(line.into_owned().dim()));
+        }
+    }
+
+    if let Some(summary) = selected.and_then(|result| result.summary.as_ref()) {
+        for line in wrap(summary, wrap_width) {
+            lines.push(Line::from(line.into_owned().dim()));
+        }
+    }
+    if let Some(location) = selected.and_then(|result| result.location.as_ref()) {
+        for line in wrap(location, wrap_width) {
+            lines.push(Line::from(line.into_owned().cyan()));
+        }
+    }
+
+    lines.push(Line::default());
+
+    let body = selected
+        .and_then(|result| result.body.clone())
+        .unwrap_or_else(|| "No preview available.".to_string());
+    for raw_line in body.lines() {
+        if raw_line.is_empty() {
+            lines.push(Line::default());
+            continue;
+        }
+        for line in wrap(raw_line, wrap_width) {
+            lines.push(Line::from(line.into_owned()));
+        }
+    }
+
+    if !state.marked_ref_ids.is_empty() {
+        lines.push(Line::default());
+        lines.push(
+            format!("Marked {}", state.marked_ref_ids.len())
+                .cyan()
+                .into(),
+        );
+        for result in state
+            .results
+            .iter()
+            .filter(|result| state.marked_ref_ids.contains(&result.ref_id))
+        {
+            let line = format!("[x] {}", result.title);
+            for wrapped in wrap(line.as_str(), wrap_width) {
+                lines.push(Line::from(wrapped.into_owned().dim()));
+            }
+        }
+    }
+
+    lines
+}
+
+struct TogetherContextWritePreviewRenderable {
+    plan: ContextWritePlanResponse,
+}
+
+impl Renderable for TogetherContextWritePreviewRenderable {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        let lines = together_context_write_preview_lines(&self.plan, area.width);
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(area, buf);
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        together_context_write_preview_lines(&self.plan, width).len() as u16
+    }
+}
+
+fn together_context_write_preview_lines(
+    plan: &ContextWritePlanResponse,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let wrap_width = width.max(1) as usize;
+    let mut lines = vec!["Review tracked Markdown edits".bold().into()];
+
+    for file in &plan.files {
+        lines.push(Line::default());
+        lines.push(
+            format!(
+                "{} · {} · {}",
+                file.path,
+                file.kind,
+                if file.exists { "update" } else { "create" }
+            )
+            .cyan()
+            .into(),
+        );
+        for raw_line in file.content.lines() {
+            if raw_line.is_empty() {
+                lines.push(Line::default());
+                continue;
+            }
+            for line in wrap(raw_line, wrap_width) {
+                lines.push(Line::from(line.into_owned()));
+            }
+        }
+    }
+
+    lines
+}
+
+struct TogetherHandoffPreviewRenderable {
+    plan: HandoffPlanResponse,
+}
+
+impl Renderable for TogetherHandoffPreviewRenderable {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        let lines = together_handoff_preview_lines(&self.plan, area.width);
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(area, buf);
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        together_handoff_preview_lines(&self.plan, width).len() as u16
+    }
+}
+
+fn together_handoff_preview_lines(plan: &HandoffPlanResponse, width: u16) -> Vec<Line<'static>> {
+    let wrap_width = width.max(1) as usize;
+    let mut lines = vec!["Create fresh thread from selected context".bold().into()];
+
+    if let Some(goal) = &plan.goal {
+        lines.push(Line::default());
+        lines.push("Goal".cyan().into());
+        for line in wrap(goal, wrap_width) {
+            lines.push(Line::from(line.into_owned()));
+        }
+    }
+
+    lines.push(Line::default());
+    lines.push(
+        format!("Source thread: {}", plan.source_thread_id)
+            .dim()
+            .into(),
+    );
+    lines.push(
+        format!("Estimated tokens: {}", plan.token_estimate)
+            .dim()
+            .into(),
+    );
+
+    if !plan.kept_refs.is_empty() {
+        lines.push(Line::default());
+        lines.push("Included".cyan().into());
+        for context_ref in &plan.kept_refs {
+            let line = format!("[ctx: {}]", context_ref.display_label);
+            for wrapped in wrap(line.as_str(), wrap_width) {
+                lines.push(Line::from(wrapped.into_owned()));
+            }
+        }
+    }
+
+    lines
+}
+
+fn together_handoff_draft(plan: &HandoffPlanResponse) -> String {
+    let mut parts = Vec::new();
+    if let Some(goal) = &plan.goal {
+        parts.push(goal.trim().to_string());
+    }
+    if !plan.kept_refs.is_empty() {
+        if !parts.is_empty() {
+            parts.push(String::new());
+        }
+        parts.extend(plan.kept_refs.iter().map(together_context_token));
+    }
+    parts.join("\n")
+}
+
+fn together_context_ref(result: &ContextSearchResult) -> ContextRef {
+    let source_thread_id = (result.kind == codex_together_protocol::ContextKind::SharedThread)
+        .then(|| {
+            result
+                .ref_id
+                .strip_prefix("ctx:thread:")
+                .map(str::to_string)
+        })
+        .flatten();
+    let repo_context_id = (result.kind == codex_together_protocol::ContextKind::RepoContextFile)
+        .then(|| result.location.clone())
+        .flatten();
+    ContextRef {
+        ref_id: result.ref_id.clone(),
+        kind: result.kind,
+        display_label: result.title.clone(),
+        source_thread_id,
+        repo_context_id,
+        git_branch: None,
+        stale_state: None,
+    }
+}
+
+fn together_context_token(context_ref: &ContextRef) -> String {
+    format!("[ctx: {}]", context_ref.display_label)
+}
+
+fn together_context_row_description(result: &ContextSearchResult) -> String {
+    let kind = match result.kind {
+        codex_together_protocol::ContextKind::SharedThread => "shared thread",
+        codex_together_protocol::ContextKind::RepoContextFile => "repo context",
+    };
+    match (&result.location, &result.summary) {
+        (Some(location), Some(summary)) => format!("{kind} · {location} · {summary}"),
+        (Some(location), None) => format!("{kind} · {location}"),
+        (None, Some(summary)) => format!("{kind} · {summary}"),
+        (None, None) => kind.to_string(),
+    }
+}
+
+fn collaboration_context_bundle_message(bundle_text: String) -> String {
+    format!(
+        "{}\n{}\n{}",
+        codex_protocol::protocol::COLLABORATION_CONTEXT_OPEN_TAG,
+        bundle_text,
+        codex_protocol::protocol::COLLABORATION_CONTEXT_CLOSE_TAG,
+    )
+}
+
+fn strip_context_tokens_from_submission(
+    original_text: String,
+    original_elements: Vec<TextElement>,
+    context_bindings: &[ContextBinding],
+) -> (String, Vec<TextElement>) {
+    if context_bindings.is_empty() || original_text.is_empty() {
+        return (original_text, original_elements);
+    }
+
+    let mut remaining_tokens = context_bindings
+        .iter()
+        .map(|binding| together_context_token(&binding.context_ref))
+        .fold(HashMap::<String, usize>::new(), |mut counts, token| {
+            *counts.entry(token).or_insert(0) += 1;
+            counts
+        });
+    let mut rebuilt = String::new();
+    let mut rebuilt_elements = Vec::new();
+    let mut cursor = 0usize;
+
+    for mut element in original_elements {
+        let start = element.byte_range.start.min(original_text.len());
+        let end = element.byte_range.end.min(original_text.len());
+        if let Some(segment) = original_text.get(cursor..start) {
+            rebuilt.push_str(segment);
+        }
+
+        let placeholder = element.placeholder(&original_text).map(str::to_string);
+        let remove_context = placeholder.as_ref().is_some_and(|token| {
+            remaining_tokens.get_mut(token).is_some_and(|count| {
+                if *count > 0 {
+                    *count -= 1;
+                    true
+                } else {
+                    false
+                }
+            })
+        });
+        if remove_context {
+            cursor = end;
+            continue;
+        }
+
+        let Some(segment) = original_text.get(start..end) else {
+            cursor = end;
+            continue;
+        };
+        let rebuilt_start = rebuilt.len();
+        rebuilt.push_str(segment);
+        let rebuilt_end = rebuilt.len();
+        element.byte_range = (rebuilt_start..rebuilt_end).into();
+        rebuilt_elements.push(element);
+        cursor = end;
+    }
+    if let Some(segment) = original_text.get(cursor..) {
+        rebuilt.push_str(segment);
+    }
+
+    let trimmed = rebuilt.trim().to_string();
+    let trimmed_elements = crate::bottom_pane::ChatComposer::trim_text_elements(
+        rebuilt.as_str(),
+        trimmed.as_str(),
+        rebuilt_elements,
+    );
+    (trimmed, trimmed_elements)
 }
 
 type TogetherSocket =
@@ -9261,7 +9512,63 @@ async fn execute_together_command(
             follow_up: None,
         });
     };
-    let rest = &argv[1..];
+    let mut rest = argv[1..].to_vec();
+    let mut command = command;
+
+    match command.as_str() {
+        "host" => match rest.first().map(|s| s.to_ascii_lowercase()) {
+            None => {
+                command = "create".to_string();
+            }
+            Some(ref subcommand) if subcommand == "start" => {
+                command = "create".to_string();
+                rest.remove(0);
+            }
+            Some(ref subcommand) if subcommand == "status" => {
+                command = "status".to_string();
+                rest.remove(0);
+            }
+            Some(ref subcommand) if subcommand == "stop" => {
+                command = "stop".to_string();
+                rest.remove(0);
+            }
+            Some(_) => anyhow::bail!("usage: /host"),
+        },
+        "session" => match rest.first().map(|s| s.to_ascii_lowercase()) {
+            Some(ref subcommand) if subcommand == "join" => {
+                command = "join".to_string();
+                rest.remove(0);
+            }
+            Some(ref subcommand) if subcommand == "leave" => {
+                command = "leave".to_string();
+                rest.remove(0);
+            }
+            Some(_) | None => anyhow::bail!("usage: /join <invite-or-url> or /leave"),
+        },
+        "thread" => match rest.first().map(|s| s.to_ascii_lowercase()) {
+            Some(ref subcommand) if subcommand == "share" => {
+                command = "share".to_string();
+                rest.remove(0);
+            }
+            Some(ref subcommand) if subcommand == "list" => {
+                command = "list".to_string();
+                rest.remove(0);
+            }
+            Some(ref subcommand) if subcommand == "inspect" => {
+                command = "inspect".to_string();
+                rest.remove(0);
+            }
+            Some(_) | None => anyhow::bail!("usage: /share on|off, /threads, or /threads inspect"),
+        },
+        "context" => {
+            command = "context".to_string();
+        }
+        "handoff" => {
+            command = "handoff".to_string();
+        }
+        _ => {}
+    }
+    let rest = rest.as_slice();
 
     match command.as_str() {
         "help" => Ok(TogetherCommandOutput {
@@ -9269,89 +9576,6 @@ async fn execute_together_command(
             hint: Some(together_usage_hint()),
             follow_up: None,
         }),
-        "mascot" => match rest {
-            [] => {
-                let enabled = if together_mascot_enabled() {
-                    "on"
-                } else {
-                    "off"
-                };
-                let motion = if together_mascot_motion_enabled() {
-                    "on"
-                } else {
-                    "off"
-                };
-                let labels = if together_mascot_masked_labels() {
-                    "masked"
-                } else {
-                    "full"
-                };
-                Ok(TogetherCommandOutput {
-                    message: "Together mascot settings".to_string(),
-                    hint: Some(format!(
-                        "mascot: {enabled}\nmotion: {motion}\nlabels: {labels}\n\nControls:\n/together mascot on|off\n/together mascot motion on|off\n/together mascot labels masked|full"
-                    )),
-                    follow_up: None,
-                })
-            }
-            [value] if value.eq_ignore_ascii_case("on") => {
-                set_together_mascot_enabled(true);
-                Ok(TogetherCommandOutput {
-                    message: "Together mascot enabled.".to_string(),
-                    hint: Some("Crew sprites are visible in Together Center.".to_string()),
-                    follow_up: None,
-                })
-            }
-            [value] if value.eq_ignore_ascii_case("off") => {
-                set_together_mascot_enabled(false);
-                Ok(TogetherCommandOutput {
-                    message: "Together mascot disabled.".to_string(),
-                    hint: Some("Together Center now shows text-only roster rows.".to_string()),
-                    follow_up: None,
-                })
-            }
-            [mode, value] if mode.eq_ignore_ascii_case("motion") => {
-                if value.eq_ignore_ascii_case("on") {
-                    set_together_mascot_motion_enabled(true);
-                    return Ok(TogetherCommandOutput {
-                        message: "Together mascot motion enabled.".to_string(),
-                        hint: Some("Animation effects can run when supported.".to_string()),
-                        follow_up: None,
-                    });
-                }
-                if value.eq_ignore_ascii_case("off") {
-                    set_together_mascot_motion_enabled(false);
-                    return Ok(TogetherCommandOutput {
-                        message: "Together mascot motion disabled.".to_string(),
-                        hint: Some("Mascot rendering uses static posture.".to_string()),
-                        follow_up: None,
-                    });
-                }
-                anyhow::bail!("usage: /together mascot motion on|off");
-            }
-            [mode, value] if mode.eq_ignore_ascii_case("labels") => {
-                if value.eq_ignore_ascii_case("masked") {
-                    set_together_mascot_label_mode(true);
-                    return Ok(TogetherCommandOutput {
-                        message: "Together mascot labels set to masked.".to_string(),
-                        hint: Some("Default privacy-friendly label mode restored.".to_string()),
-                        follow_up: None,
-                    });
-                }
-                if value.eq_ignore_ascii_case("full") {
-                    set_together_mascot_label_mode(false);
-                    return Ok(TogetherCommandOutput {
-                        message: "Together mascot labels set to full.".to_string(),
-                        hint: Some("Crew labels now render full email addresses.".to_string()),
-                        follow_up: None,
-                    });
-                }
-                anyhow::bail!("usage: /together mascot labels masked|full");
-            }
-            _ => anyhow::bail!(
-                "usage: /together mascot on|off\n       /together mascot motion on|off\n       /together mascot labels masked|full"
-            ),
-        },
         "create" => {
             if !rest.is_empty() {
                 anyhow::bail!("usage: /host");
@@ -9359,10 +9583,7 @@ async fn execute_together_command(
             let endpoint = TOGETHER_DEFAULT_ENDPOINT_URL.to_string();
             let mut client = connect_and_auth(&endpoint).await?;
             if let Ok(existing) = client
-                .call::<TogetherServerInfoResponse, _>(
-                    METHOD_TOGETHER_SERVER_INFO,
-                    serde_json::json!({}),
-                )
+                .call::<TogetherServerInfoResponse, _>(METHOD_HOST_STATUS, serde_json::json!({}))
                 .await
             {
                 remember_together_server_endpoint(&existing.server_id, &existing.public_base_url);
@@ -9405,7 +9626,7 @@ async fn execute_together_command(
             let public_base_url = ensure_ngrok_public_base_url(&endpoint).await?;
             let response: TogetherServerCreateResponse = match client
                 .call(
-                    METHOD_TOGETHER_SERVER_CREATE,
+                    METHOD_HOST_START,
                     TogetherServerCreateRequest {
                         public_base_url: public_base_url.clone(),
                         display_name: None,
@@ -9416,7 +9637,7 @@ async fn execute_together_command(
                 Ok(response) => response,
                 Err(err) if err.to_string().contains("TOGETHER_SINGLETON_CONFLICT") => {
                     let existing: TogetherServerInfoResponse = client
-                        .call(METHOD_TOGETHER_SERVER_INFO, serde_json::json!({}))
+                        .call(METHOD_HOST_STATUS, serde_json::json!({}))
                         .await?;
                     remember_together_server_endpoint(
                         &existing.server_id,
@@ -9483,12 +9704,11 @@ async fn execute_together_command(
                 follow_up: None,
             })
         }
-        "close" => {
+        "stop" => {
             let endpoint = current_together_endpoint();
             let mut client = connect_and_auth(&endpoint).await?;
-            let close_result: anyhow::Result<TogetherServerCloseResponse> = client
-                .call(METHOD_TOGETHER_SERVER_CLOSE, serde_json::json!({}))
-                .await;
+            let close_result: anyhow::Result<HostStopResponse> =
+                client.call(METHOD_HOST_STOP, serde_json::json!({})).await;
             match close_result {
                 Ok(_) => {
                     if is_local_endpoint(&endpoint)? {
@@ -9498,7 +9718,7 @@ async fn execute_together_command(
                     clear_together_endpoint();
                     clear_together_checked_out_thread();
                     Ok(TogetherCommandOutput {
-                        message: "Together server closed.".to_string(),
+                        message: "Collaboration host stopped.".to_string(),
                         hint: None,
                         follow_up: None,
                     })
@@ -9511,7 +9731,7 @@ async fn execute_together_command(
                     clear_together_endpoint();
                     clear_together_checked_out_thread();
                     Ok(TogetherCommandOutput {
-                        message: "Already disconnected from together server.".to_string(),
+                        message: "Already disconnected from collaboration host.".to_string(),
                         hint: None,
                         follow_up: None,
                     })
@@ -9527,7 +9747,7 @@ async fn execute_together_command(
             let mut client = connect_and_auth(&endpoint).await?;
             let response: TogetherJoinResponse = client
                 .call(
-                    METHOD_TOGETHER_JOIN,
+                    METHOD_SESSION_JOIN,
                     TogetherJoinRequest {
                         invite: target.clone(),
                     },
@@ -9560,7 +9780,7 @@ async fn execute_together_command(
             let mut client = connect_and_auth(&endpoint).await?;
             let leave_result: anyhow::Result<codex_together_protocol::TogetherLeaveResponse> =
                 client
-                    .call(METHOD_TOGETHER_LEAVE, serde_json::json!({}))
+                    .call(METHOD_SESSION_LEAVE, serde_json::json!({}))
                     .await;
             match leave_result {
                 Ok(response) if response.left => {
@@ -9590,155 +9810,65 @@ async fn execute_together_command(
             }
         }
         "share" => {
-            let checked_out_thread_id = current_together_checked_out_thread();
-            let thread_id = rest
+            let thread_id = current_thread_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("usage: /share on|off"))?;
+            if !rest.is_empty() && !matches!(rest, [value] if value.eq_ignore_ascii_case("on")) {
+                anyhow::bail!("usage: /share on|off");
+            }
+            let sharing_enabled = !rest
                 .first()
-                .cloned()
-                .or_else(|| {
-                    if current_thread_id.as_deref() != checked_out_thread_id.as_deref() {
-                        checked_out_thread_id.clone()
-                    } else {
-                        None
-                    }
-                })
-                .or_else(|| current_thread_id.clone())
-                .or(checked_out_thread_id)
-                .ok_or_else(|| anyhow::anyhow!("usage: /share [thread-id]"))?;
-            let share_history = match local_together_share_history(
-                current_rollout_path.as_ref(),
-                current_thread_id.as_deref().unwrap_or(thread_id.as_str()),
-                codex_home.as_path(),
-            )
-            .await
-            {
-                Ok(history) => Some(history),
-                Err(err)
-                    if current_thread_id.as_deref() != Some(thread_id.as_str())
-                        && rest.is_empty() =>
-                {
-                    match local_together_share_history(
-                        current_rollout_path.as_ref(),
-                        thread_id.as_str(),
-                        codex_home.as_path(),
-                    )
-                    .await
-                    {
-                        Ok(history) => Some(history),
-                        Err(_) => {
-                            return Err(err);
-                        }
-                    }
-                }
-                Err(err) => return Err(err),
+                .is_some_and(|value| value.eq_ignore_ascii_case("off"));
+            let share_history = if sharing_enabled {
+                local_together_share_history(
+                    current_rollout_path.as_ref(),
+                    thread_id.as_str(),
+                    codex_home.as_path(),
+                )
+                .await?
+            } else {
+                None
             };
+            let (repo_root, git_branch, git_sha, git_origin_url) =
+                if let Some(repo_root) = get_git_repo_root(cwd.as_path()) {
+                    let repo_root_value = repo_root.display().to_string();
+                    let (git_branch, git_sha, remote_urls) = tokio::join!(
+                        current_branch_name(repo_root.as_path()),
+                        get_head_commit_hash(repo_root.as_path()),
+                        get_git_remote_urls_assume_git_repo(repo_root.as_path()),
+                    );
+                    let git_origin_url = remote_urls.and_then(|urls| {
+                        urls.get("origin")
+                            .cloned()
+                            .or_else(|| urls.values().next().cloned())
+                    });
+                    (Some(repo_root_value), git_branch, git_sha, git_origin_url)
+                } else {
+                    (None, None, None, None)
+                };
             let endpoint = current_together_endpoint();
             let mut client = connect_and_auth(&endpoint).await?;
             let response: TogetherThreadShareResponse = client
                 .call(
-                    METHOD_TOGETHER_THREAD_SHARE,
+                    METHOD_THREAD_SHARE,
                     TogetherThreadShareRequest {
                         thread_id: thread_id.clone(),
                         history: share_history,
-                    },
-                )
-                .await?;
-            set_together_checked_out_thread(Some(response.thread_id.clone()));
-            Ok(TogetherCommandOutput {
-                message: format!("Shared thread {}", response.thread_id),
-                hint: Some(format!(
-                    "Owner: {}\nShared at: {}",
-                    response.owner_email, response.shared_at
-                )),
-                follow_up: None,
-            })
-        }
-        "checkout" => {
-            let Some(thread_id) = rest.first() else {
-                anyhow::bail!("usage: /threads (select a thread and press Enter to checkout)");
-            };
-            let endpoint = current_together_endpoint();
-            let mut client = connect_and_auth(&endpoint).await?;
-            let response: TogetherThreadCheckoutResponse = client
-                .call(
-                    METHOD_TOGETHER_THREAD_CHECKOUT,
-                    TogetherThreadCheckoutRequest {
-                        thread_id: thread_id.clone(),
-                    },
-                )
-                .await?;
-            set_together_checked_out_thread(Some(response.thread_id.clone()));
-            let checked_out_thread_id = response.thread_id.clone();
-            let mode = if response.writable {
-                "writable"
-            } else {
-                "read-only"
-            };
-            let reason = match response.reason {
-                Some(CheckoutReason::NonOwnerMustFork) => {
-                    "Reason: non-owner must fork before writing.".to_string()
-                }
-                None => "Reason: thread owner match.".to_string(),
-            };
-            Ok(TogetherCommandOutput {
-                message: format!("Checked out thread {} ({mode})", response.thread_id),
-                hint: Some(format!("Owner: {}\n{reason}", response.owner_email)),
-                follow_up: Some(TogetherCommandFollowUp::ResumeThread {
-                    thread_id: checked_out_thread_id.clone(),
-                    history: fetch_together_thread_replay(checked_out_thread_id)
-                        .await
-                        .ok()
-                        .and_then(|thread| thread.history),
-                    writable: response.writable,
-                    owner_email: response.owner_email,
-                }),
-            })
-        }
-        "fork" => {
-            let Some(thread_id) = rest.first() else {
-                anyhow::bail!(
-                    "usage: /fork (current thread) or /threads (press f on a selected row)"
-                );
-            };
-            let response = fork_thread_via_together(thread_id.clone(), cwd.clone()).await?;
-            let mode = if response.writable {
-                "writable"
-            } else {
-                "read-only"
-            };
-            Ok(TogetherCommandOutput {
-                message: format!(
-                    "Forked thread {} -> {}",
-                    response.parent_thread_id, response.child_thread_id
-                ),
-                hint: Some(format!(
-                    "Auto-entered child thread {} ({mode}).\nOwner: {}\nResume child with: codex resume {}",
-                    response.child_thread_id, response.owner_email, response.child_thread_id
-                )),
-                follow_up: Some(TogetherCommandFollowUp::ResumeThread {
-                    thread_id: response.child_thread_id.clone(),
-                    history: response.history,
-                    writable: response.writable,
-                    owner_email: response.owner_email,
-                }),
-            })
-        }
-        "delete" => {
-            let Some(thread_id) = rest.first() else {
-                anyhow::bail!("usage: /threads (owner can press d on a selected row)");
-            };
-            let endpoint = current_together_endpoint();
-            let mut client = connect_and_auth(&endpoint).await?;
-            let response: TogetherThreadDeleteResponse = client
-                .call(
-                    METHOD_TOGETHER_THREAD_DELETE,
-                    TogetherThreadDeleteRequest {
-                        thread_id: thread_id.clone(),
+                        visibility: Some(if sharing_enabled {
+                            "public".to_string()
+                        } else {
+                            "private".to_string()
+                        }),
+                        repo_root,
+                        git_branch,
+                        git_sha,
+                        git_origin_url,
                     },
                 )
                 .await?;
             let refreshed_threads = client
                 .call(
-                    METHOD_TOGETHER_THREAD_LIST,
+                    METHOD_THREAD_LIST,
                     TogetherThreadListRequest {
                         cursor: None,
                         limit: Some(200),
@@ -9748,15 +9878,56 @@ async fn execute_together_command(
                 .await
                 .ok()
                 .map(|response: TogetherThreadListResponse| response.data);
-            if current_together_checked_out_thread().as_deref() == Some(response.thread_id.as_str())
-            {
-                clear_together_checked_out_thread();
+            if sharing_enabled {
+                Ok(TogetherCommandOutput {
+                    message: format!("Shared thread {}", response.thread_id),
+                    hint: Some(format!(
+                        "Owner: {}\nShared at: {}",
+                        response.owner_email, response.shared_at
+                    )),
+                    follow_up: refreshed_threads.map(|threads| {
+                        TogetherCommandFollowUp::RefreshThreadsViewIfActive { threads }
+                    }),
+                })
+            } else {
+                Ok(TogetherCommandOutput {
+                    message: format!("Hidden thread {}", response.thread_id),
+                    hint: Some(
+                        "The local thread still exists; it is no longer visible to collaborators."
+                            .to_string(),
+                    ),
+                    follow_up: refreshed_threads.map(|threads| {
+                        TogetherCommandFollowUp::RefreshThreadsViewIfActive { threads }
+                    }),
+                })
             }
+        }
+        "inspect" => {
+            let Some(thread_id) = rest.first() else {
+                anyhow::bail!("usage: /threads (select a thread and press Enter to inspect)");
+            };
+            let endpoint = current_together_endpoint();
+            let mut client = connect_and_auth(&endpoint).await?;
+            let response: TogetherThreadReadResponse = client
+                .call(
+                    METHOD_THREAD_INSPECT,
+                    TogetherThreadReadRequest {
+                        thread_id: thread_id.clone(),
+                    },
+                )
+                .await?;
             Ok(TogetherCommandOutput {
-                message: format!("Deleted shared thread {}", response.thread_id),
-                hint: None,
-                follow_up: refreshed_threads
-                    .map(|threads| TogetherCommandFollowUp::RefreshThreadsViewIfActive { threads }),
+                message: format!("Inspecting thread {}", response.thread_id),
+                hint: Some(format!(
+                    "Owner: {}\nThis opens in read-only inspect mode. Press Esc to return.",
+                    response.owner_email
+                )),
+                follow_up: Some(TogetherCommandFollowUp::ResumeThread {
+                    thread_id: response.thread_id.clone(),
+                    history: response.history,
+                    writable: false,
+                    owner_email: response.owner_email,
+                }),
             })
         }
         "list" => {
@@ -9769,7 +9940,7 @@ async fn execute_together_command(
             };
             let response: TogetherThreadListResponse = client
                 .call(
-                    METHOD_TOGETHER_THREAD_LIST,
+                    METHOD_THREAD_LIST,
                     TogetherThreadListRequest {
                         cursor: None,
                         limit: Some(100),
@@ -9799,24 +9970,77 @@ async fn execute_together_command(
                 follow_up: None,
             })
         }
-        "lineage" | "history" => {
-            let Some(root_thread_id) = rest.first() else {
-                anyhow::bail!("usage: /history");
-            };
+        "context" => {
             let endpoint = current_together_endpoint();
             let mut client = connect_and_auth(&endpoint).await?;
-            let response: TogetherHistoryLineageResponse = client
+            let query = if rest.is_empty() {
+                None
+            } else {
+                Some(rest.join(" "))
+            };
+            let response: ContextSearchResponse = client
                 .call(
-                    METHOD_TOGETHER_HISTORY_LINEAGE,
-                    TogetherHistoryLineageRequest {
-                        root_thread_id: root_thread_id.clone(),
+                    METHOD_CONTEXT_SEARCH,
+                    ContextSearchParams {
+                        query: query.clone(),
+                        limit: Some(100),
                     },
                 )
                 .await?;
+            if response.data.is_empty() {
+                return Ok(TogetherCommandOutput {
+                    message: "No collaboration context found.".to_string(),
+                    hint: query.map(|value| format!("Search query: {value}")),
+                    follow_up: None,
+                });
+            }
             Ok(TogetherCommandOutput {
-                message: format!("Lineage for {}", response.root),
-                hint: Some(render_lineage_tree(&response)),
-                follow_up: None,
+                message: "Opened collaboration context.".to_string(),
+                hint: query.as_ref().map(|value| format!("Search query: {value}")),
+                follow_up: Some(TogetherCommandFollowUp::OpenContextView {
+                    query,
+                    results: response.data,
+                }),
+            })
+        }
+        "handoff" => {
+            let Some(source_thread_id) = current_thread_id else {
+                anyhow::bail!("cannot create a handoff without an active thread");
+            };
+            let endpoint = current_together_endpoint();
+            let mut client = connect_and_auth(&endpoint).await?;
+            let goal = if rest.is_empty() {
+                None
+            } else {
+                Some(rest.join(" "))
+            };
+            let plan: HandoffPlanResponse = client
+                .call(
+                    METHOD_HANDOFF_PLAN,
+                    HandoffPlanParams {
+                        source_thread_id: Some(source_thread_id),
+                        selected_ref_ids: Vec::new(),
+                        goal,
+                    },
+                )
+                .await?;
+
+            let hint = Some(match &plan.goal {
+                Some(goal) => format!(
+                    "Goal: {goal}\nPrepared {} context item(s) from thread {}.",
+                    plan.kept_refs.len(),
+                    plan.source_thread_id
+                ),
+                None => format!(
+                    "Prepared {} context item(s) from thread {}.",
+                    plan.kept_refs.len(),
+                    plan.source_thread_id
+                ),
+            });
+            Ok(TogetherCommandOutput {
+                message: "Prepared handoff review.".to_string(),
+                hint,
+                follow_up: Some(TogetherCommandFollowUp::OpenHandoffReview { plan }),
             })
         }
         "status" => {
@@ -9828,7 +10052,7 @@ async fn execute_together_command(
             };
             let mut client = connect_and_auth(&endpoint).await?;
             let response: TogetherServerInfoResponse = client
-                .call(METHOD_TOGETHER_SERVER_INFO, serde_json::json!({}))
+                .call(METHOD_HOST_STATUS, serde_json::json!({}))
                 .await?;
             remember_together_server_endpoint(&response.server_id, &response.public_base_url);
             set_together_endpoint(Some(endpoint.clone()));
@@ -9869,32 +10093,6 @@ async fn execute_together_command(
     }
 }
 
-pub(crate) async fn fork_thread_via_together(
-    thread_id: String,
-    cwd: PathBuf,
-) -> anyhow::Result<TogetherThreadForkResponse> {
-    let endpoint = current_together_endpoint();
-    let mut client = connect_and_auth(&endpoint).await?;
-    let mut response: TogetherThreadForkResponse = client
-        .call(
-            METHOD_TOGETHER_THREAD_FORK,
-            TogetherThreadForkRequest {
-                thread_id,
-                cwd: Some(cwd.display().to_string()),
-            },
-        )
-        .await?;
-    if response.owner_email.is_empty() {
-        response.owner_email = local_together_actor_id();
-    }
-    set_together_checked_out_thread(Some(response.child_thread_id.clone()));
-    Ok(response)
-}
-
-pub(crate) fn together_checked_out_thread_id() -> Option<String> {
-    current_together_checked_out_thread()
-}
-
 pub(crate) fn clear_together_checked_out_thread_id() {
     clear_together_checked_out_thread();
 }
@@ -9906,8 +10104,108 @@ pub(crate) async fn fetch_together_thread_replay(
     let mut client = connect_and_auth(&endpoint).await?;
     client
         .call(
-            METHOD_TOGETHER_THREAD_READ,
+            METHOD_THREAD_INSPECT,
             TogetherThreadReadRequest { thread_id },
+        )
+        .await
+}
+
+pub(crate) async fn search_together_context(
+    query: Option<String>,
+    limit: Option<u32>,
+) -> anyhow::Result<Vec<ContextSearchResult>> {
+    let endpoint = current_together_endpoint();
+    let mut client = connect_and_auth(&endpoint).await?;
+    let response: ContextSearchResponse = client
+        .call(METHOD_CONTEXT_SEARCH, ContextSearchParams { query, limit })
+        .await?;
+    Ok(response.data)
+}
+
+pub(crate) async fn plan_together_context_handoff(
+    source_thread_id: Option<String>,
+    selected_ref_ids: Vec<String>,
+) -> anyhow::Result<HandoffPlanResponse> {
+    let endpoint = current_together_endpoint();
+    let mut client = connect_and_auth(&endpoint).await?;
+    client
+        .call(
+            METHOD_HANDOFF_PLAN,
+            HandoffPlanParams {
+                source_thread_id,
+                selected_ref_ids,
+                goal: None,
+            },
+        )
+        .await
+}
+
+pub(crate) async fn plan_together_context_write(
+    selected_ref_ids: Vec<String>,
+) -> anyhow::Result<ContextWritePlanResponse> {
+    let endpoint = current_together_endpoint();
+    let mut client = connect_and_auth(&endpoint).await?;
+    client
+        .call(
+            METHOD_CONTEXT_WRITE_PLAN,
+            ContextWritePlanParams {
+                selected_ref_ids,
+                branch: None,
+            },
+        )
+        .await
+}
+
+pub(crate) async fn commit_together_context_write_plan(
+    plan_id: String,
+) -> anyhow::Result<ContextWriteCommitResponse> {
+    let endpoint = current_together_endpoint();
+    let mut client = connect_and_auth(&endpoint).await?;
+    client
+        .call(
+            METHOD_CONTEXT_WRITE_COMMIT,
+            ContextWriteCommitParams { plan_id },
+        )
+        .await
+}
+
+async fn resolve_together_context_bundle(
+    thread_id: Option<String>,
+    context_refs: Vec<ContextRef>,
+) -> anyhow::Result<ContextResolveBundleResponse> {
+    let endpoint = current_together_endpoint();
+    let mut client = connect_and_auth(&endpoint).await?;
+    client
+        .call(
+            METHOD_CONTEXT_RESOLVE_BUNDLE,
+            ContextResolveBundleParams {
+                thread_id,
+                context_refs,
+                branch: None,
+            },
+        )
+        .await
+}
+
+pub(crate) async fn commit_together_handoff_plan(
+    plan_id: String,
+    cwd: PathBuf,
+    model: String,
+    approval_policy: AskForApproval,
+    sandbox: SandboxPolicy,
+) -> anyhow::Result<HandoffCommitResponse> {
+    let endpoint = current_together_endpoint();
+    let mut client = connect_and_auth(&endpoint).await?;
+    client
+        .call(
+            METHOD_HANDOFF_COMMIT,
+            HandoffCommitParams {
+                plan_id,
+                cwd: Some(cwd.display().to_string()),
+                model: Some(model),
+                approval_policy: Some(approval_policy),
+                sandbox: Some(sandbox),
+            },
         )
         .await
 }
@@ -9916,18 +10214,26 @@ async fn local_together_share_history(
     current_rollout_path: Option<&PathBuf>,
     thread_id: &str,
     codex_home: &Path,
-) -> anyhow::Result<Vec<RolloutItem>> {
-    let rollout_path = if let Some(path) = current_rollout_path {
-        path.clone()
+) -> anyhow::Result<Option<Vec<RolloutItem>>> {
+    let Some(rollout_path) = (if let Some(path) = current_rollout_path
+        && path.exists()
+    {
+        Some(path.clone())
     } else {
         find_thread_path_by_id_str(codex_home, thread_id)
             .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!("failed to locate local thread {thread_id} for /share")
-            })?
+            .filter(|path| path.exists())
+    }) else {
+        return Ok(None);
     };
 
-    let history = RolloutRecorder::get_rollout_history(rollout_path.as_path()).await?;
+    let history = match RolloutRecorder::get_rollout_history(rollout_path.as_path()).await {
+        Ok(history) => history,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(err) => return Err(err.into()),
+    };
     let items = match history {
         codex_protocol::protocol::InitialHistory::New => Vec::new(),
         codex_protocol::protocol::InitialHistory::Resumed(resumed) => resumed.history,
@@ -9940,41 +10246,7 @@ async fn local_together_share_history(
         );
     }
 
-    Ok(items)
-}
-
-fn together_checkout_target(command_args: &str) -> Option<String> {
-    let argv = shlex::split(command_args)?;
-    let command = argv.first()?.to_ascii_lowercase();
-    if command != "checkout" {
-        return None;
-    }
-    argv.get(1).cloned()
-}
-
-fn together_fork_child_target(command_args: &str, message: &str) -> Option<String> {
-    let argv = shlex::split(command_args)?;
-    if !argv.first()?.eq_ignore_ascii_case("fork") {
-        return None;
-    }
-    let (_, child) = message.split_once("->")?;
-    child
-        .split_whitespace()
-        .next()
-        .filter(|value| !value.trim().is_empty())
-        .map(ToString::to_string)
-}
-
-fn should_replay_together_thread(
-    replay_thread_id: Option<&str>,
-    current_thread_id: Option<&str>,
-) -> bool {
-    replay_thread_id.is_some_and(|thread_id| current_thread_id != Some(thread_id))
-}
-
-fn together_method_missing(err: &anyhow::Error) -> bool {
-    let text = err.to_string().to_ascii_lowercase();
-    text.contains("method not found") && text.contains("(-32601)")
+    Ok(Some(items))
 }
 
 fn together_not_connected(err: &anyhow::Error) -> bool {
@@ -10028,6 +10300,8 @@ struct TogetherHealthzResponse {
     ok: bool,
     #[serde(default)]
     version: Option<String>,
+    #[serde(default)]
+    commit: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -10210,15 +10484,17 @@ async fn ensure_local_together_server_running(endpoint: &str) -> anyhow::Result<
     }
     let healthz_url = healthz_url_from_ws_endpoint(endpoint)?;
     let expected_version = env!("CARGO_PKG_VERSION");
+    let expected_commit = current_together_build_commit().await;
     let mut must_spawn = true;
     if let Some(health) = together_server_health(&healthz_url).await {
-        if health.ok && health.version.as_deref() == Some(expected_version) {
+        if together_server_health_matches(&health, expected_version, expected_commit.as_deref()) {
             return Ok(());
         }
         if health.ok {
             stop_local_together_server().await?;
         }
-        must_spawn = !health.ok || health.version.as_deref() != Some(expected_version);
+        must_spawn =
+            !together_server_health_matches(&health, expected_version, expected_commit.as_deref());
     }
 
     let listen_url = listen_url_for_local_endpoint(endpoint)?;
@@ -10246,23 +10522,30 @@ async fn ensure_local_together_server_running(endpoint: &str) -> anyhow::Result<
 
     for _ in 0..30 {
         if let Some(health) = together_server_health(&healthz_url).await
-            && health.ok
-            && health.version.as_deref() == Some(expected_version)
+            && together_server_health_matches(&health, expected_version, expected_commit.as_deref())
         {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
-    let reported = together_server_health(&healthz_url)
-        .await
-        .and_then(|health| health.version);
-    if let Some(version) = reported {
+    let reported = together_server_health(&healthz_url).await.map(|health| {
+        let version = health.version.unwrap_or_else(|| "unknown".to_string());
+        match health.commit {
+            Some(commit) => format!("{version} ({commit})"),
+            None => version,
+        }
+    });
+    let expected_identity = match expected_commit.as_deref() {
+        Some(commit) => format!("{expected_version} ({commit})"),
+        None => expected_version.to_string(),
+    };
+    if let Some(identity) = reported {
         anyhow::bail!(
-            "timed out waiting for together-server at `{listen_url}` to report version `{expected_version}`; got `{version}`"
+            "timed out waiting for together-server at `{listen_url}` to report build `{expected_identity}`; got `{identity}`"
         );
     }
     anyhow::bail!(
-        "timed out waiting for together-server at `{listen_url}` to become healthy (expected version `{expected_version}`)"
+        "timed out waiting for together-server at `{listen_url}` to become healthy (expected build `{expected_identity}`)"
     );
 }
 
@@ -10272,6 +10555,26 @@ async fn together_server_health(healthz_url: &str) -> Option<TogetherHealthzResp
             response.json::<TogetherHealthzResponse>().await.ok()
         }
         _ => None,
+    }
+}
+
+async fn current_together_build_commit() -> Option<String> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = get_git_repo_root(manifest_dir)?;
+    get_head_commit_hash(repo_root.as_path()).await
+}
+
+fn together_server_health_matches(
+    health: &TogetherHealthzResponse,
+    expected_version: &str,
+    expected_commit: Option<&str>,
+) -> bool {
+    if !health.ok || health.version.as_deref() != Some(expected_version) {
+        return false;
+    }
+    match expected_commit {
+        Some(expected_commit) => health.commit.as_deref() == Some(expected_commit),
+        None => true,
     }
 }
 
@@ -10379,10 +10682,10 @@ fn terminate_pid(pid: u32, force: bool) -> bool {
         return true;
     }
 
-    match std::io::Error::last_os_error().raw_os_error() {
-        Some(code) if code == libc::ESRCH => true,
-        _ => false,
-    }
+    matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(code) if code == libc::ESRCH
+    )
 }
 
 #[cfg(not(unix))]
@@ -10466,13 +10769,6 @@ fn current_together_endpoint() -> String {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| TOGETHER_DEFAULT_ENDPOINT_URL.to_string())
-}
-
-fn current_together_checked_out_thread() -> Option<String> {
-    std::env::var(TOGETHER_CHECKED_OUT_THREAD_ENV_KEY)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 fn set_together_status(value: Option<String>) {
@@ -10571,385 +10867,23 @@ fn together_status_is_host() -> bool {
     together_status_value().contains("host:")
 }
 
-fn together_presence_signature(info: &TogetherServerInfoResponse) -> String {
-    let mut members = info
-        .connected_members
-        .iter()
-        .map(|member| format!("{}:{}", member.email, together_role_label(member.role)))
-        .collect::<Vec<_>>();
-    members.sort();
-    format!(
-        "{}|{}|{}",
-        info.server_id,
-        info.owner_email,
-        members.join(",")
-    )
-}
-
-fn together_mascot_enabled() -> bool {
-    std::env::var(TOGETHER_MASCOT_ENABLED_ENV_KEY)
-        .ok()
-        .map(|value| value.trim().eq_ignore_ascii_case("on"))
-        .unwrap_or(true)
-}
-
-fn together_mascot_motion_enabled() -> bool {
-    std::env::var(TOGETHER_MASCOT_MOTION_ENV_KEY)
-        .ok()
-        .map(|value| value.trim().eq_ignore_ascii_case("on"))
-        .unwrap_or(true)
-}
-
-fn together_mascot_masked_labels() -> bool {
-    std::env::var(TOGETHER_MASCOT_LABELS_ENV_KEY)
-        .ok()
-        .map(|value| !value.trim().eq_ignore_ascii_case("full"))
-        .unwrap_or(MASK_EMAIL_LABELS_BY_DEFAULT)
-}
-
-fn set_together_mascot_enabled(enabled: bool) {
-    let value = if enabled { "on" } else { "off" };
-    unsafe {
-        std::env::set_var(TOGETHER_MASCOT_ENABLED_ENV_KEY, value);
-    }
-}
-
-fn set_together_mascot_motion_enabled(enabled: bool) {
-    let value = if enabled { "on" } else { "off" };
-    unsafe {
-        std::env::set_var(TOGETHER_MASCOT_MOTION_ENV_KEY, value);
-    }
-}
-
-fn set_together_mascot_label_mode(masked: bool) {
-    let value = if masked { "masked" } else { "full" };
-    unsafe {
-        std::env::set_var(TOGETHER_MASCOT_LABELS_ENV_KEY, value);
-    }
-}
-
-fn together_threads_footer_hint(can_delete: bool) -> Line<'static> {
-    if can_delete {
-        Line::from("Enter checkout · f fork · d delete · Esc close")
-    } else {
-        Line::from("Enter checkout · f fork · Esc close")
-    }
+fn together_threads_footer_hint(_can_delete: bool) -> Line<'static> {
+    Line::from("Enter inspect · Esc close")
 }
 
 fn together_usage_hint() -> String {
     [
         "/host",
-        "/join <ngrok-url-or-invite-id>",
-        "/share [thread-id]",
+        "/join <invite-or-url>",
+        "/leave",
+        "/share on|off",
         "/threads",
-        "/history",
-        "/fork",
+        "/context [query]",
+        "/handoff [goal]",
         "/status",
         "/exit",
-        "/together",
-        "/together mascot on|off",
-        "/together mascot motion on|off",
-        "/together mascot labels masked|full",
     ]
     .join("\n")
-}
-
-fn together_join_handshake_lines(
-    local_email: &str,
-    joined_email: &str,
-    connected_members: &[ConnectedMember],
-) -> Vec<Line<'static>> {
-    let variant = together_join_handshake_variant(joined_email);
-    let left_style = together_handshake_member_style(local_email, connected_members);
-    let right_style = together_handshake_member_style(joined_email, connected_members);
-    let mut lines = Vec::with_capacity(5);
-    lines.push("  handshake".dim().into());
-    for row in variant {
-        lines.push(Line::from(vec![
-            "  ".into(),
-            Span::styled(row.left, left_style),
-            row.middle.into(),
-            Span::styled(row.right, right_style),
-        ]));
-    }
-    lines.push(Line::from(vec![
-        "  ".into(),
-        Span::styled(local_email.to_string(), left_style),
-        "  <->  ".dim(),
-        Span::styled(joined_email.to_string(), right_style),
-    ]));
-    lines
-}
-
-fn together_join_handshake_variant(joined_email: &str) -> [HandshakeRow; 3] {
-    let mut hash: usize = 0;
-    for byte in joined_email.as_bytes() {
-        hash = hash.wrapping_mul(37).wrapping_add(usize::from(*byte));
-    }
-    TOGETHER_JOIN_HANDSHAKE_VARIANTS[hash % TOGETHER_JOIN_HANDSHAKE_VARIANTS.len()]
-}
-
-fn together_handshake_member_style(email: &str, connected_members: &[ConnectedMember]) -> Style {
-    let slot_idx = connected_members
-        .iter()
-        .position(|member| member.email == email)
-        .unwrap_or_else(|| {
-            let mut hash: usize = 0;
-            for byte in email.as_bytes() {
-                hash = hash.wrapping_mul(33).wrapping_add(usize::from(*byte));
-            }
-            hash
-        });
-    let color = match slot_idx % 5 {
-        0 => Color::Cyan,
-        1 => Color::Green,
-        2 => Color::Magenta,
-        3 => Color::Yellow,
-        _ => Color::Blue,
-    };
-    Style::default().fg(color).add_modifier(Modifier::BOLD)
-}
-
-fn render_lineage_tree(response: &TogetherHistoryLineageResponse) -> String {
-    let lines = lineage_selection_rows(response)
-        .into_iter()
-        .map(|row| {
-            format!(
-                "{}{}  {}",
-                row.display_prefix_plain, row.display_name, row.description
-            )
-        })
-        .collect::<Vec<_>>();
-    if lines.is_empty() {
-        return "No lineage nodes found.".to_string();
-    }
-    lines.join("\n")
-}
-
-fn lineage_selection_rows(
-    response: &TogetherHistoryLineageResponse,
-) -> Vec<TogetherLineageSelectionRow> {
-    let owners: HashMap<String, String> = response
-        .nodes
-        .iter()
-        .map(|node| (node.thread_id.clone(), node.owner_email.clone()))
-        .collect();
-
-    let mut children: BTreeMap<String, Vec<TogetherLineageChildEdge>> = BTreeMap::new();
-    for edge in &response.edges {
-        children
-            .entry(edge.parent_thread_id.clone())
-            .or_default()
-            .push(TogetherLineageChildEdge {
-                child_thread_id: edge.child_thread_id.clone(),
-                actor_email: edge.actor_email.clone(),
-                created_at: edge.created_at.clone(),
-            });
-    }
-    for values in children.values_mut() {
-        values.sort_by(|a, b| {
-            a.created_at
-                .cmp(&b.created_at)
-                .then_with(|| a.child_thread_id.cmp(&b.child_thread_id))
-        });
-    }
-
-    let mut out = Vec::new();
-    let mut lanes = Vec::new();
-    let mut visited = HashSet::new();
-    let root_thread_id = lineage_tree_root(response);
-    lineage_selection_row_walk(
-        root_thread_id.as_str(),
-        None,
-        true,
-        &mut lanes,
-        &owners,
-        &children,
-        &response.root,
-        &mut visited,
-        &mut out,
-    );
-    out
-}
-
-fn lineage_tree_root(response: &TogetherHistoryLineageResponse) -> String {
-    let parents: HashMap<&str, &str> = response
-        .edges
-        .iter()
-        .map(|edge| {
-            (
-                edge.child_thread_id.as_str(),
-                edge.parent_thread_id.as_str(),
-            )
-        })
-        .collect();
-
-    let mut current = response.root.as_str();
-    let mut seen = HashSet::new();
-    while seen.insert(current) {
-        let Some(parent) = parents.get(current).copied() else {
-            break;
-        };
-        current = parent;
-    }
-
-    current.to_string()
-}
-
-fn lineage_selection_row_walk(
-    thread_id: &str,
-    incoming_edge: Option<&TogetherLineageChildEdge>,
-    is_last: bool,
-    parent_lanes: &mut Vec<bool>,
-    owners: &HashMap<String, String>,
-    children: &BTreeMap<String, Vec<TogetherLineageChildEdge>>,
-    head_thread_id: &str,
-    visited: &mut HashSet<String>,
-    out: &mut Vec<TogetherLineageSelectionRow>,
-) {
-    if !visited.insert(thread_id.to_string()) {
-        return;
-    }
-
-    let owner = owners
-        .get(thread_id)
-        .cloned()
-        .unwrap_or_else(|| "unknown".to_string());
-    let is_root = incoming_edge.is_none();
-    let (display_prefix_spans, display_prefix_plain) =
-        lineage_graph_prefix(parent_lanes, is_last, is_root);
-    let short_id = short_thread_id(thread_id);
-    let display_name = if thread_id == head_thread_id {
-        format!("{short_id} (HEAD)")
-    } else {
-        short_id
-    };
-    let description = lineage_row_description(thread_id, owner.as_str(), incoming_edge);
-    let mut search_terms = vec![thread_id.to_string(), owner.clone()];
-    if let Some(edge) = incoming_edge {
-        search_terms.push(edge.actor_email.clone());
-        search_terms.push(compact_lineage_timestamp(edge.created_at.as_str()));
-    }
-
-    out.push(TogetherLineageSelectionRow {
-        thread_id: thread_id.to_string(),
-        owner_email: owner,
-        display_name,
-        display_prefix_plain,
-        display_prefix_spans,
-        description,
-        search_value: search_terms.join(" "),
-    });
-
-    let Some(kids) = children.get(thread_id) else {
-        return;
-    };
-
-    let track_parent_lane = incoming_edge.is_some();
-    if track_parent_lane {
-        parent_lanes.push(!is_last);
-    }
-
-    for (index, child_edge) in kids.iter().enumerate() {
-        lineage_selection_row_walk(
-            child_edge.child_thread_id.as_str(),
-            Some(child_edge),
-            index + 1 == kids.len(),
-            parent_lanes,
-            owners,
-            children,
-            head_thread_id,
-            visited,
-            out,
-        );
-    }
-
-    if track_parent_lane {
-        parent_lanes.pop();
-    }
-}
-
-fn lineage_graph_prefix(
-    parent_lanes: &[bool],
-    is_last: bool,
-    is_root: bool,
-) -> (Vec<Span<'static>>, String) {
-    let mut styled = Vec::new();
-    let mut plain = String::new();
-
-    if is_root {
-        styled.push(Span::styled(
-            "● ",
-            Style::default().fg(lineage_lane_color(0)).bold(),
-        ));
-        plain.push_str("● ");
-        return (styled, plain);
-    }
-
-    for (depth, has_more_siblings) in parent_lanes.iter().enumerate() {
-        if *has_more_siblings {
-            styled.push(Span::styled(
-                "│ ",
-                Style::default().fg(lineage_lane_color(depth)),
-            ));
-            plain.push_str("│ ");
-        } else {
-            styled.push(Span::raw("  "));
-            plain.push_str("  ");
-        }
-    }
-
-    let depth = parent_lanes.len();
-    let lane_style = Style::default().fg(lineage_lane_color(depth));
-    let branch = if is_last { "└" } else { "├" };
-    styled.push(Span::styled(format!("{branch}─"), lane_style));
-    styled.push(Span::styled("● ", lane_style.bold()));
-    plain.push_str(branch);
-    plain.push('─');
-    plain.push('●');
-    plain.push(' ');
-
-    (styled, plain)
-}
-
-fn lineage_lane_color(depth: usize) -> Color {
-    const PALETTE: [Color; 6] = [
-        Color::Yellow,
-        Color::Cyan,
-        Color::Green,
-        Color::Magenta,
-        Color::Blue,
-        Color::Red,
-    ];
-    PALETTE[depth % PALETTE.len()]
-}
-
-fn short_thread_id(thread_id: &str) -> String {
-    thread_id.chars().take(12).collect()
-}
-
-fn lineage_row_description(
-    thread_id: &str,
-    owner_email: &str,
-    incoming_edge: Option<&TogetherLineageChildEdge>,
-) -> String {
-    match incoming_edge {
-        Some(edge) => format!(
-            "owner={owner_email} · thread={thread_id} · forked_by={} · {}",
-            edge.actor_email,
-            compact_lineage_timestamp(edge.created_at.as_str())
-        ),
-        None => format!("owner={owner_email} · thread={thread_id} · root"),
-    }
-}
-
-fn compact_lineage_timestamp(raw: &str) -> String {
-    let base = raw
-        .split_once('.')
-        .map(|(ts, _)| ts)
-        .unwrap_or(raw)
-        .replace('T', " ");
-    base.strip_suffix("+00:00").unwrap_or(&base).to_string()
 }
 
 fn has_websocket_timing_metrics(summary: RuntimeMetricsSummary) -> bool {

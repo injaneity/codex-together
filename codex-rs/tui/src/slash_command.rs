@@ -30,7 +30,6 @@ pub enum SlashCommand {
     Compact,
     Plan,
     Collab,
-    Together,
     Agent,
     // Undo,
     Diff,
@@ -40,10 +39,10 @@ pub enum SlashCommand {
     Host,
     Join,
     Leave,
-    Close,
     Share,
     Threads,
-    History,
+    Context,
+    Handoff,
     DebugConfig,
     Statusline,
     Theme,
@@ -88,13 +87,13 @@ impl SlashCommand {
             SlashCommand::Mention => "mention a file",
             SlashCommand::Skills => "use skills to improve how Codex performs specific tasks",
             SlashCommand::Status => "show current session configuration and token usage",
-            SlashCommand::Host => "start a codex-together app server",
-            SlashCommand::Join => "join a codex-together app server",
-            SlashCommand::Leave => "leave the current codex-together app server",
-            SlashCommand::Close => "close the current hosted codex-together app server",
-            SlashCommand::Share => "share the current thread to codex-together",
-            SlashCommand::Threads => "browse shared threads and checkout/fork/delete",
-            SlashCommand::History => "browse lineage for the current thread",
+            SlashCommand::Host => "start or manage the collaboration host",
+            SlashCommand::Join => "join a collaboration host",
+            SlashCommand::Leave => "leave the current collaboration host",
+            SlashCommand::Share => "toggle visibility for the current thread",
+            SlashCommand::Threads => "browse shared threads and inspect them",
+            SlashCommand::Context => "open the collaboration context graph",
+            SlashCommand::Handoff => "create a fresh thread from selected context",
             SlashCommand::DebugConfig => "show config layers and requirement sources for debugging",
             SlashCommand::Statusline => "configure which items appear in the status line",
             SlashCommand::Theme => "choose a syntax highlighting theme",
@@ -108,7 +107,6 @@ impl SlashCommand {
             SlashCommand::Settings => "configure realtime microphone/speaker",
             SlashCommand::Plan => "switch to Plan mode",
             SlashCommand::Collab => "change collaboration mode (experimental)",
-            SlashCommand::Together => "open codex-together menu",
             SlashCommand::Agent => "switch the active agent thread",
             SlashCommand::Approvals => "choose what Codex is allowed to do",
             SlashCommand::Permissions => "choose what Codex is allowed to do",
@@ -138,10 +136,12 @@ impl SlashCommand {
             SlashCommand::Review
                 | SlashCommand::Rename
                 | SlashCommand::Plan
-                | SlashCommand::Together
+                | SlashCommand::Host
                 | SlashCommand::Join
                 | SlashCommand::Leave
                 | SlashCommand::Share
+                | SlashCommand::Context
+                | SlashCommand::Handoff
                 | SlashCommand::SandboxReadRoot
         )
     }
@@ -177,16 +177,15 @@ impl SlashCommand {
             | SlashCommand::Host
             | SlashCommand::Join
             | SlashCommand::Leave
-            | SlashCommand::Close
             | SlashCommand::Share
             | SlashCommand::Threads
-            | SlashCommand::History
+            | SlashCommand::Context
+            | SlashCommand::Handoff
             | SlashCommand::DebugConfig
             | SlashCommand::Ps
             | SlashCommand::Clean
             | SlashCommand::Mcp
             | SlashCommand::Apps
-            | SlashCommand::Together
             | SlashCommand::Feedback
             | SlashCommand::Quit
             | SlashCommand::Exit => true,

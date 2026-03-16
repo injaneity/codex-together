@@ -26,15 +26,14 @@ pub(crate) fn is_contextual_user_message_content(message: &[ContentItem]) -> boo
 }
 
 fn parse_user_message(message: &[ContentItem]) -> Option<UserMessageItem> {
-    if is_contextual_user_message_content(message) {
-        return None;
-    }
-
     let mut content: Vec<UserInput> = Vec::new();
 
     for (idx, content_item) in message.iter().enumerate() {
         match content_item {
-            ContentItem::InputText { text } => {
+            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                if is_contextual_user_fragment(content_item) {
+                    continue;
+                }
                 if (is_local_image_open_tag_text(text) || is_image_open_tag_text(text))
                     && (matches!(message.get(idx + 1), Some(ContentItem::InputImage { .. })))
                     || (idx > 0
@@ -54,13 +53,10 @@ fn parse_user_message(message: &[ContentItem]) -> Option<UserMessageItem> {
                     image_url: image_url.clone(),
                 });
             }
-            ContentItem::OutputText { text } => {
-                warn!("Output text in user message: {}", text);
-            }
         }
     }
 
-    Some(UserMessageItem::new(&content))
+    (!content.is_empty()).then(|| UserMessageItem::new(&content))
 }
 
 fn parse_agent_message(
@@ -199,6 +195,53 @@ mod tests {
             }
             other => panic!("expected TurnItem::UserMessage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_user_message_from_output_text() {
+        let item = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "Hello world".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+
+        let turn_item = parse_turn_item(&item).expect("expected user message turn item");
+
+        match turn_item {
+            TurnItem::UserMessage(user) => {
+                assert_eq!(
+                    user.content,
+                    vec![UserInput::Text {
+                        text: "Hello world".to_string(),
+                        text_elements: Vec::new(),
+                    }]
+                );
+            }
+            other => panic!("expected TurnItem::UserMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skips_contextual_output_text_in_user_message() {
+        let item = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: format!(
+                    "{}\nbundle body\n{}",
+                    codex_protocol::protocol::COLLABORATION_CONTEXT_OPEN_TAG,
+                    codex_protocol::protocol::COLLABORATION_CONTEXT_CLOSE_TAG,
+                ),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+
+        assert!(parse_turn_item(&item).is_none());
     }
 
     #[test]

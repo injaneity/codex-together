@@ -1,0 +1,24 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: terminal.backend()
+---
+"                                                                                                                        "
+"                                                                                                                        "
+"  Collaboration Context                                      Planning Overview                                          "
+"  Search results for planning                                Search: planning                                           "
+"                                                             plan · public · Ship the context browser first.            "
+"  Search by title, location, or content                      .codex/context/overview.md                                 "
+"› Planning Overview  repo context · .codex/context/                                                                     "
+"                     overview.md · plan · public · Ship the  # Planning Overview                                        "
+"                     context browser first.                                                                             "
+"  planning sync      shared thread · thread/thread-1 ·       Ship the context browser first.                            "
+"                     owner=owner@example.com ·               Then wire handoff on top.                                  "
+"                     shared_by=owner@example.com ·                                                                      "
+"                     shared_at=2026-03-08T12:05:00Z                                                                     "
+"                                                                                                                        "
+"  Enter attach · Space mark · H handoff · W write · Esc dismiss                                                         "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "

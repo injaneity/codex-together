@@ -1,0 +1,26 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: terminal.backend()
+---
+"                                                                                                                        "
+"                                                                                                                        "
+"  Write Repo Context                                         Review tracked Markdown edits                              "
+"  Review 2 repo-context files                                                                                           "
+"                                                             .codex/context/concepts/planning-overview.md · concept ·   "
+"› 1. Write tracked files  Create or update tracked Markdown  create                                                     "
+"                          under .codex/context               ---                                                        "
+"  2. Cancel               Leave the working tree unchanged   id: "planning-overview"                                    "
+"                                                                                                                        "
+"  Enter write · Esc cancel                                                                                              "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "

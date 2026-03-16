@@ -17,15 +17,15 @@ use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RolloutItem;
-use codex_together_protocol::TogetherHistoryLineageResponse;
-use codex_together_protocol::TogetherReplayMessage;
-use codex_together_protocol::TogetherServerInfoResponse;
+use codex_together_protocol::ContextRef;
+use codex_together_protocol::ContextResolveBundleResponse;
+use codex_together_protocol::ContextSearchResult;
+use codex_together_protocol::HandoffPlanResponse;
 use codex_together_protocol::TogetherThreadSummary;
 use codex_utils_approval_presets::ApprovalPreset;
 
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::StatusLineItem;
-use crate::bottom_pane::TogetherPresenceState;
 use crate::history_cell::HistoryCell;
 
 use codex_core::features::Feature;
@@ -413,12 +413,12 @@ pub(crate) enum AppEvent {
     /// Open the custom prompt option from the review popup.
     OpenReviewCustomPrompt,
 
-    /// Execute a parsed `/together` command.
+    /// Execute a parsed collaboration command.
     RunTogetherCommand {
         args: String,
     },
 
-    /// Open an interactive shared-threads list for together operations.
+    /// Open an interactive shared-threads list for collaboration operations.
     OpenTogetherThreadsView {
         threads: Vec<TogetherThreadSummary>,
     },
@@ -428,29 +428,68 @@ pub(crate) enum AppEvent {
         threads: Vec<TogetherThreadSummary>,
     },
 
-    /// Open an interactive lineage list for together history operations.
-    OpenTogetherHistoryView {
-        lineage: TogetherHistoryLineageResponse,
+    /// Async search request for `##` composer context attach.
+    StartTogetherComposerContextSearch {
+        query: String,
     },
 
-    /// Open Together Center with the latest server info (if connected).
-    OpenTogetherCenterView {
-        server_info: Option<TogetherServerInfoResponse>,
+    /// Async search results for `##` composer context attach.
+    TogetherComposerContextSearchResult {
+        query: String,
+        results: Vec<ContextSearchResult>,
     },
 
-    /// Background together presence refresh event for Together Center updates.
-    TogetherPresenceUpdated {
-        server_info: Option<TogetherServerInfoResponse>,
-        state: TogetherPresenceState,
+    /// Resolve bound `[ctx: ...]` refs before submitting a user message.
+    TogetherContextBundleResolved {
+        response: ContextResolveBundleResponse,
     },
 
-    /// Dismiss the currently active bottom-pane modal/popup view, if any.
-    DismissBottomPaneView,
+    /// Failed to resolve bound `[ctx: ...]` refs before submit.
+    TogetherContextBundleResolveFailed {
+        error: String,
+    },
 
-    /// Replay a checked-out together thread using the same UI replay flow as resume.
-    ReplayTogetherThread {
-        thread_id: String,
-        messages: Vec<TogetherReplayMessage>,
+    /// Open the collaboration context picker with the latest search results.
+    OpenTogetherContextView {
+        query: Option<String>,
+        results: Vec<ContextSearchResult>,
+    },
+
+    /// Toggle whether the selected collaboration context row is marked.
+    ToggleTogetherContextMark {
+        actual_idx: usize,
+    },
+
+    /// Attach the current or marked collaboration context rows into the composer.
+    AttachTogetherContextSelection {
+        actual_idx: usize,
+    },
+
+    /// Plan a fresh-thread handoff from the current or marked context rows.
+    PlanTogetherContextHandoff {
+        actual_idx: usize,
+    },
+
+    /// Plan durable repo context writes from the current or marked context rows.
+    PlanTogetherContextWrite {
+        actual_idx: usize,
+    },
+
+    /// Open the handoff review popup for a planned fresh-thread handoff.
+    OpenTogetherHandoffReview {
+        plan: HandoffPlanResponse,
+    },
+
+    /// Commit a previously planned handoff and open the new writable thread.
+    CommitTogetherHandoff {
+        plan_id: String,
+        draft_text: String,
+        context_refs: Vec<ContextRef>,
+    },
+
+    /// Commit a previously planned repo-context write.
+    CommitTogetherContextWrite {
+        plan_id: String,
     },
 
     /// Try to switch the active thread to a together checkout/fork target.

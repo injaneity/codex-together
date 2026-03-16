@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
+use crate::bottom_pane::ContextBinding;
 use crate::bottom_pane::MentionBinding;
 use crate::mention_codec::decode_history_mentions;
 use codex_protocol::protocol::Op;
@@ -21,6 +22,8 @@ pub(crate) struct HistoryEntry {
     pub(crate) remote_image_urls: Vec<String>,
     /// Mention bindings for tool/app/skill references inside `text`.
     pub(crate) mention_bindings: Vec<MentionBinding>,
+    /// Context bindings for `[ctx: ...]` references inside `text`.
+    pub(crate) context_bindings: Vec<ContextBinding>,
     /// Placeholder-to-payload pairs used to restore large paste content.
     pub(crate) pending_pastes: Vec<(String, String)>,
 }
@@ -41,6 +44,7 @@ impl HistoryEntry {
                     path: mention.path,
                 })
                 .collect(),
+            context_bindings: Vec::new(),
             pending_pastes: Vec::new(),
         }
     }
@@ -58,6 +62,7 @@ impl HistoryEntry {
             local_image_paths,
             remote_image_urls: Vec::new(),
             mention_bindings: Vec::new(),
+            context_bindings: Vec::new(),
             pending_pastes,
         }
     }
@@ -76,6 +81,7 @@ impl HistoryEntry {
             local_image_paths,
             remote_image_urls,
             mention_bindings: Vec::new(),
+            context_bindings: Vec::new(),
             pending_pastes,
         }
     }
@@ -139,6 +145,7 @@ impl ChatComposerHistory {
             && entry.local_image_paths.is_empty()
             && entry.remote_image_urls.is_empty()
             && entry.mention_bindings.is_empty()
+            && entry.context_bindings.is_empty()
             && entry.pending_pastes.is_empty()
         {
             return;

@@ -10,6 +10,7 @@ use crate::app_event::ExitMode;
 #[cfg(all(not(target_os = "linux"), feature = "voice-input"))]
 use crate::app_event::RealtimeAudioDeviceKind;
 use crate::app_event_sender::AppEventSender;
+use crate::bottom_pane::ContextBinding;
 use crate::bottom_pane::FeedbackAudience;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::MentionBinding;
@@ -96,9 +97,14 @@ use codex_protocol::protocol::ViewImageToolCallEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::TextElement;
 use codex_protocol::user_input::UserInput;
-use codex_together_protocol::LineageEdge;
-use codex_together_protocol::LineageNode;
-use codex_together_protocol::TogetherHistoryLineageResponse;
+use codex_together_protocol::ConnectedMember;
+use codex_together_protocol::ContextKind;
+use codex_together_protocol::ContextRef;
+use codex_together_protocol::ContextSearchResult;
+use codex_together_protocol::ContextStaleState;
+use codex_together_protocol::ContextWriteFilePlan;
+use codex_together_protocol::ContextWritePlanResponse;
+use codex_together_protocol::HandoffPlanResponse;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_approval_presets::builtin_approval_presets;
 use crossterm::event::KeyCode;
@@ -1030,6 +1036,7 @@ async fn blocked_image_restore_preserves_mention_bindings() {
         local_images.clone(),
         mention_bindings.clone(),
         Vec::new(),
+        Vec::new(),
     );
 
     let mention_start = text.find("$file").expect("mention token exists");
@@ -1094,6 +1101,7 @@ async fn blocked_image_restore_with_remote_images_keeps_local_placeholder_mappin
         text_elements.clone(),
         local_images.clone(),
         Vec::new(),
+        Vec::new(),
         remote_image_urls.clone(),
     );
 
@@ -1139,6 +1147,7 @@ async fn queued_restore_with_remote_images_keeps_local_placeholder_mapping() {
         remote_image_urls: remote_image_urls.clone(),
         text_elements: text_elements.clone(),
         mention_bindings: Vec::new(),
+        context_bindings: Vec::new(),
     });
 
     assert_eq!(chat.bottom_pane.composer_text(), text);
@@ -1184,6 +1193,7 @@ async fn interrupted_turn_restores_queued_messages_with_images_and_elements() {
         remote_image_urls: Vec::new(),
         text_elements: first_elements,
         mention_bindings: Vec::new(),
+        context_bindings: Vec::new(),
     });
     chat.queued_user_messages.push_back(UserMessage {
         text: second_text,
@@ -1194,6 +1204,7 @@ async fn interrupted_turn_restores_queued_messages_with_images_and_elements() {
         remote_image_urls: Vec::new(),
         text_elements: second_elements,
         mention_bindings: Vec::new(),
+        context_bindings: Vec::new(),
     });
     chat.refresh_queued_user_messages();
 
@@ -1264,6 +1275,7 @@ async fn interrupted_turn_restore_keeps_active_mode_for_resubmission() {
         remote_image_urls: Vec::new(),
         text_elements: Vec::new(),
         mention_bindings: Vec::new(),
+        context_bindings: Vec::new(),
     });
     chat.refresh_queued_user_messages();
 
@@ -1326,6 +1338,7 @@ async fn remap_placeholders_uses_attachment_labels() {
         local_images: attachments,
         remote_image_urls: vec!["https://example.com/a.png".to_string()],
         mention_bindings: Vec::new(),
+        context_bindings: Vec::new(),
     };
     let mut next_label = 3usize;
     let remapped = remap_placeholders_for_message(message, &mut next_label);
@@ -1392,6 +1405,7 @@ async fn remap_placeholders_uses_byte_ranges_when_placeholder_missing() {
         local_images: attachments,
         remote_image_urls: Vec::new(),
         mention_bindings: Vec::new(),
+        context_bindings: Vec::new(),
     };
     let mut next_label = 3usize;
     let remapped = remap_placeholders_for_message(message, &mut next_label);
@@ -1734,6 +1748,8 @@ async fn make_chatwidget_manual(
         show_welcome_banner: true,
         startup_tooltip_override: None,
         queued_user_messages: VecDeque::new(),
+        pending_together_context_submission: None,
+        together_context_view_state: None,
         queued_message_edit_binding: crate::key_hint::alt(KeyCode::Up),
         suppress_session_configured_redraw: false,
         pending_notification: None,
@@ -1763,10 +1779,6 @@ async fn make_chatwidget_manual(
         status_line_branch_lookup_complete: false,
         external_editor_state: ExternalEditorState::Closed,
         realtime_conversation: RealtimeConversationUiState::default(),
-        together_member_emails: HashSet::new(),
-        together_member_roles: HashMap::new(),
-        together_presence_seen_once: false,
-        together_presence_monitor: None,
         last_rendered_user_message_event: None,
     };
     widget.set_model(&resolved_model);
@@ -1795,48 +1807,46 @@ fn assert_no_submit_op(op_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Op>) {
     }
 }
 
-#[test]
-fn together_replay_is_skipped_for_current_thread() {
-    assert!(!should_replay_together_thread(
-        Some("thread-1"),
-        Some("thread-1")
-    ));
-    assert!(should_replay_together_thread(
-        Some("thread-1"),
-        Some("thread-2")
-    ));
-    assert!(should_replay_together_thread(Some("thread-1"), None));
-    assert!(!should_replay_together_thread(None, Some("thread-1")));
-}
-
 #[tokio::test]
 async fn together_threads_view_refresh_snapshot() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
-    let actor = local_together_actor_id();
+    let owner_email = "owner@example.com".to_string();
 
     chat.show_together_threads_view(vec![
         TogetherThreadSummary {
             thread_id: "thread-1".to_string(),
-            owner_email: actor.clone(),
+            owner_email: owner_email.clone(),
             preview: Some("first preview".to_string()),
             created_at: "2026-03-06T12:00:00Z".to_string(),
+            repo_root: None,
+            git_branch: None,
+            git_sha: None,
+            git_origin_url: None,
         },
         TogetherThreadSummary {
             thread_id: "thread-2".to_string(),
-            owner_email: actor.clone(),
+            owner_email: owner_email.clone(),
             preview: Some("second preview".to_string()),
             created_at: "2026-03-06T12:05:00Z".to_string(),
+            repo_root: None,
+            git_branch: None,
+            git_sha: None,
+            git_origin_url: None,
         },
     ]);
 
     chat.refresh_together_threads_view_if_open(vec![TogetherThreadSummary {
         thread_id: "thread-2".to_string(),
-        owner_email: actor,
+        owner_email,
         preview: Some("second preview".to_string()),
         created_at: "2026-03-06T12:05:00Z".to_string(),
+        repo_root: None,
+        git_branch: None,
+        git_sha: None,
+        git_origin_url: None,
     }]);
 
     let mut terminal = Terminal::new(TestBackend::new(100, 16)).expect("create terminal");
@@ -1847,6 +1857,352 @@ async fn together_threads_view_refresh_snapshot() {
         "together_threads_view_refresh_after_delete",
         terminal.backend()
     );
+}
+
+#[tokio::test]
+async fn together_context_view_snapshot() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.show_together_context_view(
+        Some("planning".to_string()),
+        vec![
+            ContextSearchResult {
+                ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+                kind: ContextKind::RepoContextFile,
+                title: "Planning Overview".to_string(),
+                summary: Some("plan · public · Ship the context browser first.".to_string()),
+                location: Some(".codex/context/overview.md".to_string()),
+                body: Some(
+                    "# Planning Overview\n\nShip the context browser first.\nThen wire handoff on top."
+                        .to_string(),
+                ),
+            },
+            ContextSearchResult {
+                ref_id: "ctx:thread:thread-1".to_string(),
+                kind: ContextKind::SharedThread,
+                title: "planning sync".to_string(),
+                summary: Some(
+                    "owner=owner@example.com · shared_by=owner@example.com · shared_at=2026-03-08T12:05:00Z"
+                        .to_string(),
+                ),
+                location: Some("thread/thread-1".to_string()),
+                body: Some(
+                    "Thread: thread-1\nOwner: owner@example.com\n\nRecent transcript:\nUser: Scope the rewrite.\nAssistant: Start with /context."
+                        .to_string(),
+                ),
+            },
+        ],
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw context view");
+    assert_snapshot!("together_context_view", terminal.backend());
+}
+
+#[tokio::test]
+async fn together_context_view_emits_attach_mark_and_write_events() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.show_together_context_view(
+        Some("planning".to_string()),
+        vec![ContextSearchResult {
+            ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+            kind: ContextKind::RepoContextFile,
+            title: "Planning Overview".to_string(),
+            summary: Some("plan · public".to_string()),
+            location: Some(".codex/context/overview.md".to_string()),
+            body: Some("# Planning Overview".to_string()),
+        }],
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    assert_matches!(
+        rx.try_recv().expect("expected toggle event"),
+        AppEvent::ToggleTogetherContextMark { actual_idx: 0 }
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('W'), KeyModifiers::SHIFT));
+    assert_matches!(
+        rx.try_recv().expect("expected write event"),
+        AppEvent::PlanTogetherContextWrite { actual_idx: 0 }
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_matches!(
+        rx.try_recv().expect("expected attach event"),
+        AppEvent::AttachTogetherContextSelection { actual_idx: 0 }
+    );
+}
+
+#[tokio::test]
+async fn together_context_marked_attach_inserts_all_marked_tokens() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.show_together_context_view(
+        Some("planning".to_string()),
+        vec![
+            ContextSearchResult {
+                ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+                kind: ContextKind::RepoContextFile,
+                title: "Planning Overview".to_string(),
+                summary: Some("plan · public".to_string()),
+                location: Some(".codex/context/overview.md".to_string()),
+                body: Some("# Planning Overview".to_string()),
+            },
+            ContextSearchResult {
+                ref_id: "ctx:thread:thread-1".to_string(),
+                kind: ContextKind::SharedThread,
+                title: "planning sync".to_string(),
+                summary: Some("owner=owner@example.com".to_string()),
+                location: Some("thread/thread-1".to_string()),
+                body: Some("Thread: thread-1".to_string()),
+            },
+        ],
+    );
+
+    chat.toggle_together_context_mark(0);
+    chat.toggle_together_context_mark(1);
+    chat.attach_together_context_selection(1);
+
+    assert_eq!(
+        chat.composer_text_with_pending(),
+        "[ctx: Planning Overview] [ctx: planning sync] "
+    );
+}
+
+#[tokio::test]
+async fn together_context_source_thread_id_prefers_selected_shared_thread() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.show_together_context_view(
+        Some("planning".to_string()),
+        vec![
+            ContextSearchResult {
+                ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+                kind: ContextKind::RepoContextFile,
+                title: "Planning Overview".to_string(),
+                summary: Some("plan · public".to_string()),
+                location: Some(".codex/context/overview.md".to_string()),
+                body: Some("# Planning Overview".to_string()),
+            },
+            ContextSearchResult {
+                ref_id: "ctx:thread:thread-1".to_string(),
+                kind: ContextKind::SharedThread,
+                title: "planning sync".to_string(),
+                summary: Some("owner=owner@example.com".to_string()),
+                location: Some("thread/thread-1".to_string()),
+                body: Some("Thread: thread-1".to_string()),
+            },
+        ],
+    );
+
+    assert_eq!(
+        chat.together_context_source_thread_id(1).as_deref(),
+        Some("thread-1")
+    );
+
+    chat.toggle_together_context_mark(1);
+
+    assert_eq!(
+        chat.together_context_source_thread_id(0).as_deref(),
+        Some("thread-1")
+    );
+}
+
+#[tokio::test]
+async fn local_together_share_history_returns_none_for_missing_rollout_path() {
+    let temp = tempdir().expect("tempdir");
+    let missing_rollout_path = temp.path().join("sessions").join("missing.jsonl");
+
+    let history =
+        local_together_share_history(Some(&missing_rollout_path), "thread-1", temp.path())
+            .await
+            .expect("missing rollout path should fall back to app-server thread reads");
+
+    assert!(history.is_none());
+}
+
+#[tokio::test]
+async fn together_context_write_review_snapshot() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.show_together_context_write_review(ContextWritePlanResponse {
+        plan_id: "write-plan-1".to_string(),
+        files: vec![
+            ContextWriteFilePlan {
+                path: ".codex/context/concepts/planning-overview.md".to_string(),
+                title: "Planning Overview".to_string(),
+                kind: "concept".to_string(),
+                exists: false,
+                content: "---\nid: \"planning-overview\"\nkind: \"concept\"\ntitle: \"Planning Overview\"\napplies_to:\n  branches:\n    - \"rewrite-codex-2gether-v2\"\nsource_threads: []\nsource_files: []\nlast_validated_at: 2026-03-16\nvisibility: \"repo\"\n---\n\n# Planning Overview\n"
+                    .to_string(),
+            },
+            ContextWriteFilePlan {
+                path: ".codex/context/decisions/branch-routing.md".to_string(),
+                title: "Branch Routing".to_string(),
+                kind: "decision".to_string(),
+                exists: true,
+                content: "---\nid: \"branch-routing\"\nkind: \"decision\"\ntitle: \"Branch Routing\"\n---\n\n# Branch Routing\n"
+                    .to_string(),
+            },
+        ],
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 22)).expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw context write review");
+    assert_snapshot!("together_context_write_review", terminal.backend());
+}
+
+#[tokio::test]
+async fn insert_together_context_binding_appends_token_and_binding() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.set_composer_text("Existing draft".to_string(), Vec::new(), Vec::new());
+
+    let context_ref = ContextRef {
+        ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+        kind: ContextKind::RepoContextFile,
+        display_label: "Planning Overview".to_string(),
+        source_thread_id: None,
+        repo_context_id: Some(".codex/context/overview.md".to_string()),
+        git_branch: Some("rewrite-codex-2gether-v2".to_string()),
+        stale_state: Some(ContextStaleState::Fresh),
+    };
+    chat.insert_together_context_binding(context_ref.clone());
+
+    assert_eq!(
+        chat.composer_text_with_pending(),
+        "Existing draft [ctx: Planning Overview] "
+    );
+    assert_eq!(
+        chat.bottom_pane.composer_context_bindings(),
+        vec![ContextBinding { context_ref }]
+    );
+}
+
+#[test]
+fn strip_context_tokens_from_submission_removes_bound_tokens_and_rebases_other_elements() {
+    let context_token = "[ctx: Planning Overview]";
+    let mention_token = "$file";
+    let original_text = format!("Investigate expiry\n{context_token}\n{mention_token}");
+    let context_start = "Investigate expiry\n".len();
+    let mention_start = context_start + context_token.len() + 1;
+    let original_elements = vec![
+        TextElement::new(
+            (context_start..context_start + context_token.len()).into(),
+            Some(context_token.to_string()),
+        ),
+        TextElement::new(
+            (mention_start..mention_start + mention_token.len()).into(),
+            Some(mention_token.to_string()),
+        ),
+    ];
+
+    let (stripped_text, stripped_elements) = strip_context_tokens_from_submission(
+        original_text,
+        original_elements,
+        &[ContextBinding {
+            context_ref: ContextRef {
+                ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+                kind: ContextKind::RepoContextFile,
+                display_label: "Planning Overview".to_string(),
+                source_thread_id: None,
+                repo_context_id: Some(".codex/context/overview.md".to_string()),
+                git_branch: Some("rewrite-codex-2gether-v2".to_string()),
+                stale_state: Some(ContextStaleState::Fresh),
+            },
+        }],
+    );
+
+    assert_eq!(stripped_text, "Investigate expiry\n\n$file".to_string());
+    assert_eq!(
+        stripped_elements,
+        vec![TextElement::new(
+            ("Investigate expiry\n\n".len().."Investigate expiry\n\n$file".len()).into(),
+            Some(mention_token.to_string()),
+        )]
+    );
+}
+
+#[tokio::test]
+async fn together_handoff_review_snapshot() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.show_together_handoff_review(HandoffPlanResponse {
+        plan_id: "plan-1".to_string(),
+        source_thread_id: "thread-local-1".to_string(),
+        goal: Some("isolate mobile expiry investigation".to_string()),
+        selected_node_ids: vec![
+            "ctx:thread:thread-local-1".to_string(),
+            "ctx:file:.codex/context/token-refresh-invariant.md".to_string(),
+        ],
+        kept_refs: vec![
+            ContextRef {
+                ref_id: "ctx:thread:thread-local-1".to_string(),
+                kind: ContextKind::SharedThread,
+                display_label: "mobile refresh expiry".to_string(),
+                source_thread_id: Some("thread-local-1".to_string()),
+                repo_context_id: None,
+                git_branch: Some("rewrite-codex-2gether-v2".to_string()),
+                stale_state: Some(ContextStaleState::Fresh),
+            },
+            ContextRef {
+                ref_id: "ctx:file:.codex/context/token-refresh-invariant.md".to_string(),
+                kind: ContextKind::RepoContextFile,
+                display_label: "token-refresh-invariant".to_string(),
+                source_thread_id: None,
+                repo_context_id: Some(".codex/context/token-refresh-invariant.md".to_string()),
+                git_branch: Some("rewrite-codex-2gether-v2".to_string()),
+                stale_state: Some(ContextStaleState::Fresh),
+            },
+        ],
+        dropped_refs: Vec::new(),
+        token_estimate: 128,
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw handoff review");
+    assert_snapshot!("together_handoff_review", terminal.backend());
+}
+
+#[test]
+fn together_server_health_matches_expected_build_identity() {
+    let matching = TogetherHealthzResponse {
+        ok: true,
+        version: Some("0.0.0".to_string()),
+        commit: Some("abc123".to_string()),
+    };
+    let wrong_commit = TogetherHealthzResponse {
+        ok: true,
+        version: Some("0.0.0".to_string()),
+        commit: Some("def456".to_string()),
+    };
+
+    assert!(together_server_health_matches(
+        &matching,
+        "0.0.0",
+        Some("abc123")
+    ));
+    assert!(!together_server_health_matches(
+        &wrong_commit,
+        "0.0.0",
+        Some("abc123")
+    ));
+    assert!(together_server_health_matches(&matching, "0.0.0", None));
 }
 
 #[test]
@@ -5006,53 +5362,6 @@ async fn slash_exit_requests_exit() {
     assert_matches!(rx.try_recv(), Ok(AppEvent::Exit(ExitMode::ShutdownFirst)));
 }
 
-#[test]
-fn together_join_handshake_lines_include_right_side_joined_member_label() {
-    let local = "alice@example.com";
-    let joined = "new.member@example.com";
-    let members = vec![
-        ConnectedMember {
-            email: local.to_string(),
-            role: TogetherRole::Owner,
-        },
-        ConnectedMember {
-            email: joined.to_string(),
-            role: TogetherRole::Member,
-        },
-    ];
-    let lines = together_join_handshake_lines(local, joined, &members);
-    let rendered = lines_to_single_string(&lines);
-
-    assert!(rendered.contains("handshake"));
-    assert!(rendered.contains("alice@example.com  <->  new.member@example.com"));
-    assert!(!rendered.contains("(left)"));
-    assert!(!rendered.contains("(right)"));
-}
-
-#[test]
-fn together_join_handshake_lines_render_selected_variant_rows() {
-    let local = "alice@example.com";
-    let joined = "friend@example.com";
-    let members = vec![
-        ConnectedMember {
-            email: local.to_string(),
-            role: TogetherRole::Owner,
-        },
-        ConnectedMember {
-            email: joined.to_string(),
-            role: TogetherRole::Member,
-        },
-    ];
-    let variant = together_join_handshake_variant(joined);
-    let lines = together_join_handshake_lines(local, joined, &members);
-    let rendered = lines_to_single_string(&lines);
-
-    for row in variant {
-        let row_text = format!("{}{}{}", row.left, row.middle, row.right);
-        assert!(rendered.contains(&row_text));
-    }
-}
-
 #[tokio::test]
 async fn slash_clean_submits_background_terminal_cleanup() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
@@ -5136,13 +5445,13 @@ async fn slash_fork_requests_current_fork() {
 }
 
 #[tokio::test]
-async fn read_only_together_checkout_f_requests_fork() {
+async fn read_only_together_inspect_does_not_request_fork() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
     chat.set_together_checkout_mode(false, "owner@example.com");
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
 
-    assert_matches!(rx.try_recv(), Ok(AppEvent::ForkCurrentSession));
+    assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
 }
 
 #[tokio::test]
@@ -5153,6 +5462,17 @@ async fn read_only_together_checkout_escape_requests_exit() {
     chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::ExitReadOnlyTogetherCheckout));
+}
+
+#[tokio::test]
+async fn read_only_together_checkout_disables_normal_backtrack_mode() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    assert!(chat.is_normal_backtrack_mode());
+
+    chat.set_together_checkout_mode(false, "owner@example.com");
+
+    assert!(!chat.is_normal_backtrack_mode());
 }
 
 #[tokio::test]
@@ -8870,41 +9190,4 @@ async fn review_queues_user_messages_snapshot() {
     })
     .unwrap();
     assert_snapshot!(term.backend().vt100().screen().contents());
-}
-
-#[test]
-fn render_lineage_tree_includes_ancestors_and_marks_focused_thread() {
-    let response = TogetherHistoryLineageResponse {
-        root: "thread-child".to_string(),
-        nodes: vec![
-            LineageNode {
-                thread_id: "thread-parent".to_string(),
-                owner_email: "owner@example.com".to_string(),
-            },
-            LineageNode {
-                thread_id: "thread-child".to_string(),
-                owner_email: "alice@example.com".to_string(),
-            },
-            LineageNode {
-                thread_id: "thread-grandchild".to_string(),
-                owner_email: "bob@example.com".to_string(),
-            },
-        ],
-        edges: vec![
-            LineageEdge {
-                parent_thread_id: "thread-parent".to_string(),
-                child_thread_id: "thread-child".to_string(),
-                actor_email: "alice@example.com".to_string(),
-                created_at: "2026-03-08T10:00:00Z".to_string(),
-            },
-            LineageEdge {
-                parent_thread_id: "thread-child".to_string(),
-                child_thread_id: "thread-grandchild".to_string(),
-                actor_email: "bob@example.com".to_string(),
-                created_at: "2026-03-08T11:00:00Z".to_string(),
-            },
-        ],
-    };
-
-    assert_snapshot!(render_lineage_tree(&response));
 }

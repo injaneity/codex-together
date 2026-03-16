@@ -32,6 +32,7 @@ use codex_core::skills::model::SkillMetadata;
 use codex_file_search::FileMatch;
 use codex_protocol::request_user_input::RequestUserInputEvent;
 use codex_protocol::user_input::TextElement;
+use codex_together_protocol::ContextRef;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
@@ -65,6 +66,11 @@ pub(crate) struct MentionBinding {
     /// Canonical mention target (for example `app://...` or absolute SKILL.md path).
     pub(crate) path: String,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ContextBinding {
+    pub(crate) context_ref: ContextRef,
+}
 mod chat_composer;
 mod chat_composer_history;
 mod command_popup;
@@ -77,7 +83,6 @@ mod prompt_args;
 mod skill_popup;
 mod skills_toggle_view;
 mod slash_commands;
-mod together_center_view;
 pub(crate) use footer::CollaborationModeIndicator;
 pub(crate) use list_selection_view::ColumnWidthMode;
 pub(crate) use list_selection_view::SelectionViewParams;
@@ -93,10 +98,6 @@ pub(crate) use skills_toggle_view::SkillsToggleItem;
 pub(crate) use skills_toggle_view::SkillsToggleView;
 pub(crate) use status_line_setup::StatusLineItem;
 pub(crate) use status_line_setup::StatusLineSetupView;
-pub(crate) use together_center_view::TOGETHER_CENTER_VIEW_ID;
-pub(crate) use together_center_view::TogetherCenterView;
-pub(crate) use together_center_view::TogetherCenterViewParams;
-pub(crate) use together_center_view::TogetherPresenceState;
 mod paste_burst;
 mod pending_thread_approvals;
 pub mod popup_consts;
@@ -258,8 +259,16 @@ impl BottomPane {
         self.composer.take_mention_bindings()
     }
 
+    pub fn take_context_bindings(&mut self) -> Vec<ContextBinding> {
+        self.composer.take_context_bindings()
+    }
+
     pub fn take_recent_submission_mention_bindings(&mut self) -> Vec<MentionBinding> {
         self.composer.take_recent_submission_mention_bindings()
+    }
+
+    pub fn take_recent_submission_context_bindings(&mut self) -> Vec<ContextBinding> {
+        self.composer.take_recent_submission_context_bindings()
     }
 
     /// Clear pending attachments and mention bindings e.g. when a slash command doesn't submit text.
@@ -267,7 +276,9 @@ impl BottomPane {
         let _ = self.take_recent_submission_images_with_placeholders();
         let _ = self.take_remote_image_urls();
         let _ = self.take_recent_submission_mention_bindings();
+        let _ = self.take_recent_submission_context_bindings();
         let _ = self.take_mention_bindings();
+        let _ = self.take_context_bindings();
     }
 
     pub fn set_collaboration_modes_enabled(&mut self, enabled: bool) {
@@ -517,6 +528,25 @@ impl BottomPane {
     /// Use this when rehydrating a draft after a local validation/gating
     /// failure (for example unsupported image submit) so previously selected
     /// mention targets remain stable across retry.
+    pub(crate) fn set_composer_text_with_bindings(
+        &mut self,
+        text: String,
+        text_elements: Vec<TextElement>,
+        local_image_paths: Vec<PathBuf>,
+        mention_bindings: Vec<MentionBinding>,
+        context_bindings: Vec<ContextBinding>,
+    ) {
+        self.composer.set_text_content_with_bindings(
+            text,
+            text_elements,
+            local_image_paths,
+            mention_bindings,
+            context_bindings,
+        );
+        self.request_redraw();
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_composer_text_with_mention_bindings(
         &mut self,
         text: String,
@@ -524,12 +554,17 @@ impl BottomPane {
         local_image_paths: Vec<PathBuf>,
         mention_bindings: Vec<MentionBinding>,
     ) {
-        self.composer.set_text_content_with_mention_bindings(
+        self.set_composer_text_with_bindings(
             text,
             text_elements,
             local_image_paths,
             mention_bindings,
+            Vec::new(),
         );
+    }
+
+    pub(crate) fn move_composer_cursor_to_end(&mut self) {
+        self.composer.move_cursor_to_end();
         self.request_redraw();
     }
 
@@ -563,6 +598,25 @@ impl BottomPane {
 
     pub(crate) fn composer_mention_bindings(&self) -> Vec<MentionBinding> {
         self.composer.mention_bindings()
+    }
+
+    pub(crate) fn composer_context_bindings(&self) -> Vec<ContextBinding> {
+        self.composer.context_bindings()
+    }
+
+    pub(crate) fn on_together_context_search_result(
+        &mut self,
+        query: String,
+        results: Vec<codex_together_protocol::ContextSearchResult>,
+    ) {
+        self.composer
+            .on_together_context_search_result(query, results);
+        self.request_redraw();
+    }
+
+    pub(crate) fn insert_context_binding(&mut self, context_ref: ContextRef) {
+        self.composer.insert_context_binding(context_ref);
+        self.request_redraw();
     }
 
     #[cfg(test)]
@@ -776,24 +830,6 @@ impl BottomPane {
         self.view_stack.pop();
         let view = list_selection_view::ListSelectionView::new(params, self.app_event_tx.clone());
         self.push_view(Box::new(view));
-        true
-    }
-
-    pub(crate) fn replace_view_if_active(
-        &mut self,
-        view_id: &'static str,
-        view: Box<dyn BottomPaneView>,
-    ) -> bool {
-        let is_match = self
-            .view_stack
-            .last()
-            .is_some_and(|active| active.view_id() == Some(view_id));
-        if !is_match {
-            return false;
-        }
-
-        self.view_stack.pop();
-        self.push_view(view);
         true
     }
 

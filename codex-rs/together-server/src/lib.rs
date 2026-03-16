@@ -32,15 +32,17 @@ use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification as AppJsonRpcNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::RequestId;
-use codex_app_server_protocol::ThreadForkParams;
-use codex_app_server_protocol::ThreadForkResponse;
+use codex_app_server_protocol::SandboxMode as AppServerSandboxMode;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
+use codex_app_server_protocol::ThreadStartParams;
+use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::UserInput;
 use codex_core::RolloutRecorder;
 use codex_core::config::find_codex_home;
+use codex_core::git_info::current_branch_name;
 use codex_core::git_info::get_git_repo_root;
 use codex_core::git_info::get_head_commit_hash;
 use codex_protocol::ThreadId;
@@ -52,58 +54,65 @@ use codex_state::TogetherMemberRecord;
 use codex_state::TogetherRole as StateTogetherRole;
 use codex_state::TogetherServerRecord;
 use codex_state::TogetherThreadAclRecord;
-use codex_state::TogetherThreadForkRecord;
-use codex_together_protocol::CheckoutReason;
 use codex_together_protocol::ConnectedMember;
+use codex_together_protocol::ContextGraphParams;
+use codex_together_protocol::ContextGraphResponse;
+use codex_together_protocol::ContextKind;
+use codex_together_protocol::ContextPreviewParams;
+use codex_together_protocol::ContextPreviewResponse;
+use codex_together_protocol::ContextRef;
+use codex_together_protocol::ContextResolveBundleParams;
+use codex_together_protocol::ContextResolveBundleResponse;
+use codex_together_protocol::ContextSearchParams;
+use codex_together_protocol::ContextSearchResponse;
+use codex_together_protocol::ContextSearchResult;
+use codex_together_protocol::ContextStaleState;
+use codex_together_protocol::ContextWriteCommitParams;
+use codex_together_protocol::ContextWriteCommitResponse;
+use codex_together_protocol::ContextWriteFilePlan;
+use codex_together_protocol::ContextWritePlanParams;
+use codex_together_protocol::ContextWritePlanResponse;
+use codex_together_protocol::HandoffCommitParams;
+use codex_together_protocol::HandoffCommitResponse;
+use codex_together_protocol::HandoffPlanParams;
+use codex_together_protocol::HandoffPlanResponse;
+use codex_together_protocol::HostStopResponse;
 use codex_together_protocol::JsonRpcNotification;
 use codex_together_protocol::JsonRpcRequest;
 use codex_together_protocol::JsonRpcResponse;
-use codex_together_protocol::LineageEdge;
-use codex_together_protocol::LineageNode;
+use codex_together_protocol::METHOD_CONTEXT_GRAPH;
+use codex_together_protocol::METHOD_CONTEXT_PREVIEW;
+use codex_together_protocol::METHOD_CONTEXT_RESOLVE_BUNDLE;
+use codex_together_protocol::METHOD_CONTEXT_SEARCH;
+use codex_together_protocol::METHOD_CONTEXT_WRITE_COMMIT;
+use codex_together_protocol::METHOD_CONTEXT_WRITE_PLAN;
+use codex_together_protocol::METHOD_HANDOFF_COMMIT;
+use codex_together_protocol::METHOD_HANDOFF_PLAN;
+use codex_together_protocol::METHOD_HOST_START;
+use codex_together_protocol::METHOD_HOST_STATUS;
+use codex_together_protocol::METHOD_HOST_STOP;
 use codex_together_protocol::METHOD_INITIALIZE;
 use codex_together_protocol::METHOD_INITIALIZED;
+use codex_together_protocol::METHOD_SESSION_JOIN;
+use codex_together_protocol::METHOD_SESSION_LEAVE;
+use codex_together_protocol::METHOD_THREAD_INSPECT;
+use codex_together_protocol::METHOD_THREAD_LIST;
+use codex_together_protocol::METHOD_THREAD_SHARE;
 use codex_together_protocol::METHOD_TOGETHER_AUTH;
-use codex_together_protocol::METHOD_TOGETHER_HISTORY_LINEAGE;
-use codex_together_protocol::METHOD_TOGETHER_JOIN;
-use codex_together_protocol::METHOD_TOGETHER_LEAVE;
-use codex_together_protocol::METHOD_TOGETHER_MEMBER_ADD;
-use codex_together_protocol::METHOD_TOGETHER_MEMBER_REMOVE;
-use codex_together_protocol::METHOD_TOGETHER_SERVER_CLOSE;
-use codex_together_protocol::METHOD_TOGETHER_SERVER_CREATE;
-use codex_together_protocol::METHOD_TOGETHER_SERVER_INFO;
-use codex_together_protocol::METHOD_TOGETHER_THREAD_CHECKOUT;
-use codex_together_protocol::METHOD_TOGETHER_THREAD_DELETE;
-use codex_together_protocol::METHOD_TOGETHER_THREAD_FORK;
-use codex_together_protocol::METHOD_TOGETHER_THREAD_LIST;
-use codex_together_protocol::METHOD_TOGETHER_THREAD_READ;
-use codex_together_protocol::METHOD_TOGETHER_THREAD_SHARE;
-use codex_together_protocol::NOTIFY_TOGETHER_CONNECTION_REVOKED;
+use codex_together_protocol::NOTIFY_HOST_STOPPED;
 use codex_together_protocol::NOTIFY_TOGETHER_MEMBER_UPDATED;
-use codex_together_protocol::NOTIFY_TOGETHER_SERVER_CLOSED;
-use codex_together_protocol::NOTIFY_TOGETHER_THREAD_FORKED;
 use codex_together_protocol::NOTIFY_TOGETHER_THREAD_SHARED;
 use codex_together_protocol::TogetherAuthRequest;
 use codex_together_protocol::TogetherAuthResponse;
-use codex_together_protocol::TogetherHistoryLineageRequest;
-use codex_together_protocol::TogetherHistoryLineageResponse;
 use codex_together_protocol::TogetherJoinRequest;
 use codex_together_protocol::TogetherJoinResponse;
 use codex_together_protocol::TogetherLeaveResponse;
-use codex_together_protocol::TogetherMemberUpdateRequest;
-use codex_together_protocol::TogetherMemberUpdateResponse;
 use codex_together_protocol::TogetherReplayMessage;
 use codex_together_protocol::TogetherReplayRole;
 use codex_together_protocol::TogetherRole;
-use codex_together_protocol::TogetherServerCloseResponse;
 use codex_together_protocol::TogetherServerCreateRequest;
 use codex_together_protocol::TogetherServerCreateResponse;
 use codex_together_protocol::TogetherServerInfoResponse;
-use codex_together_protocol::TogetherThreadCheckoutRequest;
-use codex_together_protocol::TogetherThreadCheckoutResponse;
-use codex_together_protocol::TogetherThreadDeleteRequest;
-use codex_together_protocol::TogetherThreadDeleteResponse;
-use codex_together_protocol::TogetherThreadForkRequest;
-use codex_together_protocol::TogetherThreadForkResponse;
 use codex_together_protocol::TogetherThreadListRequest;
 use codex_together_protocol::TogetherThreadListResponse;
 use codex_together_protocol::TogetherThreadReadRequest;
@@ -141,6 +150,9 @@ const RPC_ERR_OVERLOADED: i64 = -39007;
 
 const APP_SERVER_MAX_OVERLOAD_RETRIES: usize = 3;
 const APP_SERVER_OVERLOAD_BACKOFF_MS: [u64; APP_SERVER_MAX_OVERLOAD_RETRIES] = [100, 300, 900];
+const CONTEXT_DEFAULT_LIMIT: u32 = 40;
+const CONTEXT_MAX_LIMIT: u32 = 200;
+const CONTEXT_BODY_CHAR_LIMIT: usize = 4_000;
 
 #[derive(Clone)]
 struct AppState {
@@ -153,6 +165,8 @@ struct AppState {
 
 struct ServerState {
     hosted: Option<HostedServer>,
+    handoff_plans: HashMap<String, PendingHandoffPlan>,
+    context_write_plans: HashMap<String, PendingContextWritePlan>,
     connections: HashMap<Uuid, ConnectionEntry>,
 }
 
@@ -162,13 +176,28 @@ struct ConnectionEntry {
 }
 
 #[derive(Debug, Clone)]
+struct PendingHandoffPlan {
+    source_thread_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingContextWritePlan {
+    files: Vec<PendingContextWriteFile>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingContextWriteFile {
+    relative_path: String,
+    content: String,
+}
+
+#[derive(Debug, Clone)]
 struct HostedServer {
     server_id: String,
     owner_email: String,
     public_base_url: String,
     members: HashSet<String>,
     threads: HashMap<String, SharedThread>,
-    forks: Vec<ForkEdge>,
 }
 
 #[derive(Debug, Clone)]
@@ -179,14 +208,29 @@ struct SharedThread {
     preview: Option<String>,
     shared_at: String,
     history: Option<Vec<codex_protocol::protocol::RolloutItem>>,
+    repo_root: Option<String>,
+    git_branch: Option<String>,
+    git_sha: Option<String>,
+    git_origin_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
-struct ForkEdge {
-    parent_thread_id: String,
-    child_thread_id: String,
-    actor_email: String,
-    created_at: String,
+struct ContextDocument {
+    ref_id: String,
+    kind: ContextKind,
+    title: String,
+    summary: Option<String>,
+    location: Option<String>,
+    body: Option<String>,
+    search_text: String,
+}
+
+#[derive(Debug, Default)]
+struct RepoContextMetadata {
+    id: Option<String>,
+    title: Option<String>,
+    kind: Option<String>,
+    visibility: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -199,6 +243,7 @@ struct ConnectionContext {
 struct Healthz {
     ok: bool,
     version: &'static str,
+    commit: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -226,6 +271,8 @@ pub async fn run_main(listen: &str) -> Result<()> {
     let state = AppState {
         inner: Arc::new(Mutex::new(ServerState {
             hosted: None,
+            handoff_plans: HashMap::new(),
+            context_write_plans: HashMap::new(),
             connections: HashMap::new(),
         })),
         app_server: Arc::new(Mutex::new(app_server)),
@@ -254,6 +301,7 @@ async fn healthz() -> Json<Healthz> {
     Json(Healthz {
         ok: true,
         version: env!("CARGO_PKG_VERSION"),
+        commit: together_build_commit().await,
     })
 }
 
@@ -370,20 +418,22 @@ async fn handle_request(
         )
         .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed")),
         METHOD_TOGETHER_AUTH => together_auth(state, connection_id, ctx, req).await,
-        METHOD_TOGETHER_SERVER_CREATE => together_server_create(state, ctx, req).await,
-        METHOD_TOGETHER_SERVER_CLOSE => together_server_close(state, ctx, req).await,
-        METHOD_TOGETHER_MEMBER_ADD => update_member(state, ctx, req, true).await,
-        METHOD_TOGETHER_MEMBER_REMOVE => update_member(state, ctx, req, false).await,
-        METHOD_TOGETHER_SERVER_INFO => together_server_info(state, ctx, req).await,
-        METHOD_TOGETHER_THREAD_SHARE => together_thread_share(state, ctx, req).await,
-        METHOD_TOGETHER_THREAD_CHECKOUT => together_thread_checkout(state, ctx, req).await,
-        METHOD_TOGETHER_THREAD_READ => together_thread_read(state, ctx, req).await,
-        METHOD_TOGETHER_THREAD_FORK => together_thread_fork(state, ctx, req).await,
-        METHOD_TOGETHER_THREAD_DELETE => together_thread_delete(state, ctx, req).await,
-        METHOD_TOGETHER_THREAD_LIST => together_thread_list(state, ctx, req).await,
-        METHOD_TOGETHER_HISTORY_LINEAGE => together_history_lineage(state, ctx, req).await,
-        METHOD_TOGETHER_JOIN => together_join(state, ctx, req).await,
-        METHOD_TOGETHER_LEAVE => together_leave(state, connection_id, ctx, req).await,
+        METHOD_HOST_START => together_server_create(state, ctx, req).await,
+        METHOD_HOST_STATUS => together_server_info(state, ctx, req).await,
+        METHOD_HOST_STOP => host_stop(state, ctx, req).await,
+        METHOD_SESSION_JOIN => together_join(state, ctx, req).await,
+        METHOD_SESSION_LEAVE => together_leave(state, connection_id, ctx, req).await,
+        METHOD_THREAD_SHARE => together_thread_share(state, ctx, req).await,
+        METHOD_THREAD_LIST => together_thread_list(state, ctx, req).await,
+        METHOD_THREAD_INSPECT => together_thread_read(state, ctx, req).await,
+        METHOD_CONTEXT_SEARCH => context_search(state, ctx, req).await,
+        METHOD_CONTEXT_GRAPH => context_graph(state, ctx, req).await,
+        METHOD_CONTEXT_PREVIEW => context_preview(state, ctx, req).await,
+        METHOD_CONTEXT_RESOLVE_BUNDLE => context_resolve_bundle(state, ctx, req).await,
+        METHOD_HANDOFF_PLAN => handoff_plan(state, ctx, req).await,
+        METHOD_HANDOFF_COMMIT => handoff_commit(state, req).await,
+        METHOD_CONTEXT_WRITE_PLAN => context_write_plan(state, ctx, req).await,
+        METHOD_CONTEXT_WRITE_COMMIT => context_write_commit(state, req).await,
         _ => rpc_error(req.id, -32601, "method not found"),
     }
 }
@@ -471,7 +521,6 @@ async fn together_server_create(
             public_base_url: public_base_url.clone(),
             members: HashSet::from([owner_email.clone()]),
             threads: HashMap::new(),
-            forks: Vec::new(),
         };
         guard.hosted = Some(hosted);
     }
@@ -538,7 +587,7 @@ async fn together_server_create(
     .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
 }
 
-async fn together_server_close(
+async fn host_stop(
     state: &AppState,
     ctx: &ConnectionContext,
     req: JsonRpcRequest,
@@ -560,7 +609,7 @@ async fn together_server_close(
         guard.hosted = None;
         broadcast_notification(
             &guard,
-            NOTIFY_TOGETHER_SERVER_CLOSED,
+            NOTIFY_HOST_STOPPED,
             serde_json::json!({
                 "serverId": hosted.server_id,
                 "ownerEmail": hosted.owner_email,
@@ -598,86 +647,7 @@ async fn together_server_close(
         return rpc_error(req.id, -32603, "failed to persist together server close");
     }
 
-    JsonRpcResponse::ok(req.id, TogetherServerCloseResponse { closed: true })
-        .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
-}
-
-async fn update_member(
-    state: &AppState,
-    ctx: &ConnectionContext,
-    req: JsonRpcRequest,
-    add: bool,
-) -> JsonRpcResponse {
-    let payload: TogetherMemberUpdateRequest = match serde_json::from_value(req.params) {
-        Ok(p) => p,
-        Err(_) => return rpc_error(req.id, -32602, "invalid params"),
-    };
-
-    let caller_email = ctx
-        .email
-        .clone()
-        .unwrap_or_else(|| "guest@local".to_string());
-
-    let (server_id, changed) = {
-        let mut guard = state.inner.lock().await;
-        let (server_id, changed, notify_email) = {
-            let Some(hosted) = guard.hosted.as_mut() else {
-                return rpc_error(req.id, RPC_ERR_NOT_CONNECTED, "TOGETHER_NOT_CONNECTED");
-            };
-
-            if hosted.owner_email != caller_email {
-                return rpc_error(req.id, RPC_ERR_FORBIDDEN, "TOGETHER_FORBIDDEN");
-            }
-            if !add && payload.email == hosted.owner_email {
-                return rpc_error(req.id, RPC_ERR_FORBIDDEN, "cannot remove owner");
-            }
-
-            let changed = if add {
-                hosted.members.insert(payload.email.clone())
-            } else {
-                hosted.members.remove(&payload.email)
-            };
-
-            (hosted.server_id.clone(), changed, payload.email.clone())
-        };
-        broadcast_notification(
-            &guard,
-            NOTIFY_TOGETHER_MEMBER_UPDATED,
-            serde_json::json!({
-                "email": notify_email,
-                "added": add,
-            }),
-        );
-
-        if !add {
-            notify_connection_revoked(&guard, &notify_email);
-        }
-
-        (server_id, changed)
-    };
-
-    if changed {
-        let now = Utc::now().timestamp();
-        let role = StateTogetherRole::Member;
-        let removed_at = if add { None } else { Some(now) };
-
-        if let Err(err) = state
-            .state_db
-            .upsert_together_member(&TogetherMemberRecord {
-                server_id,
-                email: payload.email,
-                role,
-                added_at: now,
-                removed_at,
-            })
-            .await
-        {
-            error!(error = %err, "failed to persist together member update");
-            return rpc_error(req.id, -32603, "failed to persist member update");
-        }
-    }
-
-    JsonRpcResponse::ok(req.id, TogetherMemberUpdateResponse { updated: changed })
+    JsonRpcResponse::ok(req.id, HostStopResponse { stopped: true })
         .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
 }
 
@@ -749,6 +719,52 @@ async fn together_thread_share(
         .email
         .clone()
         .unwrap_or_else(|| "guest@local".to_string());
+    let visibility = match normalized_thread_visibility(payload.visibility.as_deref()) {
+        Some(value) => value,
+        None => return rpc_error(req.id, -32602, "visibility must be on|off|public|private"),
+    };
+    let shared_at = Utc::now().to_rfc3339();
+    let shared_at_epoch = Utc::now().timestamp();
+
+    if visibility == "private" {
+        let (owner_email, preview, response_shared_at) = {
+            let mut guard = state.inner.lock().await;
+            let Some(hosted) = guard.hosted.as_mut() else {
+                return rpc_error(req.id, RPC_ERR_NOT_CONNECTED, "TOGETHER_NOT_CONNECTED");
+            };
+
+            if member_role(hosted, &caller_email).is_none() {
+                return rpc_error(
+                    req.id,
+                    RPC_ERR_MEMBER_NOT_ALLOWED,
+                    "TOGETHER_MEMBER_NOT_ALLOWED",
+                );
+            }
+
+            if let Some(existing) = hosted.threads.get(&payload.thread_id)
+                && existing.owner_email != caller_email
+            {
+                return rpc_error(req.id, RPC_ERR_FORBIDDEN, "TOGETHER_FORBIDDEN");
+            }
+
+            match hosted.threads.remove(&payload.thread_id) {
+                Some(existing) => (existing.owner_email, existing.preview, existing.shared_at),
+                None => (caller_email.clone(), None, shared_at.clone()),
+            }
+        };
+
+        return JsonRpcResponse::ok(
+            req.id,
+            TogetherThreadShareResponse {
+                thread_id: payload.thread_id,
+                owner_email,
+                preview,
+                shared_at: response_shared_at,
+                visibility: Some(visibility),
+            },
+        )
+        .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"));
+    }
 
     let has_existing_shared = {
         let guard = state.inner.lock().await;
@@ -827,8 +843,6 @@ async fn together_thread_share(
             forkable_history_from_rollout(thread.path.as_ref()).await,
         )
     };
-    let shared_at = Utc::now().to_rfc3339();
-    let shared_at_epoch = Utc::now().timestamp();
 
     let (server_id, owner_email) = {
         let mut guard = state.inner.lock().await;
@@ -866,6 +880,10 @@ async fn together_thread_share(
                     preview: preview.clone(),
                     shared_at: shared_at.clone(),
                     history: shared_history.clone(),
+                    repo_root: payload.repo_root.clone(),
+                    git_branch: payload.git_branch.clone(),
+                    git_sha: payload.git_sha.clone(),
+                    git_origin_url: payload.git_origin_url.clone(),
                 },
             );
 
@@ -912,53 +930,7 @@ async fn together_thread_share(
             owner_email,
             preview,
             shared_at,
-        },
-    )
-    .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
-}
-
-async fn together_thread_checkout(
-    state: &AppState,
-    ctx: &ConnectionContext,
-    req: JsonRpcRequest,
-) -> JsonRpcResponse {
-    let payload: TogetherThreadCheckoutRequest = match serde_json::from_value(req.params) {
-        Ok(p) => p,
-        Err(_) => return rpc_error(req.id, -32602, "invalid params"),
-    };
-    let email = ctx
-        .email
-        .clone()
-        .unwrap_or_else(|| "guest@local".to_string());
-
-    let guard = state.inner.lock().await;
-    let Some(hosted) = guard.hosted.as_ref() else {
-        return rpc_error(req.id, RPC_ERR_NOT_CONNECTED, "TOGETHER_NOT_CONNECTED");
-    };
-    if member_role(hosted, &email).is_none() {
-        return rpc_error(
-            req.id,
-            RPC_ERR_MEMBER_NOT_ALLOWED,
-            "TOGETHER_MEMBER_NOT_ALLOWED",
-        );
-    }
-
-    let Some(thread) = hosted.threads.get(&payload.thread_id) else {
-        return rpc_error(req.id, -32602, "thread not shared");
-    };
-    let writable = thread.owner_email == email;
-
-    JsonRpcResponse::ok(
-        req.id,
-        TogetherThreadCheckoutResponse {
-            thread_id: thread.thread_id.clone(),
-            writable,
-            owner_email: thread.owner_email.clone(),
-            reason: if writable {
-                None
-            } else {
-                Some(CheckoutReason::NonOwnerMustFork)
-            },
+            visibility: Some(visibility),
         },
     )
     .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
@@ -1014,7 +986,7 @@ async fn together_thread_read(
 
     let thread_read = {
         let mut bridge = state.app_server.lock().await;
-        match bridge.thread_read(payload.thread_id.clone(), true).await {
+        match thread_read_with_turn_fallback(&mut bridge, payload.thread_id.as_str()).await {
             Ok(response) => response,
             Err(err) => return app_server_error_response(req.id, err),
         }
@@ -1027,324 +999,6 @@ async fn together_thread_read(
             owner_email,
             history: forkable_history_from_rollout(thread_read.thread.path.as_ref()).await,
             messages: replay_messages_from_turns(&thread_read.thread.turns),
-        },
-    )
-    .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
-}
-
-async fn together_thread_fork(
-    state: &AppState,
-    ctx: &ConnectionContext,
-    req: JsonRpcRequest,
-) -> JsonRpcResponse {
-    let payload: TogetherThreadForkRequest = match serde_json::from_value(req.params) {
-        Ok(p) => p,
-        Err(_) => return rpc_error(req.id, -32602, "invalid params"),
-    };
-    let caller_email = ctx
-        .email
-        .clone()
-        .unwrap_or_else(|| "guest@local".to_string());
-
-    let parent_snapshot = {
-        let guard = state.inner.lock().await;
-        let Some(hosted) = guard.hosted.as_ref() else {
-            return rpc_error(req.id, RPC_ERR_NOT_CONNECTED, "TOGETHER_NOT_CONNECTED");
-        };
-        if member_role(hosted, &caller_email).is_none() {
-            return rpc_error(
-                req.id,
-                RPC_ERR_MEMBER_NOT_ALLOWED,
-                "TOGETHER_MEMBER_NOT_ALLOWED",
-            );
-        }
-        if !hosted.threads.contains_key(&payload.thread_id) {
-            return rpc_error(req.id, -32602, "thread not shared");
-        }
-        hosted
-            .threads
-            .get(&payload.thread_id)
-            .and_then(|thread| thread.history.clone())
-    };
-
-    if let Some(history) = parent_snapshot {
-        if history.is_empty() {
-            return rpc_error(
-                req.id,
-                -32602,
-                "cannot fork thread: no persisted turns yet; send at least one message first",
-            );
-        }
-
-        let child_thread_id = ThreadId::default().to_string();
-        let child_thread_owner_email = caller_email.clone();
-        let preview = rollout_history_preview(history.as_slice());
-        let now = Utc::now();
-        let created_at = now.to_rfc3339();
-        let created_at_epoch = now.timestamp();
-        let child_history = Some(canonicalize_forked_history(
-            &child_thread_id,
-            &payload.thread_id,
-            &created_at,
-            history.clone(),
-        ));
-
-        let server_id = {
-            let mut guard = state.inner.lock().await;
-            let (server_id, edge) = {
-                let Some(hosted) = guard.hosted.as_mut() else {
-                    return rpc_error(req.id, RPC_ERR_NOT_CONNECTED, "TOGETHER_NOT_CONNECTED");
-                };
-
-                hosted.threads.insert(
-                    child_thread_id.clone(),
-                    SharedThread {
-                        thread_id: child_thread_id.clone(),
-                        owner_email: caller_email.clone(),
-                        shared_by_email: caller_email.clone(),
-                        preview,
-                        shared_at: created_at.clone(),
-                        history: child_history.clone(),
-                    },
-                );
-
-                let edge = ForkEdge {
-                    parent_thread_id: payload.thread_id.clone(),
-                    child_thread_id: child_thread_id.clone(),
-                    actor_email: caller_email.clone(),
-                    created_at: created_at.clone(),
-                };
-                hosted.forks.push(edge.clone());
-
-                (hosted.server_id.clone(), edge)
-            };
-            broadcast_notification(
-                &guard,
-                NOTIFY_TOGETHER_THREAD_FORKED,
-                serde_json::json!({
-                    "parentThreadId": edge.parent_thread_id,
-                    "childThreadId": edge.child_thread_id,
-                    "actorEmail": edge.actor_email,
-                    "createdAt": edge.created_at,
-                }),
-            );
-
-            server_id
-        };
-
-        if let Err(err) = state
-            .state_db
-            .upsert_together_thread_acl(&TogetherThreadAclRecord {
-                server_id: server_id.clone(),
-                thread_id: child_thread_id.clone(),
-                owner_email: caller_email.clone(),
-                shared_by_email: caller_email.clone(),
-                shared_at: created_at_epoch,
-            })
-            .await
-        {
-            error!(error = %err, "failed to persist forked thread ACL");
-            return rpc_error(req.id, -32603, "failed to persist fork metadata");
-        }
-
-        if let Err(err) = state
-            .state_db
-            .insert_together_thread_fork(&TogetherThreadForkRecord {
-                server_id,
-                child_thread_id: child_thread_id.clone(),
-                parent_thread_id: payload.thread_id.clone(),
-                actor_email: caller_email,
-                created_at: created_at_epoch,
-            })
-            .await
-        {
-            error!(error = %err, "failed to persist thread fork edge");
-            return rpc_error(req.id, -32603, "failed to persist fork metadata");
-        }
-
-        return JsonRpcResponse::ok(
-            req.id,
-            TogetherThreadForkResponse {
-                parent_thread_id: payload.thread_id,
-                child_thread_id,
-                owner_email: child_thread_owner_email,
-                history: child_history,
-                writable: true,
-            },
-        )
-        .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"));
-    }
-
-    {
-        let mut bridge = state.app_server.lock().await;
-        let parent_read = match bridge.thread_read(payload.thread_id.clone(), true).await {
-            Ok(response) => response,
-            Err(err) => return app_server_error_response(req.id.clone(), err),
-        };
-        if parent_read.thread.turns.is_empty() {
-            return rpc_error(
-                req.id,
-                -32602,
-                "cannot fork thread: no persisted turns yet; send at least one message first",
-            );
-        }
-    }
-
-    let forked = {
-        let mut bridge = state.app_server.lock().await;
-        match bridge
-            .thread_fork(payload.thread_id.clone(), payload.cwd.clone())
-            .await
-        {
-            Ok(response) => response,
-            Err(err) => return app_server_error_response(req.id, err),
-        }
-    };
-
-    let child_thread_id = forked.thread.id.clone();
-    let child_thread_owner_email = caller_email.clone();
-    let preview = non_empty_string(forked.thread.preview);
-    let child_history = forkable_history_from_rollout(forked.thread.path.as_ref()).await;
-    let now = Utc::now();
-    let created_at = now.to_rfc3339();
-    let created_at_epoch = now.timestamp();
-
-    let server_id = {
-        let mut guard = state.inner.lock().await;
-        let (server_id, edge) = {
-            let Some(hosted) = guard.hosted.as_mut() else {
-                return rpc_error(req.id, RPC_ERR_NOT_CONNECTED, "TOGETHER_NOT_CONNECTED");
-            };
-
-            hosted.threads.insert(
-                child_thread_id.clone(),
-                SharedThread {
-                    thread_id: child_thread_id.clone(),
-                    owner_email: caller_email.clone(),
-                    shared_by_email: caller_email.clone(),
-                    preview,
-                    shared_at: created_at.clone(),
-                    history: child_history.clone(),
-                },
-            );
-
-            let edge = ForkEdge {
-                parent_thread_id: payload.thread_id.clone(),
-                child_thread_id: child_thread_id.clone(),
-                actor_email: caller_email.clone(),
-                created_at: created_at.clone(),
-            };
-            hosted.forks.push(edge.clone());
-
-            (hosted.server_id.clone(), edge)
-        };
-        broadcast_notification(
-            &guard,
-            NOTIFY_TOGETHER_THREAD_FORKED,
-            serde_json::json!({
-                "parentThreadId": edge.parent_thread_id,
-                "childThreadId": edge.child_thread_id,
-                "actorEmail": edge.actor_email,
-                "createdAt": edge.created_at,
-            }),
-        );
-
-        server_id
-    };
-
-    if let Err(err) = state
-        .state_db
-        .upsert_together_thread_acl(&TogetherThreadAclRecord {
-            server_id: server_id.clone(),
-            thread_id: child_thread_id.clone(),
-            owner_email: caller_email.clone(),
-            shared_by_email: caller_email.clone(),
-            shared_at: created_at_epoch,
-        })
-        .await
-    {
-        error!(error = %err, "failed to persist forked thread ACL");
-        return rpc_error(req.id, -32603, "failed to persist fork metadata");
-    }
-
-    if let Err(err) = state
-        .state_db
-        .insert_together_thread_fork(&TogetherThreadForkRecord {
-            server_id,
-            child_thread_id: child_thread_id.clone(),
-            parent_thread_id: payload.thread_id.clone(),
-            actor_email: caller_email,
-            created_at: created_at_epoch,
-        })
-        .await
-    {
-        error!(error = %err, "failed to persist thread fork edge");
-        return rpc_error(req.id, -32603, "failed to persist fork metadata");
-    }
-
-    JsonRpcResponse::ok(
-        req.id,
-        TogetherThreadForkResponse {
-            parent_thread_id: payload.thread_id,
-            child_thread_id,
-            owner_email: child_thread_owner_email,
-            history: child_history,
-            writable: true,
-        },
-    )
-    .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
-}
-
-async fn together_thread_delete(
-    state: &AppState,
-    ctx: &ConnectionContext,
-    req: JsonRpcRequest,
-) -> JsonRpcResponse {
-    let payload: TogetherThreadDeleteRequest = match serde_json::from_value(req.params) {
-        Ok(p) => p,
-        Err(_) => return rpc_error(req.id, -32602, "invalid params"),
-    };
-    let caller_email = ctx
-        .email
-        .clone()
-        .unwrap_or_else(|| "guest@local".to_string());
-
-    let deleted = {
-        let mut guard = state.inner.lock().await;
-        let Some(hosted) = guard.hosted.as_mut() else {
-            return rpc_error(req.id, RPC_ERR_NOT_CONNECTED, "TOGETHER_NOT_CONNECTED");
-        };
-        if member_role(hosted, &caller_email).is_none() {
-            return rpc_error(
-                req.id,
-                RPC_ERR_MEMBER_NOT_ALLOWED,
-                "TOGETHER_MEMBER_NOT_ALLOWED",
-            );
-        }
-
-        let Some(thread) = hosted.threads.get(&payload.thread_id) else {
-            return rpc_error(req.id, -32602, "thread not shared");
-        };
-        if thread.owner_email != caller_email {
-            return rpc_error(req.id, RPC_ERR_FORBIDDEN, "TOGETHER_FORBIDDEN");
-        }
-
-        if hosted.threads.remove(&payload.thread_id).is_some() {
-            hosted.forks.retain(|edge| {
-                edge.parent_thread_id != payload.thread_id
-                    && edge.child_thread_id != payload.thread_id
-            });
-            true
-        } else {
-            false
-        }
-    };
-
-    JsonRpcResponse::ok(
-        req.id,
-        TogetherThreadDeleteResponse {
-            thread_id: payload.thread_id,
-            deleted,
         },
     )
     .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
@@ -1387,6 +1041,10 @@ async fn together_thread_list(
             owner_email: thread.owner_email.clone(),
             preview: thread.preview.clone(),
             created_at: thread.shared_at.clone(),
+            repo_root: thread.repo_root.clone(),
+            git_branch: thread.git_branch.clone(),
+            git_sha: thread.git_sha.clone(),
+            git_origin_url: thread.git_origin_url.clone(),
         })
         .collect();
 
@@ -1400,6 +1058,26 @@ async fn together_thread_list(
                     .preview
                     .as_ref()
                     .map(|p| p.to_lowercase().contains(&term_lower))
+                    .unwrap_or(false)
+                || row
+                    .repo_root
+                    .as_ref()
+                    .map(|value| value.to_lowercase().contains(&term_lower))
+                    .unwrap_or(false)
+                || row
+                    .git_branch
+                    .as_ref()
+                    .map(|value| value.to_lowercase().contains(&term_lower))
+                    .unwrap_or(false)
+                || row
+                    .git_sha
+                    .as_ref()
+                    .map(|value| value.to_lowercase().contains(&term_lower))
+                    .unwrap_or(false)
+                || row
+                    .git_origin_url
+                    .as_ref()
+                    .map(|value| value.to_lowercase().contains(&term_lower))
                     .unwrap_or(false)
         });
     }
@@ -1419,62 +1097,341 @@ async fn together_thread_list(
     .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
 }
 
-async fn together_history_lineage(
+async fn context_search(
     state: &AppState,
     ctx: &ConnectionContext,
     req: JsonRpcRequest,
 ) -> JsonRpcResponse {
-    let payload: TogetherHistoryLineageRequest = match serde_json::from_value(req.params) {
+    let payload: ContextSearchParams = match serde_json::from_value(req.params) {
         Ok(p) => p,
         Err(_) => return rpc_error(req.id, -32602, "invalid params"),
     };
 
-    let email = ctx
-        .email
-        .clone()
-        .unwrap_or_else(|| "guest@local".to_string());
+    JsonRpcResponse::ok(
+        req.id,
+        ContextSearchResponse {
+            data: context_search_results(
+                state,
+                ctx,
+                payload.query.as_deref(),
+                payload.limit.unwrap_or(CONTEXT_DEFAULT_LIMIT),
+            )
+            .await,
+        },
+    )
+    .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
+}
 
-    let guard = state.inner.lock().await;
-    let Some(hosted) = guard.hosted.as_ref() else {
-        return rpc_error(req.id, RPC_ERR_NOT_CONNECTED, "TOGETHER_NOT_CONNECTED");
+async fn context_graph(
+    state: &AppState,
+    ctx: &ConnectionContext,
+    req: JsonRpcRequest,
+) -> JsonRpcResponse {
+    let payload: ContextGraphParams = match serde_json::from_value(req.params) {
+        Ok(p) => p,
+        Err(_) => return rpc_error(req.id, -32602, "invalid params"),
     };
-    if member_role(hosted, &email).is_none() {
-        return rpc_error(
-            req.id,
-            RPC_ERR_MEMBER_NOT_ALLOWED,
-            "TOGETHER_MEMBER_NOT_ALLOWED",
-        );
-    }
-
-    let edges = lineage_edges(hosted, &payload.root_thread_id);
-    let mut node_ids = HashSet::from([payload.root_thread_id.clone()]);
-    for edge in &edges {
-        node_ids.insert(edge.parent_thread_id.clone());
-        node_ids.insert(edge.child_thread_id.clone());
-    }
-
-    let mut nodes: Vec<LineageNode> = node_ids
-        .into_iter()
-        .map(|thread_id| {
-            let owner_email = hosted
-                .threads
-                .get(&thread_id)
-                .map(|thread| thread.owner_email.clone())
-                .unwrap_or_else(|| "unknown".to_string());
-            LineageNode {
-                thread_id,
-                owner_email,
-            }
-        })
-        .collect();
-    nodes.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
 
     JsonRpcResponse::ok(
         req.id,
-        TogetherHistoryLineageResponse {
-            root: payload.root_thread_id,
-            nodes,
-            edges,
+        ContextGraphResponse {
+            nodes: context_search_results(
+                state,
+                ctx,
+                payload.query.as_deref(),
+                payload.limit.unwrap_or(CONTEXT_DEFAULT_LIMIT),
+            )
+            .await,
+            edges: Vec::new(),
+        },
+    )
+    .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
+}
+
+async fn context_preview(
+    state: &AppState,
+    ctx: &ConnectionContext,
+    req: JsonRpcRequest,
+) -> JsonRpcResponse {
+    let payload: ContextPreviewParams = match serde_json::from_value(req.params) {
+        Ok(p) => p,
+        Err(_) => return rpc_error(req.id, -32602, "invalid params"),
+    };
+
+    let item = context_documents(state, ctx)
+        .await
+        .into_iter()
+        .find(|document| document.ref_id == payload.ref_id)
+        .map(ContextDocument::into_search_result);
+
+    JsonRpcResponse::ok(req.id, ContextPreviewResponse { item })
+        .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
+}
+
+async fn context_resolve_bundle(
+    state: &AppState,
+    ctx: &ConnectionContext,
+    req: JsonRpcRequest,
+) -> JsonRpcResponse {
+    let payload: ContextResolveBundleParams = match serde_json::from_value(req.params) {
+        Ok(p) => p,
+        Err(_) => return rpc_error(req.id, -32602, "invalid params"),
+    };
+
+    let response = build_context_bundle(state, ctx, payload.context_refs).await;
+    JsonRpcResponse::ok(req.id, response)
+        .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
+}
+
+async fn context_write_plan(
+    state: &AppState,
+    ctx: &ConnectionContext,
+    req: JsonRpcRequest,
+) -> JsonRpcResponse {
+    let payload: ContextWritePlanParams = match serde_json::from_value(req.params) {
+        Ok(p) => p,
+        Err(_) => return rpc_error(req.id, -32602, "invalid params"),
+    };
+    if payload.selected_ref_ids.is_empty() {
+        return rpc_error(req.id, -32602, "selectedRefIds is required");
+    }
+
+    let repo_root = match resolve_context_root() {
+        Ok(path) => path,
+        Err(err) => {
+            return rpc_error(
+                req.id,
+                -32603,
+                format!("failed to resolve collaboration context root: {err}"),
+            );
+        }
+    };
+    let branch = match payload.branch {
+        Some(branch) => non_empty_string(branch).unwrap_or_default(),
+        None => current_branch_name(repo_root.as_path())
+            .await
+            .unwrap_or_default(),
+    };
+
+    let documents = context_documents(state, ctx).await;
+    let planned_files = plan_context_write_files(
+        repo_root.as_path(),
+        documents,
+        &payload.selected_ref_ids,
+        non_empty_string(branch),
+    );
+    if planned_files.is_empty() {
+        return rpc_error(req.id, -32602, "no context refs matched selectedRefIds");
+    }
+
+    let plan_id = Uuid::new_v4().to_string();
+    let files = planned_files
+        .iter()
+        .map(|file| ContextWriteFilePlan {
+            path: file.relative_path.clone(),
+            title: file.title.clone(),
+            kind: file.kind.clone(),
+            exists: file.exists,
+            content: file.content.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    {
+        let mut guard = state.inner.lock().await;
+        guard.context_write_plans.insert(
+            plan_id.clone(),
+            PendingContextWritePlan {
+                files: planned_files
+                    .into_iter()
+                    .map(|file| PendingContextWriteFile {
+                        relative_path: file.relative_path,
+                        content: file.content,
+                    })
+                    .collect(),
+            },
+        );
+    }
+
+    JsonRpcResponse::ok(req.id, ContextWritePlanResponse { plan_id, files })
+        .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
+}
+
+async fn context_write_commit(state: &AppState, req: JsonRpcRequest) -> JsonRpcResponse {
+    let payload: ContextWriteCommitParams = match serde_json::from_value(req.params) {
+        Ok(p) => p,
+        Err(_) => return rpc_error(req.id, -32602, "invalid params"),
+    };
+
+    let pending = {
+        let mut guard = state.inner.lock().await;
+        match guard.context_write_plans.remove(&payload.plan_id) {
+            Some(plan) => plan,
+            None => return rpc_error(req.id, -32602, "unknown context write plan"),
+        }
+    };
+
+    let repo_root = match resolve_context_root() {
+        Ok(path) => path,
+        Err(err) => {
+            return rpc_error(
+                req.id,
+                -32603,
+                format!("failed to resolve collaboration context root: {err}"),
+            );
+        }
+    };
+
+    let mut written_files = Vec::with_capacity(pending.files.len());
+    for file in pending.files {
+        let path = repo_root.join(&file.relative_path);
+        if let Some(parent) = path.parent()
+            && let Err(err) = std::fs::create_dir_all(parent)
+        {
+            return rpc_error(
+                req.id,
+                -32603,
+                format!("failed to create {}: {err}", parent.display()),
+            );
+        }
+        if let Err(err) = std::fs::write(&path, file.content) {
+            return rpc_error(
+                req.id,
+                -32603,
+                format!("failed to write {}: {err}", path.display()),
+            );
+        }
+        written_files.push(file.relative_path);
+    }
+
+    JsonRpcResponse::ok(req.id, ContextWriteCommitResponse { written_files })
+        .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
+}
+
+async fn handoff_plan(
+    state: &AppState,
+    ctx: &ConnectionContext,
+    req: JsonRpcRequest,
+) -> JsonRpcResponse {
+    let payload: HandoffPlanParams = match serde_json::from_value(req.params) {
+        Ok(p) => p,
+        Err(_) => return rpc_error(req.id, -32602, "invalid params"),
+    };
+
+    let Some(source_thread_id) = payload.source_thread_id else {
+        return rpc_error(req.id, -32602, "sourceThreadId is required");
+    };
+
+    let documents = context_documents(state, ctx).await;
+    let source_entry = {
+        let mut bridge = state.app_server.lock().await;
+        match source_thread_context_entry(&mut bridge, &source_thread_id).await {
+            Ok(entry) => entry,
+            Err(err) if app_server_thread_not_loaded(&err) => {
+                let expected_ref_id = format!("ctx:thread:{source_thread_id}");
+                match documents
+                    .iter()
+                    .find(|document| document.ref_id == expected_ref_id)
+                {
+                    Some(document) => resolved_entry_from_document(document.clone()),
+                    None => return app_server_error_response(req.id, err),
+                }
+            }
+            Err(err) => return app_server_error_response(req.id, err),
+        }
+    };
+
+    let mut kept_entries = vec![source_entry];
+    kept_entries.extend(selected_context_entries(
+        documents,
+        &payload.selected_ref_ids,
+    ));
+    dedupe_context_entries(&mut kept_entries);
+
+    let kept_refs = kept_entries
+        .iter()
+        .map(|entry| entry.context_ref.clone())
+        .collect::<Vec<_>>();
+    let token_estimate = estimate_context_bundle_tokens(&kept_entries);
+    let plan_id = Uuid::new_v4().to_string();
+    let goal = payload.goal.filter(|value| !value.trim().is_empty());
+
+    {
+        let mut guard = state.inner.lock().await;
+        guard.handoff_plans.insert(
+            plan_id.clone(),
+            PendingHandoffPlan {
+                source_thread_id: source_thread_id.clone(),
+            },
+        );
+    }
+
+    JsonRpcResponse::ok(
+        req.id,
+        HandoffPlanResponse {
+            plan_id,
+            source_thread_id,
+            goal,
+            selected_node_ids: kept_refs.iter().map(|entry| entry.ref_id.clone()).collect(),
+            kept_refs,
+            dropped_refs: Vec::new(),
+            token_estimate,
+        },
+    )
+    .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
+}
+
+async fn handoff_commit(state: &AppState, req: JsonRpcRequest) -> JsonRpcResponse {
+    let payload: HandoffCommitParams = match serde_json::from_value(req.params) {
+        Ok(p) => p,
+        Err(_) => return rpc_error(req.id, -32602, "invalid params"),
+    };
+
+    let pending = {
+        let guard = state.inner.lock().await;
+        match guard.handoff_plans.get(&payload.plan_id) {
+            Some(plan) => plan.clone(),
+            None => return rpc_error(req.id, -32602, "unknown handoff plan"),
+        }
+    };
+
+    let mut bridge = state.app_server.lock().await;
+    let cwd = match payload.cwd {
+        Some(cwd) => cwd,
+        None => match source_thread_cwd(&mut bridge, &pending.source_thread_id).await {
+            Ok(cwd) => cwd,
+            Err(err) => return app_server_error_response(req.id, err),
+        },
+    };
+
+    let started = match bridge
+        .thread_start(
+            Some(cwd.clone()),
+            payload.model,
+            payload.approval_policy,
+            payload.sandbox,
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => return app_server_error_response(req.id, err),
+    };
+
+    {
+        let mut guard = state.inner.lock().await;
+        guard.handoff_plans.remove(&payload.plan_id);
+    }
+
+    JsonRpcResponse::ok(
+        req.id,
+        HandoffCommitResponse {
+            thread_id: started.thread.id.clone(),
+            source_thread_id: pending.source_thread_id,
+            rollout_path: started
+                .thread
+                .path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            cwd: started.cwd.display().to_string(),
         },
     )
     .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
@@ -1630,6 +1587,19 @@ fn member_role(hosted: &HostedServer, email: &str) -> Option<TogetherRole> {
     None
 }
 
+fn normalized_thread_visibility(value: Option<&str>) -> Option<String> {
+    match value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("on") | Some("public") => Some("public".to_string()),
+        Some("off") | Some("private") => Some("private".to_string()),
+        Some(_) => None,
+    }
+}
+
 fn default_actor_id(connection_id: Uuid) -> String {
     let short = connection_id.simple().to_string();
     format!("anon+{}@local", &short[..12])
@@ -1718,119 +1688,957 @@ fn broadcast_notification(state: &ServerState, method: &str, params: Value) {
     }
 }
 
-fn notify_connection_revoked(state: &ServerState, target_email: &str) {
-    let note = JsonRpcNotification {
-        jsonrpc: "2.0".to_string(),
-        method: NOTIFY_TOGETHER_CONNECTION_REVOKED.to_string(),
-        params: serde_json::json!({
-            "email": target_email,
-        }),
-    };
-
-    if let Ok(text) = serde_json::to_string(&note) {
-        for entry in state.connections.values() {
-            if entry.email.as_deref() == Some(target_email) {
-                let _ = entry.tx.send(text.clone());
-            }
+impl ContextDocument {
+    fn into_search_result(self) -> ContextSearchResult {
+        ContextSearchResult {
+            ref_id: self.ref_id,
+            kind: self.kind,
+            title: self.title,
+            summary: self.summary,
+            location: self.location,
+            body: self.body,
         }
     }
 }
 
-fn lineage_edges(hosted: &HostedServer, root: &str) -> Vec<LineageEdge> {
-    let all_edges = merged_lineage_edges(hosted);
-    let mut connected_nodes = HashSet::from([root.to_string()]);
-    let mut frontier = vec![root.to_string()];
+#[derive(Debug, Clone)]
+struct ResolvedContextEntry {
+    context_ref: ContextRef,
+    bundle_text: String,
+}
 
-    while let Some(node_id) = frontier.pop() {
-        for edge in &all_edges {
-            let neighbor = if edge.parent_thread_id == node_id {
-                Some(edge.child_thread_id.clone())
-            } else if edge.child_thread_id == node_id {
-                Some(edge.parent_thread_id.clone())
-            } else {
-                None
-            };
+#[derive(Debug, Clone)]
+struct PlannedContextWriteFile {
+    relative_path: String,
+    title: String,
+    kind: String,
+    exists: bool,
+    content: String,
+}
 
-            if let Some(neighbor) = neighbor
-                && connected_nodes.insert(neighbor.clone())
-            {
-                frontier.push(neighbor);
-            }
+async fn context_search_results(
+    state: &AppState,
+    ctx: &ConnectionContext,
+    query: Option<&str>,
+    limit: u32,
+) -> Vec<ContextSearchResult> {
+    let documents = context_documents(state, ctx).await;
+    search_context_documents(documents, query, limit)
+}
+
+async fn context_documents(state: &AppState, ctx: &ConnectionContext) -> Vec<ContextDocument> {
+    let email = ctx
+        .email
+        .clone()
+        .unwrap_or_else(|| "guest@local".to_string());
+    let hosted = {
+        let guard = state.inner.lock().await;
+        guard.hosted.clone()
+    };
+
+    let repo_root = match resolve_context_root() {
+        Ok(path) => path,
+        Err(err) => {
+            warn!(error = %err, "failed to resolve collaboration context root");
+            return shared_thread_context_documents(hosted.as_ref(), &email);
         }
+    };
+
+    let mut documents = repo_context_documents(repo_root.as_path());
+    documents.extend(shared_thread_context_documents(hosted.as_ref(), &email));
+    documents.sort_by_key(context_default_sort_key);
+    documents
+}
+
+fn resolve_context_root() -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
+    Ok(get_git_repo_root(&cwd).unwrap_or(cwd))
+}
+
+fn search_context_documents(
+    documents: Vec<ContextDocument>,
+    query: Option<&str>,
+    limit: u32,
+) -> Vec<ContextSearchResult> {
+    let limit = limit.clamp(1, CONTEXT_MAX_LIMIT) as usize;
+    let query = query.map(str::trim).filter(|value| !value.is_empty());
+
+    let mut documents = match query {
+        Some(query) => {
+            let query_lower = query.to_ascii_lowercase();
+            let tokens = query_lower.split_whitespace().collect::<Vec<_>>();
+            let mut scored = documents
+                .into_iter()
+                .filter_map(|document| {
+                    document_matches_query(&document, &tokens).then(|| {
+                        (
+                            context_match_score(&document, &query_lower, &tokens),
+                            document,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            scored.sort_by(|(score_a, doc_a), (score_b, doc_b)| {
+                score_b.cmp(score_a).then_with(|| {
+                    context_default_sort_key(doc_a).cmp(&context_default_sort_key(doc_b))
+                })
+            });
+            scored.into_iter().map(|(_, document)| document).collect()
+        }
+        None => documents,
+    };
+
+    if documents.len() > limit {
+        documents.truncate(limit);
     }
 
-    all_edges
+    documents
         .into_iter()
-        .filter(|edge| {
-            connected_nodes.contains(&edge.parent_thread_id)
-                && connected_nodes.contains(&edge.child_thread_id)
+        .map(ContextDocument::into_search_result)
+        .collect()
+}
+
+fn context_match_score(document: &ContextDocument, query: &str, tokens: &[&str]) -> usize {
+    let title = document.title.to_ascii_lowercase();
+    let summary = document
+        .summary
+        .clone()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let location = document
+        .location
+        .clone()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let body = document
+        .body
+        .clone()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    let mut score = 0usize;
+    if title.contains(query) {
+        score += 100;
+    }
+    if location.contains(query) {
+        score += 80;
+    }
+    if summary.contains(query) {
+        score += 60;
+    }
+    if body.contains(query) {
+        score += 40;
+    }
+    score
+        + tokens
+            .iter()
+            .filter(|token| {
+                title.contains(**token)
+                    || summary.contains(**token)
+                    || location.contains(**token)
+                    || body.contains(**token)
+            })
+            .count()
+}
+
+fn document_matches_query(document: &ContextDocument, tokens: &[&str]) -> bool {
+    if tokens.is_empty() {
+        return true;
+    }
+
+    tokens
+        .iter()
+        .all(|token| document.search_text.contains(*token))
+}
+
+fn context_default_sort_key(document: &ContextDocument) -> (u8, String, String) {
+    let kind_rank = match document.kind {
+        ContextKind::RepoContextFile => 0,
+        ContextKind::SharedThread => 1,
+    };
+    (
+        kind_rank,
+        document.title.to_ascii_lowercase(),
+        document.ref_id.clone(),
+    )
+}
+
+fn repo_context_documents(repo_root: &Path) -> Vec<ContextDocument> {
+    let context_root = repo_root.join(".codex").join("context");
+    let mut markdown_files = Vec::new();
+    collect_markdown_files(context_root.as_path(), &mut markdown_files);
+    markdown_files.sort();
+
+    markdown_files
+        .into_iter()
+        .filter_map(|path| repo_context_document(repo_root, path.as_path()))
+        .collect()
+}
+
+fn collect_markdown_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_markdown_files(path.as_path(), out);
+        } else if file_type.is_file()
+            && path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+        {
+            out.push(path);
+        }
+    }
+}
+
+fn repo_context_document(repo_root: &Path, path: &Path) -> Option<ContextDocument> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) => {
+            warn!(error = %err, path = %path.display(), "failed to read repo context file");
+            return None;
+        }
+    };
+
+    let relative_path = path
+        .strip_prefix(repo_root)
+        .ok()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| path.to_path_buf());
+    let (frontmatter, body) = split_optional_frontmatter(&content);
+    let metadata = frontmatter
+        .as_deref()
+        .map(parse_repo_context_metadata)
+        .unwrap_or_default();
+    let body = body.trim();
+    let title = metadata
+        .title
+        .clone()
+        .or_else(|| first_markdown_heading(body))
+        .or_else(|| {
+            path.file_stem()
+                .and_then(|value| value.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| relative_path.display().to_string());
+    let location = relative_path.display().to_string();
+    let summary = repo_context_summary(&metadata, body);
+    let body = non_empty_string(truncate_context_body(body));
+    let search_text = format!(
+        "{}\n{}\n{}\n{}\n{}",
+        title,
+        summary.clone().unwrap_or_default(),
+        location,
+        frontmatter.unwrap_or_default(),
+        body.clone().unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+
+    Some(ContextDocument {
+        ref_id: format!("ctx:file:{location}"),
+        kind: ContextKind::RepoContextFile,
+        title,
+        summary,
+        location: Some(location),
+        body,
+        search_text,
+    })
+}
+
+fn repo_context_summary(metadata: &RepoContextMetadata, body: &str) -> Option<String> {
+    let leading_line = first_meaningful_body_line(body);
+    match (
+        metadata.kind.as_deref(),
+        metadata.visibility.as_deref(),
+        leading_line,
+    ) {
+        (Some(kind), Some(visibility), Some(line)) => {
+            Some(format!("{kind} · {visibility} · {line}"))
+        }
+        (Some(kind), Some(visibility), None) => Some(format!("{kind} · {visibility}")),
+        (Some(kind), None, Some(line)) => Some(format!("{kind} · {line}")),
+        (None, Some(visibility), Some(line)) => Some(format!("{visibility} · {line}")),
+        (Some(kind), None, None) => Some(kind.to_string()),
+        (None, Some(visibility), None) => Some(visibility.to_string()),
+        (None, None, Some(line)) => Some(line),
+        (None, None, None) => None,
+    }
+}
+
+fn split_optional_frontmatter(content: &str) -> (Option<String>, &str) {
+    let Some(rest) = content.strip_prefix("---\n") else {
+        return (None, content);
+    };
+    let Some(frontmatter_end) = rest.find("\n---\n") else {
+        return (None, content);
+    };
+    let frontmatter = rest[..frontmatter_end].to_string();
+    let body_start = frontmatter_end + "\n---\n".len();
+    (Some(frontmatter), &rest[body_start..])
+}
+
+fn parse_repo_context_metadata(frontmatter: &str) -> RepoContextMetadata {
+    let mut metadata = RepoContextMetadata::default();
+    for line in frontmatter.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("id:") {
+            metadata.id = non_empty_string(strip_yaml_quotes(value).to_string());
+        } else if let Some(value) = trimmed.strip_prefix("title:") {
+            metadata.title = non_empty_string(strip_yaml_quotes(value).to_string());
+        } else if let Some(value) = trimmed.strip_prefix("kind:") {
+            metadata.kind = non_empty_string(strip_yaml_quotes(value).to_string());
+        } else if let Some(value) = trimmed.strip_prefix("visibility:") {
+            metadata.visibility = non_empty_string(strip_yaml_quotes(value).to_string());
+        }
+    }
+    metadata
+}
+
+fn strip_yaml_quotes(value: &str) -> &str {
+    value.trim().trim_matches('"').trim_matches('\'')
+}
+
+fn first_markdown_heading(body: &str) -> Option<String> {
+    body.lines()
+        .find_map(|line| line.trim().strip_prefix("# ").map(str::trim))
+        .map(str::to_string)
+}
+
+fn first_meaningful_body_line(body: &str) -> Option<String> {
+    body.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+}
+
+fn shared_thread_context_documents(
+    hosted: Option<&HostedServer>,
+    email: &str,
+) -> Vec<ContextDocument> {
+    let Some(hosted) = hosted else {
+        return Vec::new();
+    };
+    if member_role(hosted, email).is_none() {
+        return Vec::new();
+    }
+
+    let mut threads = hosted.threads.values().cloned().collect::<Vec<_>>();
+    threads.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
+    threads
+        .into_iter()
+        .map(|thread| {
+            let title = thread
+                .preview
+                .clone()
+                .unwrap_or_else(|| thread.thread_id.clone());
+            let summary = Some(format!(
+                "owner={} · shared_by={} · shared_at={}",
+                thread.owner_email, thread.shared_by_email, thread.shared_at
+            ));
+            let location = format!("thread/{}", thread.thread_id);
+            let body = shared_thread_context_body(&thread);
+            let search_text = format!(
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                title,
+                summary.clone().unwrap_or_default(),
+                location,
+                thread.thread_id,
+                thread.repo_root.clone().unwrap_or_default(),
+                thread.git_branch.clone().unwrap_or_default(),
+                thread.git_sha.clone().unwrap_or_default(),
+                thread.git_origin_url.clone().unwrap_or_default(),
+                body.clone().unwrap_or_default()
+            )
+            .to_ascii_lowercase();
+
+            ContextDocument {
+                ref_id: format!("ctx:thread:{}", thread.thread_id),
+                kind: ContextKind::SharedThread,
+                title,
+                summary,
+                location: Some(location),
+                body,
+                search_text,
+            }
         })
         .collect()
 }
 
-fn merged_lineage_edges(hosted: &HostedServer) -> Vec<LineageEdge> {
-    let mut by_child = HashMap::new();
-    for edge in &hosted.forks {
-        by_child.insert(
-            edge.child_thread_id.clone(),
-            LineageEdge {
-                parent_thread_id: edge.parent_thread_id.clone(),
-                child_thread_id: edge.child_thread_id.clone(),
-                actor_email: edge.actor_email.clone(),
-                created_at: edge.created_at.clone(),
-            },
-        );
+fn shared_thread_context_body(thread: &SharedThread) -> Option<String> {
+    let mut lines = vec![
+        format!("Thread: {}", thread.thread_id),
+        format!("Owner: {}", thread.owner_email),
+        format!("Shared by: {}", thread.shared_by_email),
+        format!("Shared at: {}", thread.shared_at),
+    ];
+    if let Some(preview) = non_empty_string(thread.preview.clone().unwrap_or_default()) {
+        lines.push(format!("Preview: {preview}"));
+    }
+    if let Some(repo_root) = non_empty_string(thread.repo_root.clone().unwrap_or_default()) {
+        lines.push(format!("Repo root: {repo_root}"));
+    }
+    if let Some(git_branch) = non_empty_string(thread.git_branch.clone().unwrap_or_default()) {
+        lines.push(format!("Git branch: {git_branch}"));
+    }
+    if let Some(git_sha) = non_empty_string(thread.git_sha.clone().unwrap_or_default()) {
+        lines.push(format!("Git SHA: {git_sha}"));
+    }
+    if let Some(git_origin_url) =
+        non_empty_string(thread.git_origin_url.clone().unwrap_or_default())
+    {
+        lines.push(format!("Git origin: {git_origin_url}"));
     }
 
-    for thread in hosted.threads.values() {
-        let Some(edge) = implicit_lineage_edge(thread) else {
-            continue;
-        };
-        by_child.entry(edge.child_thread_id.clone()).or_insert(edge);
+    if let Some(history) = thread.history.as_deref() {
+        let replay = replay_messages_from_history(history);
+        if !replay.is_empty() {
+            lines.push(String::new());
+            lines.push("Recent transcript:".to_string());
+            for message in replay.into_iter().take(8) {
+                let role = match message.role {
+                    TogetherReplayRole::User => "User",
+                    TogetherReplayRole::Assistant => "Assistant",
+                    TogetherReplayRole::System => "System",
+                };
+                lines.push(format!(
+                    "{role}: {}",
+                    single_line_excerpt(&message.text, 180)
+                ));
+            }
+        }
     }
 
-    let mut edges: Vec<_> = by_child.into_values().collect();
-    edges.sort_by(|a, b| {
-        a.created_at
-            .cmp(&b.created_at)
-            .then_with(|| a.parent_thread_id.cmp(&b.parent_thread_id))
-            .then_with(|| a.child_thread_id.cmp(&b.child_thread_id))
-    });
-    edges
+    non_empty_string(truncate_context_body(&lines.join("\n")))
 }
 
-fn implicit_lineage_edge(thread: &SharedThread) -> Option<LineageEdge> {
-    let meta = history_session_meta(thread.history.as_deref()?)?;
-    let child_thread_id = thread.thread_id.clone();
-    let history_thread_id = meta.id.to_string();
-    let (parent_thread_id, created_at) = if history_thread_id == child_thread_id {
-        (
-            meta.forked_from_id.as_ref()?.to_string(),
-            non_empty_string(meta.timestamp.clone()).unwrap_or_else(|| thread.shared_at.clone()),
-        )
-    } else {
-        (history_thread_id, thread.shared_at.clone())
+async fn build_context_bundle(
+    state: &AppState,
+    ctx: &ConnectionContext,
+    context_refs: Vec<ContextRef>,
+) -> ContextResolveBundleResponse {
+    if context_refs.is_empty() {
+        return ContextResolveBundleResponse {
+            bundle_text: String::new(),
+            kept_refs: Vec::new(),
+            dropped_refs: Vec::new(),
+        };
+    }
+
+    let documents = context_documents(state, ctx).await;
+    let mut kept_entries = Vec::new();
+    let mut dropped_refs = Vec::new();
+    for context_ref in context_refs {
+        if let Some(entry) = resolved_entry_for_ref(&documents, &context_ref) {
+            kept_entries.push(entry);
+        } else {
+            dropped_refs.push(ContextRef {
+                stale_state: Some(ContextStaleState::Unavailable),
+                ..context_ref
+            });
+        }
+    }
+    dedupe_context_entries(&mut kept_entries);
+    let kept_refs = kept_entries
+        .iter()
+        .map(|entry| entry.context_ref.clone())
+        .collect::<Vec<_>>();
+
+    ContextResolveBundleResponse {
+        bundle_text: render_context_bundle(&kept_entries),
+        kept_refs,
+        dropped_refs,
+    }
+}
+
+fn selected_context_entries(
+    documents: Vec<ContextDocument>,
+    selected_ref_ids: &[String],
+) -> Vec<ResolvedContextEntry> {
+    if selected_ref_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let selected = selected_ref_ids.iter().cloned().collect::<HashSet<_>>();
+    documents
+        .into_iter()
+        .filter(|document| selected.contains(&document.ref_id))
+        .map(resolved_entry_from_document)
+        .collect()
+}
+
+fn resolved_entry_for_ref(
+    documents: &[ContextDocument],
+    context_ref: &ContextRef,
+) -> Option<ResolvedContextEntry> {
+    documents
+        .iter()
+        .find(|document| document.ref_id == context_ref.ref_id)
+        .cloned()
+        .map(resolved_entry_from_document)
+}
+
+fn dedupe_context_entries(entries: &mut Vec<ResolvedContextEntry>) {
+    let mut seen = HashSet::new();
+    entries.retain(|entry| seen.insert(entry.context_ref.ref_id.clone()));
+}
+
+fn estimate_context_bundle_tokens(entries: &[ResolvedContextEntry]) -> u32 {
+    let chars = entries
+        .iter()
+        .map(|entry| entry.bundle_text.chars().count())
+        .sum::<usize>();
+    ((chars / 4).max(1)).try_into().unwrap_or(u32::MAX)
+}
+
+fn resolved_entry_from_document(document: ContextDocument) -> ResolvedContextEntry {
+    let context_ref = context_ref_from_document(&document);
+    let bundle_text = document_bundle_text(&document);
+    ResolvedContextEntry {
+        context_ref,
+        bundle_text,
+    }
+}
+
+fn context_ref_from_document(document: &ContextDocument) -> ContextRef {
+    let (source_thread_id, repo_context_id) = match document.kind {
+        ContextKind::SharedThread => (
+            document
+                .ref_id
+                .strip_prefix("ctx:thread:")
+                .map(str::to_string),
+            None,
+        ),
+        ContextKind::RepoContextFile => (None, document.location.clone()),
     };
 
-    if parent_thread_id == child_thread_id {
-        return None;
+    ContextRef {
+        ref_id: document.ref_id.clone(),
+        kind: document.kind,
+        display_label: document.title.clone(),
+        source_thread_id,
+        repo_context_id,
+        git_branch: None,
+        stale_state: Some(ContextStaleState::Fresh),
+    }
+}
+
+fn document_bundle_text(document: &ContextDocument) -> String {
+    let kind = match document.kind {
+        ContextKind::SharedThread => "shared thread",
+        ContextKind::RepoContextFile => "repo context",
+    };
+    let mut lines = vec![
+        format!("[Context: {}]", document.title),
+        format!("Kind: {kind}"),
+    ];
+    if let Some(location) = &document.location {
+        lines.push(format!("Location: {location}"));
+    }
+    if let Some(summary) = &document.summary {
+        lines.push(format!("Summary: {summary}"));
+    }
+    if let Some(body) = &document.body
+        && !body.trim().is_empty()
+    {
+        lines.push(String::new());
+        lines.push(body.trim().to_string());
+    }
+    lines.join("\n")
+}
+
+fn render_context_bundle(entries: &[ResolvedContextEntry]) -> String {
+    entries
+        .iter()
+        .map(|entry| entry.bundle_text.clone())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+async fn source_thread_context_entry(
+    bridge: &mut AppServerBridge,
+    thread_id: &str,
+) -> Result<ResolvedContextEntry, AppServerError> {
+    let thread_read = thread_read_with_turn_fallback(bridge, thread_id).await?;
+    let thread = thread_read.thread;
+    let title = thread
+        .name
+        .clone()
+        .or_else(|| non_empty_string(thread.preview.clone()))
+        .unwrap_or_else(|| thread.id.clone());
+    let location = format!("thread/{}", thread.id);
+    let summary = Some(format!(
+        "local thread · cwd={} · updated_at={}",
+        thread.cwd.display(),
+        thread.updated_at
+    ));
+    let body = local_thread_context_body(&thread);
+    let document = ContextDocument {
+        ref_id: format!("ctx:thread:{}", thread.id),
+        kind: ContextKind::SharedThread,
+        title,
+        summary,
+        location: Some(location),
+        body,
+        search_text: String::new(),
+    };
+
+    Ok(resolved_entry_from_document(document))
+}
+
+async fn thread_read_with_turn_fallback(
+    bridge: &mut AppServerBridge,
+    thread_id: &str,
+) -> Result<ThreadReadResponse, AppServerError> {
+    match bridge.thread_read(thread_id.to_string(), true).await {
+        Ok(response) => Ok(response),
+        Err(err) if app_server_thread_not_loaded(&err) => {
+            bridge.thread_read(thread_id.to_string(), false).await
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn source_thread_cwd(
+    bridge: &mut AppServerBridge,
+    thread_id: &str,
+) -> Result<String, AppServerError> {
+    let thread_read = bridge.thread_read(thread_id.to_string(), false).await?;
+    Ok(thread_read.thread.cwd.display().to_string())
+}
+
+fn local_thread_context_body(thread: &codex_app_server_protocol::Thread) -> Option<String> {
+    let mut lines = vec![
+        format!("Thread: {}", thread.id),
+        format!("Cwd: {}", thread.cwd.display()),
+        format!("Updated at: {}", thread.updated_at),
+    ];
+    if let Some(name) = &thread.name {
+        lines.push(format!("Title: {name}"));
+    }
+    if let Some(preview) = non_empty_string(thread.preview.clone()) {
+        lines.push(format!("Preview: {preview}"));
     }
 
-    Some(LineageEdge {
-        parent_thread_id,
-        child_thread_id,
-        actor_email: thread.shared_by_email.clone(),
-        created_at,
+    let replay = replay_messages_from_turns(&thread.turns);
+    if !replay.is_empty() {
+        lines.push(String::new());
+        lines.push("Recent transcript:".to_string());
+        for message in replay.into_iter().take(8) {
+            let role = match message.role {
+                TogetherReplayRole::User => "User",
+                TogetherReplayRole::Assistant => "Assistant",
+                TogetherReplayRole::System => "System",
+            };
+            lines.push(format!(
+                "{role}: {}",
+                single_line_excerpt(&message.text, 180)
+            ));
+        }
+    }
+
+    non_empty_string(truncate_context_body(&lines.join("\n")))
+}
+
+fn truncate_context_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.chars().count() <= CONTEXT_BODY_CHAR_LIMIT {
+        return trimmed.to_string();
+    }
+    let truncated = trimmed
+        .chars()
+        .take(CONTEXT_BODY_CHAR_LIMIT)
+        .collect::<String>();
+    format!("{truncated}\n…")
+}
+
+fn plan_context_write_files(
+    repo_root: &Path,
+    documents: Vec<ContextDocument>,
+    selected_ref_ids: &[String],
+    branch: Option<String>,
+) -> Vec<PlannedContextWriteFile> {
+    let documents_by_ref = documents
+        .into_iter()
+        .map(|document| (document.ref_id.clone(), document))
+        .collect::<HashMap<_, _>>();
+    let mut used_paths = HashSet::new();
+
+    selected_ref_ids
+        .iter()
+        .filter_map(|ref_id| documents_by_ref.get(ref_id))
+        .filter_map(|document| {
+            plan_context_write_file(repo_root, document, branch.clone(), &mut used_paths)
+        })
+        .collect()
+}
+
+fn plan_context_write_file(
+    repo_root: &Path,
+    document: &ContextDocument,
+    branch: Option<String>,
+    used_paths: &mut HashSet<String>,
+) -> Option<PlannedContextWriteFile> {
+    let existing_relative_path = document.location.clone().filter(|location| {
+        document.kind == ContextKind::RepoContextFile && location.ends_with(".md")
+    });
+    let existing_content = existing_relative_path
+        .as_ref()
+        .and_then(|relative_path| std::fs::read_to_string(repo_root.join(relative_path)).ok());
+    let existing_metadata = existing_content
+        .as_deref()
+        .map(split_optional_frontmatter)
+        .and_then(|(frontmatter, _)| frontmatter)
+        .map(|frontmatter| parse_repo_context_metadata(frontmatter.as_str()))
+        .unwrap_or_default();
+
+    let kind = existing_metadata
+        .kind
+        .clone()
+        .unwrap_or_else(|| inferred_context_write_kind(document));
+    let title = existing_metadata
+        .title
+        .clone()
+        .unwrap_or_else(|| document.title.clone());
+    let relative_path = context_write_relative_path(
+        repo_root,
+        document,
+        kind.as_str(),
+        existing_relative_path,
+        used_paths,
+    );
+    let exists = repo_root.join(&relative_path).exists();
+    let id = existing_metadata
+        .id
+        .clone()
+        .unwrap_or_else(|| context_write_id_from_path(&relative_path));
+    let visibility = existing_metadata
+        .visibility
+        .unwrap_or_else(|| "repo".to_string());
+    let source_threads = document
+        .ref_id
+        .strip_prefix("ctx:thread:")
+        .map(|thread_id| vec![thread_id.to_string()])
+        .unwrap_or_default();
+    let source_files = match (&document.kind, &document.location) {
+        (ContextKind::RepoContextFile, Some(location)) => vec![location.clone()],
+        _ => Vec::new(),
+    };
+    let content = render_context_write_file(
+        ContextWriteMetadata {
+            id,
+            kind: kind.clone(),
+            title: title.clone(),
+            branch,
+            source_threads,
+            source_files,
+            last_validated_at: Utc::now().format("%Y-%m-%d").to_string(),
+            visibility,
+        },
+        context_write_body(document, existing_content.as_deref()),
+    );
+
+    Some(PlannedContextWriteFile {
+        relative_path,
+        title,
+        kind,
+        exists,
+        content,
     })
 }
 
-fn history_session_meta(
-    history: &[codex_protocol::protocol::RolloutItem],
-) -> Option<&codex_protocol::protocol::SessionMeta> {
-    history.iter().find_map(|item| match item {
-        codex_protocol::protocol::RolloutItem::SessionMeta(meta_line) => Some(&meta_line.meta),
-        _ => None,
-    })
+#[derive(Debug)]
+struct ContextWriteMetadata {
+    id: String,
+    kind: String,
+    title: String,
+    branch: Option<String>,
+    source_threads: Vec<String>,
+    source_files: Vec<String>,
+    last_validated_at: String,
+    visibility: String,
+}
+
+fn render_context_write_file(metadata: ContextWriteMetadata, body: String) -> String {
+    let mut lines = vec![
+        "---".to_string(),
+        format!("id: {}", yaml_quoted(&metadata.id)),
+        format!("kind: {}", yaml_quoted(&metadata.kind)),
+        format!("title: {}", yaml_quoted(&metadata.title)),
+        "applies_to:".to_string(),
+    ];
+    if let Some(branch) = metadata.branch {
+        lines.push("  branches:".to_string());
+        lines.push(format!("    - {}", yaml_quoted(&branch)));
+    } else {
+        lines.push("  branches: []".to_string());
+    }
+    lines.extend(render_yaml_list("source_threads", &metadata.source_threads));
+    lines.extend(render_yaml_list("source_files", &metadata.source_files));
+    lines.push(format!("last_validated_at: {}", metadata.last_validated_at));
+    lines.push(format!("visibility: {}", yaml_quoted(&metadata.visibility)));
+    lines.push("---".to_string());
+    lines.push(String::new());
+    lines.push(body.trim().to_string());
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn render_yaml_list(label: &str, values: &[String]) -> Vec<String> {
+    if values.is_empty() {
+        return vec![format!("{label}: []")];
+    }
+
+    let mut lines = vec![format!("{label}:")];
+    for value in values {
+        lines.push(format!("  - {}", yaml_quoted(value)));
+    }
+    lines
+}
+
+fn yaml_quoted(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn context_write_relative_path(
+    repo_root: &Path,
+    document: &ContextDocument,
+    kind: &str,
+    existing_relative_path: Option<String>,
+    used_paths: &mut HashSet<String>,
+) -> String {
+    if let Some(relative_path) = existing_relative_path
+        && used_paths.insert(relative_path.clone())
+    {
+        return relative_path;
+    }
+
+    let directory = context_write_directory_for_kind(kind);
+    let slug = slugify_context_value(document.title.as_str());
+    let mut candidate = format!(".codex/context/{directory}/{slug}.md");
+    let mut suffix = 2usize;
+    while !used_paths.insert(candidate.clone()) || repo_root.join(&candidate).exists() {
+        candidate = format!(".codex/context/{directory}/{slug}-{suffix}.md");
+        suffix += 1;
+    }
+    candidate
+}
+
+fn context_write_directory_for_kind(kind: &str) -> &'static str {
+    match kind {
+        "decision" => "decisions",
+        "playbook" => "playbooks",
+        "hotspot" => "hotspots",
+        _ => "concepts",
+    }
+}
+
+fn inferred_context_write_kind(document: &ContextDocument) -> String {
+    let haystack = format!(
+        "{} {} {}",
+        document.title,
+        document.summary.clone().unwrap_or_default(),
+        document.body.clone().unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    if haystack.contains("decision") || haystack.contains("tradeoff") {
+        "decision".to_string()
+    } else if haystack.contains("playbook")
+        || haystack.contains("workflow")
+        || haystack.contains("debug")
+    {
+        "playbook".to_string()
+    } else if haystack.contains("hotspot")
+        || haystack.contains("sharp edge")
+        || haystack.contains("failure")
+        || haystack.contains("expiry")
+    {
+        "hotspot".to_string()
+    } else {
+        "concept".to_string()
+    }
+}
+
+fn context_write_id_from_path(path: &str) -> String {
+    Path::new(path)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "context-note".to_string())
+}
+
+fn slugify_context_value(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        "context-note".to_string()
+    } else {
+        slug
+    }
+}
+
+fn context_write_body(document: &ContextDocument, existing_content: Option<&str>) -> String {
+    if let Some(existing_content) = existing_content {
+        let (_, body) = split_optional_frontmatter(existing_content);
+        if !body.trim().is_empty() {
+            return body.trim().to_string();
+        }
+    }
+
+    let mut lines = vec![format!("# {}", document.title)];
+    if let Some(summary) = &document.summary {
+        lines.push(String::new());
+        lines.push(summary.clone());
+    }
+    if let Some(body) = &document.body
+        && !body.trim().is_empty()
+    {
+        lines.push(String::new());
+        lines.push("## Details".to_string());
+        lines.push(String::new());
+        lines.push(body.trim().to_string());
+    }
+    lines.push(String::new());
+    lines.push("## Sources".to_string());
+    lines.push(String::new());
+    match (&document.kind, &document.location) {
+        (ContextKind::SharedThread, _) => {
+            if let Some(thread_id) = document.ref_id.strip_prefix("ctx:thread:") {
+                lines.push(format!("- shared thread: {thread_id}"));
+            }
+        }
+        (ContextKind::RepoContextFile, Some(location)) => {
+            lines.push(format!("- repo context: {location}"));
+        }
+        (ContextKind::RepoContextFile, None) => {}
+    }
+    lines.join("\n")
+}
+
+fn single_line_excerpt(text: &str, max_chars: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+    let truncated = collapsed.chars().take(max_chars).collect::<String>();
+    format!("{truncated}…")
 }
 
 fn replay_messages_from_turns(turns: &[Turn]) -> Vec<TogetherReplayMessage> {
@@ -1913,25 +2721,6 @@ fn canonicalize_shared_history(
             .find(|item| matches!(item, codex_protocol::protocol::RolloutItem::SessionMeta(_)))
     {
         meta_line.meta.id = shared_thread_id;
-    }
-    history
-}
-
-fn canonicalize_forked_history(
-    thread_id: &str,
-    parent_thread_id: &str,
-    created_at: &str,
-    mut history: Vec<codex_protocol::protocol::RolloutItem>,
-) -> Vec<codex_protocol::protocol::RolloutItem> {
-    if let Some(codex_protocol::protocol::RolloutItem::SessionMeta(meta_line)) = history
-        .iter_mut()
-        .find(|item| matches!(item, codex_protocol::protocol::RolloutItem::SessionMeta(_)))
-    {
-        if let Ok(shared_thread_id) = ThreadId::from_string(thread_id) {
-            meta_line.meta.id = shared_thread_id;
-        }
-        meta_line.meta.forked_from_id = ThreadId::from_string(parent_thread_id).ok();
-        meta_line.meta.timestamp = created_at.to_string();
     }
     history
 }
@@ -2048,6 +2837,23 @@ fn app_server_thread_not_loaded(err: &AppServerError) -> bool {
             if (*code == -32600 || *code == -32602 || *code == -32603)
                 && message.to_ascii_lowercase().contains("thread not loaded")
     )
+}
+
+fn thread_start_sandbox_mode_from_policy(
+    policy: codex_protocol::protocol::SandboxPolicy,
+) -> Option<AppServerSandboxMode> {
+    match policy {
+        codex_protocol::protocol::SandboxPolicy::DangerFullAccess => {
+            Some(AppServerSandboxMode::DangerFullAccess)
+        }
+        codex_protocol::protocol::SandboxPolicy::ReadOnly { .. } => {
+            Some(AppServerSandboxMode::ReadOnly)
+        }
+        codex_protocol::protocol::SandboxPolicy::WorkspaceWrite { .. } => {
+            Some(AppServerSandboxMode::WorkspaceWrite)
+        }
+        codex_protocol::protocol::SandboxPolicy::ExternalSandbox { .. } => None,
+    }
 }
 
 #[derive(Debug)]
@@ -2185,30 +2991,37 @@ impl AppServerBridge {
         .await
     }
 
-    async fn thread_fork(
+    async fn thread_start(
         &mut self,
-        thread_id: String,
         cwd: Option<String>,
-    ) -> Result<ThreadForkResponse, AppServerError> {
-        let params = ThreadForkParams {
-            thread_id,
-            path: None,
-            model: None,
-            model_provider: None,
-            cwd,
-            approval_policy: None,
-            sandbox: None,
-            config: None,
-            base_instructions: None,
-            developer_instructions: None,
-            persist_extended_history: false,
-        };
-
+        model: Option<String>,
+        approval_policy: Option<codex_protocol::protocol::AskForApproval>,
+        sandbox: Option<codex_protocol::protocol::SandboxPolicy>,
+    ) -> Result<ThreadStartResponse, AppServerError> {
+        let approval_policy = approval_policy.map(Into::into);
+        let sandbox = sandbox.and_then(thread_start_sandbox_mode_from_policy);
         self.request_with_retry(
-            "thread/fork",
-            serde_json::to_value(params).map_err(|err| {
+            "thread/start",
+            serde_json::to_value(ThreadStartParams {
+                model,
+                model_provider: None,
+                cwd,
+                approval_policy,
+                sandbox,
+                config: None,
+                service_name: None,
+                base_instructions: None,
+                developer_instructions: None,
+                personality: None,
+                ephemeral: None,
+                dynamic_tools: None,
+                mock_experimental_field: None,
+                experimental_raw_events: false,
+                persist_extended_history: false,
+            })
+            .map_err(|err| {
                 AppServerError::Decode(anyhow::anyhow!(
-                    "failed to serialize thread/fork params: {err}"
+                    "failed to serialize thread/start params: {err}"
                 ))
             })?,
         )
@@ -2461,19 +3274,19 @@ fn is_pid_running(_pid: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::ForkEdge;
     use super::HostedServer;
     use super::SharedThread;
-    use super::canonicalize_forked_history;
-    use super::lineage_edges;
+    use super::plan_context_write_files;
+    use super::repo_context_documents;
     use super::rollout_history_preview;
+    use super::search_context_documents;
+    use super::shared_thread_context_documents;
     use codex_protocol::ThreadId;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseItem;
     use codex_protocol::protocol::RolloutItem;
-    use codex_protocol::protocol::SessionMeta;
-    use codex_protocol::protocol::SessionMetaLine;
     use codex_protocol::protocol::USER_MESSAGE_BEGIN;
+    use codex_together_protocol::ContextKind;
     use std::collections::HashMap;
     use std::collections::HashSet;
     use std::path::PathBuf;
@@ -2519,130 +3332,252 @@ mod tests {
     }
 
     #[test]
-    fn lineage_edges_include_ancestors_for_focused_child() {
-        let parent_thread_id = ThreadId::new().to_string();
-        let child_thread_id = ThreadId::new().to_string();
-        let grandchild_thread_id = ThreadId::new().to_string();
-        let hosted = HostedServer {
-            server_id: "srv_test".to_string(),
-            owner_email: "owner@example.com".to_string(),
-            public_base_url: "https://example.com".to_string(),
-            members: HashSet::new(),
-            threads: HashMap::new(),
-            forks: vec![
-                ForkEdge {
-                    parent_thread_id: parent_thread_id.clone(),
-                    child_thread_id: child_thread_id.clone(),
-                    actor_email: "owner@example.com".to_string(),
-                    created_at: "2026-03-08T10:00:00Z".to_string(),
-                },
-                ForkEdge {
-                    parent_thread_id: child_thread_id.clone(),
-                    child_thread_id: grandchild_thread_id.clone(),
-                    actor_email: "owner@example.com".to_string(),
-                    created_at: "2026-03-08T11:00:00Z".to_string(),
-                },
-            ],
-        };
+    fn repo_context_documents_parse_frontmatter_and_body() {
+        let temp_root = temp_test_dir("repo-context-docs");
+        let context_dir = temp_root.join(".codex").join("context");
+        std::fs::create_dir_all(&context_dir).expect("create context dir");
+        std::fs::write(
+            context_dir.join("overview.md"),
+            "---\ntitle: Planning Notes\nkind: plan\nvisibility: public\n---\n# Planning Notes\n\nShip the context browser first.\n",
+        )
+        .expect("write repo context");
 
-        let edges = lineage_edges(&hosted, &child_thread_id);
+        let documents = repo_context_documents(&temp_root);
 
-        assert_eq!(edges.len(), 2);
-        assert_eq!(edges[0].parent_thread_id, parent_thread_id);
-        assert_eq!(edges[0].child_thread_id, child_thread_id);
-        assert_eq!(edges[1].child_thread_id, grandchild_thread_id);
-    }
-
-    #[test]
-    fn lineage_edges_recover_republished_parent_from_shared_history() {
-        let parent_thread_id = ThreadId::new();
-        let child_thread_id = ThreadId::new();
-        let history = vec![RolloutItem::SessionMeta(SessionMetaLine {
-            meta: SessionMeta {
-                id: child_thread_id,
-                forked_from_id: Some(parent_thread_id),
-                timestamp: "2026-03-08T12:00:00Z".to_string(),
-                cwd: PathBuf::from("/tmp/project"),
-                originator: "codex".to_string(),
-                cli_version: "0.0.0".to_string(),
-                source: Default::default(),
-                agent_nickname: None,
-                agent_role: None,
-                model_provider: None,
-                base_instructions: None,
-                dynamic_tools: None,
-            },
-            git: None,
-        })];
-        let child_thread_id = child_thread_id.to_string();
-        let parent_thread_id = parent_thread_id.to_string();
-        let mut threads = HashMap::new();
-        threads.insert(
-            child_thread_id.clone(),
-            SharedThread {
-                thread_id: child_thread_id.clone(),
-                owner_email: "alice@example.com".to_string(),
-                shared_by_email: "alice@example.com".to_string(),
-                preview: Some("forked child".to_string()),
-                shared_at: "2026-03-08T12:05:00Z".to_string(),
-                history: Some(history),
-            },
-        );
-        let hosted = HostedServer {
-            server_id: "srv_test".to_string(),
-            owner_email: "owner@example.com".to_string(),
-            public_base_url: "https://example.com".to_string(),
-            members: HashSet::new(),
-            threads,
-            forks: Vec::new(),
-        };
-
-        let edges = lineage_edges(&hosted, &child_thread_id);
-
-        assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].parent_thread_id, parent_thread_id);
-        assert_eq!(edges[0].child_thread_id, child_thread_id);
-        assert_eq!(edges[0].actor_email, "alice@example.com");
-        assert_eq!(edges[0].created_at, "2026-03-08T12:00:00Z");
-    }
-
-    #[test]
-    fn canonicalize_forked_history_rewrites_child_session_metadata() {
-        let original_parent_thread_id = ThreadId::new();
-        let child_thread_id = ThreadId::new();
-        let mut history = vec![RolloutItem::SessionMeta(SessionMetaLine {
-            meta: SessionMeta {
-                id: original_parent_thread_id,
-                forked_from_id: None,
-                timestamp: "2026-03-08T09:00:00Z".to_string(),
-                cwd: PathBuf::from("/tmp/project"),
-                originator: "codex".to_string(),
-                cli_version: "0.0.0".to_string(),
-                source: Default::default(),
-                agent_nickname: None,
-                agent_role: None,
-                model_provider: None,
-                base_instructions: None,
-                dynamic_tools: None,
-            },
-            git: None,
-        })];
-
-        history = canonicalize_forked_history(
-            &child_thread_id.to_string(),
-            &original_parent_thread_id.to_string(),
-            "2026-03-08T10:00:00Z",
-            history,
-        );
-
-        let RolloutItem::SessionMeta(meta_line) = &history[0] else {
-            panic!("expected session meta");
-        };
-        assert_eq!(meta_line.meta.id, child_thread_id);
+        assert_eq!(documents.len(), 1);
+        let document = &documents[0];
+        assert_eq!(document.kind, ContextKind::RepoContextFile);
+        assert_eq!(document.title, "Planning Notes");
         assert_eq!(
-            meta_line.meta.forked_from_id,
-            Some(original_parent_thread_id)
+            document.location.as_deref(),
+            Some(".codex/context/overview.md")
         );
-        assert_eq!(meta_line.meta.timestamp, "2026-03-08T10:00:00Z");
+        assert_eq!(
+            document.summary.as_deref(),
+            Some("plan · public · Ship the context browser first.")
+        );
+        assert_eq!(
+            document.body.as_deref(),
+            Some("# Planning Notes\n\nShip the context browser first.")
+        );
+
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn context_write_plan_updates_existing_repo_context_file() {
+        let temp_root = temp_test_dir("repo-context-write-existing");
+        let context_dir = temp_root.join(".codex").join("context");
+        std::fs::create_dir_all(&context_dir).expect("create context dir");
+        std::fs::write(
+            context_dir.join("overview.md"),
+            "---\nid: planning-overview\nkind: decision\ntitle: Planning Overview\nvisibility: repo\n---\n# Planning Overview\n\nKeep the body stable.\n",
+        )
+        .expect("write repo context");
+
+        let documents = repo_context_documents(&temp_root);
+        let planned = plan_context_write_files(
+            &temp_root,
+            documents,
+            &["ctx:file:.codex/context/overview.md".to_string()],
+            Some("rewrite-codex-2gether-v2".to_string()),
+        );
+
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].relative_path, ".codex/context/overview.md");
+        assert!(planned[0].exists);
+        assert!(planned[0].content.contains("id: \"planning-overview\""));
+        assert!(planned[0].content.contains("kind: \"decision\""));
+        assert!(planned[0].content.contains("\"rewrite-codex-2gether-v2\""));
+        assert!(
+            planned[0]
+                .content
+                .contains("# Planning Overview\n\nKeep the body stable.")
+        );
+
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn context_write_plan_creates_new_file_for_shared_thread() {
+        let temp_root = temp_test_dir("repo-context-write-thread");
+        let documents = shared_thread_context_documents(
+            Some(&HostedServer {
+                server_id: "srv_test".to_string(),
+                owner_email: "owner@example.com".to_string(),
+                public_base_url: "https://example.com".to_string(),
+                members: HashSet::from(["owner@example.com".to_string()]),
+                threads: HashMap::from([(
+                    "thread-1".to_string(),
+                    SharedThread {
+                        thread_id: "thread-1".to_string(),
+                        owner_email: "owner@example.com".to_string(),
+                        shared_by_email: "owner@example.com".to_string(),
+                        preview: Some("planning sync".to_string()),
+                        shared_at: "2026-03-08T12:05:00Z".to_string(),
+                        history: None,
+                        repo_root: None,
+                        git_branch: None,
+                        git_sha: None,
+                        git_origin_url: None,
+                    },
+                )]),
+            }),
+            "owner@example.com",
+        );
+        let selected_ref_ids = vec!["ctx:thread:thread-1".to_string()];
+
+        let planned = plan_context_write_files(
+            &temp_root,
+            documents,
+            &selected_ref_ids,
+            Some("rewrite-codex-2gether-v2".to_string()),
+        );
+
+        assert_eq!(planned.len(), 1);
+        assert_eq!(
+            planned[0].relative_path,
+            ".codex/context/concepts/planning-sync.md"
+        );
+        assert!(!planned[0].exists);
+        assert!(planned[0].content.contains("source_threads:"));
+        assert!(planned[0].content.contains("- \"thread-1\""));
+        assert!(planned[0].content.contains("## Sources"));
+        assert!(planned[0].content.contains("- shared thread: thread-1"));
+
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn search_context_documents_orders_repo_context_before_shared_thread_on_ties() {
+        let temp_root = temp_test_dir("context-search-order");
+        let context_dir = temp_root.join(".codex").join("context");
+        std::fs::create_dir_all(&context_dir).expect("create context dir");
+        std::fs::write(
+            context_dir.join("planning.md"),
+            "---\ntitle: Planning Overview\nkind: note\n---\nCapture the collaboration rewrite milestones.\n",
+        )
+        .expect("write repo context");
+
+        let mut documents = repo_context_documents(&temp_root);
+        let hosted = HostedServer {
+            server_id: "srv_test".to_string(),
+            owner_email: "owner@example.com".to_string(),
+            public_base_url: "https://example.com".to_string(),
+            members: HashSet::from(["owner@example.com".to_string()]),
+            threads: HashMap::from([(
+                "thread-1".to_string(),
+                SharedThread {
+                    thread_id: "thread-1".to_string(),
+                    owner_email: "owner@example.com".to_string(),
+                    shared_by_email: "owner@example.com".to_string(),
+                    preview: Some("planning sync".to_string()),
+                    shared_at: "2026-03-08T12:05:00Z".to_string(),
+                    history: None,
+                    repo_root: None,
+                    git_branch: None,
+                    git_sha: None,
+                    git_origin_url: None,
+                },
+            )]),
+        };
+        documents.extend(shared_thread_context_documents(
+            Some(&hosted),
+            "owner@example.com",
+        ));
+
+        let results = search_context_documents(documents, Some("planning"), 10);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].kind, ContextKind::RepoContextFile);
+        assert_eq!(results[0].title, "Planning Overview");
+        assert_eq!(results[1].kind, ContextKind::SharedThread);
+        assert_eq!(results[1].location.as_deref(), Some("thread/thread-1"));
+
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn search_context_documents_matches_shared_thread_git_metadata() {
+        let documents = shared_thread_context_documents(
+            Some(&HostedServer {
+                server_id: "srv_test".to_string(),
+                owner_email: "owner@example.com".to_string(),
+                public_base_url: "https://example.com".to_string(),
+                members: HashSet::from(["owner@example.com".to_string()]),
+                threads: HashMap::from([(
+                    "thread-1".to_string(),
+                    SharedThread {
+                        thread_id: "thread-1".to_string(),
+                        owner_email: "owner@example.com".to_string(),
+                        shared_by_email: "owner@example.com".to_string(),
+                        preview: Some("planning sync".to_string()),
+                        shared_at: "2026-03-08T12:05:00Z".to_string(),
+                        history: None,
+                        repo_root: Some("/tmp/repo".to_string()),
+                        git_branch: Some("rewrite-codex-2gether-v2".to_string()),
+                        git_sha: Some("abc123def456".to_string()),
+                        git_origin_url: Some(
+                            "git@github.com:openai/codex-together.git".to_string(),
+                        ),
+                    },
+                )]),
+            }),
+            "owner@example.com",
+        );
+
+        let results = search_context_documents(documents, Some("rewrite-codex-2gether-v2"), 10);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].kind, ContextKind::SharedThread);
+        assert_eq!(results[0].location.as_deref(), Some("thread/thread-1"));
+        assert!(
+            results[0]
+                .body
+                .as_deref()
+                .is_some_and(|body| body.contains("Git branch: rewrite-codex-2gether-v2"))
+        );
+    }
+
+    #[test]
+    fn shared_thread_context_documents_require_membership() {
+        let hosted = HostedServer {
+            server_id: "srv_test".to_string(),
+            owner_email: "owner@example.com".to_string(),
+            public_base_url: "https://example.com".to_string(),
+            members: HashSet::from(["owner@example.com".to_string()]),
+            threads: HashMap::from([(
+                "thread-1".to_string(),
+                SharedThread {
+                    thread_id: "thread-1".to_string(),
+                    owner_email: "owner@example.com".to_string(),
+                    shared_by_email: "owner@example.com".to_string(),
+                    preview: Some("planning sync".to_string()),
+                    shared_at: "2026-03-08T12:05:00Z".to_string(),
+                    history: None,
+                    repo_root: None,
+                    git_branch: None,
+                    git_sha: None,
+                    git_origin_url: None,
+                },
+            )]),
+        };
+
+        assert_eq!(
+            shared_thread_context_documents(Some(&hosted), "guest@example.com").len(),
+            0
+        );
+        assert_eq!(
+            shared_thread_context_documents(Some(&hosted), "owner@example.com").len(),
+            1
+        );
+    }
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", ThreadId::new()));
+        if dir.exists() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        dir
     }
 }

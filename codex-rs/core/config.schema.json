@@ -421,6 +421,9 @@
             "steer": {
               "type": "boolean"
             },
+            "together": {
+              "type": "boolean"
+            },
             "undo": {
               "type": "boolean"
             },
@@ -1767,6 +1770,9 @@
           "type": "boolean"
         },
         "steer": {
+          "type": "boolean"
+        },
+        "together": {
           "type": "boolean"
         },
         "undo": {

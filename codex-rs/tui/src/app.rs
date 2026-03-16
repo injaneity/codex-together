@@ -13,9 +13,12 @@ use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ExternalEditorState;
 use crate::chatwidget::clear_together_checked_out_thread_id;
+use crate::chatwidget::commit_together_context_write_plan;
+use crate::chatwidget::commit_together_handoff_plan;
 use crate::chatwidget::fetch_together_thread_replay;
-use crate::chatwidget::fork_thread_via_together;
-use crate::chatwidget::together_checked_out_thread_id;
+use crate::chatwidget::plan_together_context_handoff;
+use crate::chatwidget::plan_together_context_write;
+use crate::chatwidget::search_together_context;
 use crate::cwd_prompt::CwdPromptAction;
 use crate::diff_render::DiffSummary;
 use crate::exec_command::strip_bash_lc_and_escape;
@@ -763,9 +766,10 @@ impl App {
         let previous_rollout_path = if writable {
             None
         } else {
-            self.chat_widget.rollout_path()
+            existing_together_checkout_return_path(self.chat_widget.rollout_path())
         };
         if self.chat_widget.thread_id().map(|id| id.to_string()) == Some(thread_id.clone()) {
+            self.reset_backtrack_state();
             self.chat_widget
                 .set_together_checkout_mode(writable, owner_email.as_str());
             if writable {
@@ -855,17 +859,211 @@ impl App {
             .map_err(Into::into)
     }
 
+    async fn commit_together_handoff(
+        &mut self,
+        tui: &mut tui::Tui,
+        plan_id: String,
+        draft_text: String,
+        context_refs: Vec<codex_together_protocol::ContextRef>,
+    ) {
+        let response = match commit_together_handoff_plan(
+            plan_id,
+            self.config.cwd.clone(),
+            self.chat_widget.current_model().to_string(),
+            self.config.permissions.approval_policy.value(),
+            self.config.permissions.sandbox_policy.get().clone(),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                self.chat_widget
+                    .add_error_message(format!("Failed to create handoff thread: {err}"));
+                return;
+            }
+        };
+
+        let handoff_cwd = PathBuf::from(&response.cwd);
+        let mut handoff_config = if crate::cwds_differ(&self.config.cwd, &handoff_cwd) {
+            match self.rebuild_config_for_cwd(handoff_cwd).await {
+                Ok(cfg) => cfg,
+                Err(err) => {
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to rebuild configuration for handoff thread {}: {err}",
+                        response.thread_id
+                    ));
+                    return;
+                }
+            }
+        } else {
+            self.config.clone()
+        };
+        self.apply_runtime_policy_overrides(&mut handoff_config);
+
+        let rollout_path = if let Some(path) = response.rollout_path.as_deref().map(PathBuf::from) {
+            path
+        } else {
+            match find_thread_path_by_id_str(
+                handoff_config.codex_home.as_path(),
+                response.thread_id.as_str(),
+            )
+            .await
+            {
+                Ok(Some(path)) => path,
+                Ok(None) => {
+                    self.chat_widget.add_error_message(format!(
+                        "Started handoff thread {} but could not locate its rollout file.",
+                        response.thread_id
+                    ));
+                    return;
+                }
+                Err(err) => {
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to locate handoff thread {}: {err}",
+                        response.thread_id
+                    ));
+                    return;
+                }
+            }
+        };
+
+        match self
+            .server
+            .resume_thread_from_rollout(
+                handoff_config.clone(),
+                rollout_path.clone(),
+                self.auth_manager.clone(),
+            )
+            .await
+        {
+            Ok(resumed) => {
+                self.shutdown_current_thread().await;
+                self.config = handoff_config;
+                tui.set_notification_method(self.config.tui_notification_method);
+                self.file_search.update_search_dir(self.config.cwd.clone());
+                let init =
+                    self.chatwidget_init_for_forked_or_resumed_thread(tui, self.config.clone());
+                self.chat_widget =
+                    ChatWidget::new_from_existing(init, resumed.thread, resumed.session_configured);
+                self.reset_thread_event_state();
+                self.reset_backtrack_state();
+                clear_together_checked_out_thread_id();
+                self.read_only_together_checkout_return_path = None;
+                self.chat_widget.set_together_checkout_mode(true, "");
+                self.chat_widget
+                    .set_composer_text_with_context_bindings(draft_text, context_refs);
+                self.chat_widget.add_info_message(
+                    format!(
+                        "Opened handoff thread {} from source {}.",
+                        response.thread_id, response.source_thread_id
+                    ),
+                    None,
+                );
+            }
+            Err(err) => {
+                let path_display = rollout_path.display();
+                self.chat_widget.add_error_message(format!(
+                    "Failed to open handoff thread {} from {path_display}: {err}",
+                    response.thread_id
+                ));
+            }
+        }
+    }
+
+    async fn plan_together_context_handoff(&mut self, actual_idx: usize) {
+        let source_thread_id = self
+            .chat_widget
+            .together_context_source_thread_id(actual_idx)
+            .or_else(|| {
+                self.chat_widget
+                    .thread_id()
+                    .map(|thread_id| thread_id.to_string())
+            });
+        let Some(source_thread_id) = source_thread_id else {
+            self.chat_widget
+                .add_error_message("Cannot create a handoff without an active thread.".to_string());
+            return;
+        };
+        let selected_ref_ids = self.chat_widget.together_context_action_ref_ids(actual_idx);
+        if selected_ref_ids.is_empty() {
+            self.chat_widget
+                .add_error_message("No collaboration context is selected.".to_string());
+            return;
+        }
+
+        match plan_together_context_handoff(Some(source_thread_id), selected_ref_ids).await {
+            Ok(plan) => self.chat_widget.show_together_handoff_review(plan),
+            Err(err) => self
+                .chat_widget
+                .add_error_message(format!("Failed to prepare handoff: {err}")),
+        }
+    }
+
+    async fn plan_together_context_write(&mut self, actual_idx: usize) {
+        let selected_ref_ids = self.chat_widget.together_context_action_ref_ids(actual_idx);
+        if selected_ref_ids.is_empty() {
+            self.chat_widget
+                .add_error_message("No collaboration context is selected.".to_string());
+            return;
+        }
+
+        match plan_together_context_write(selected_ref_ids).await {
+            Ok(plan) => self.chat_widget.show_together_context_write_review(plan),
+            Err(err) => self
+                .chat_widget
+                .add_error_message(format!("Failed to prepare repo-context write: {err}")),
+        }
+    }
+
+    async fn commit_together_context_write(&mut self, plan_id: String) {
+        match commit_together_context_write_plan(plan_id).await {
+            Ok(response) => {
+                let count = response.written_files.len();
+                let paths = response.written_files.join("\n");
+                let title = match count {
+                    1 => "Wrote 1 repo-context file.".to_string(),
+                    _ => format!("Wrote {count} repo-context files."),
+                };
+                self.chat_widget.add_info_message(title, Some(paths));
+            }
+            Err(err) => self
+                .chat_widget
+                .add_error_message(format!("Failed to write repo context: {err}")),
+        }
+    }
+
+    fn start_together_composer_context_search(&self, query: String) {
+        let tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            match search_together_context(Some(query.clone()), Some(50)).await {
+                Ok(results) => {
+                    tx.send(AppEvent::TogetherComposerContextSearchResult { query, results });
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to search together context for composer");
+                    tx.send(AppEvent::TogetherComposerContextSearchResult {
+                        query,
+                        results: Vec::new(),
+                    });
+                }
+            }
+        });
+    }
+
     async fn swap_in_existing_thread(&mut self, tui: &mut tui::Tui, resumed: NewThread) {
         self.shutdown_current_thread().await;
         let init = self.chatwidget_init_for_forked_or_resumed_thread(tui, self.config.clone());
         self.chat_widget =
             ChatWidget::new_from_existing(init, resumed.thread, resumed.session_configured);
         self.reset_thread_event_state();
+        self.reset_backtrack_state();
     }
 
     async fn exit_read_only_together_checkout(&mut self, tui: &mut tui::Tui) {
         clear_together_checked_out_thread_id();
-        let Some(path) = self.read_only_together_checkout_return_path.take() else {
+        let Some(path) = existing_together_checkout_return_path(
+            self.read_only_together_checkout_return_path.take(),
+        ) else {
             self.start_fresh_session_with_summary_hint(tui).await;
             return;
         };
@@ -2177,208 +2375,46 @@ impl App {
                 );
                 self.chat_widget
                     .add_plain_history_lines(vec!["/fork".magenta().into()]);
-                let together_connected = std::env::var("CODEX_TOGETHER_STATUS")
-                    .ok()
-                    .map(|status| {
-                        let normalized = status.trim().to_ascii_lowercase();
-                        !normalized.is_empty() && normalized != "disconnected"
-                    })
-                    .unwrap_or(false);
-                let mut handled_via_together = false;
-
-                if together_connected {
-                    let fork_target_thread_id = together_checked_out_thread_id()
-                        .or_else(|| self.chat_widget.thread_id().map(|id| id.to_string()));
-                    if let Some(target_thread_id) = fork_target_thread_id {
-                        match fork_thread_via_together(target_thread_id, self.config.cwd.clone())
+                if let Some(path) = self.chat_widget.rollout_path() {
+                    // Fresh threads expose a precomputed path, but the file is
+                    // materialized lazily on first user message.
+                    if path.exists() {
+                        match self
+                            .server
+                            .fork_thread(usize::MAX, self.config.clone(), path.clone(), false)
                             .await
                         {
                             Ok(forked) => {
-                                let child_thread_id = forked.child_thread_id.clone();
-                                if let Some(history) = forked.history.clone()
-                                    && !history.is_empty()
-                                {
-                                    match self.resume_thread_from_rollout_items(history).await {
-                                        Ok(resumed) => {
-                                            self.swap_in_existing_thread(tui, resumed).await;
-                                            self.chat_widget.set_together_checkout_mode(
-                                                forked.writable,
-                                                forked.owner_email.as_str(),
-                                            );
-                                            self.read_only_together_checkout_return_path = None;
-                                            if let Some(summary) = summary.as_ref() {
-                                                let mut lines: Vec<Line<'static>> =
-                                                    vec![summary.usage_line.clone().into()];
-                                                if let Some(command) =
-                                                    summary.resume_command.as_ref()
-                                                {
-                                                    let spans = vec![
-                                                        "To continue this session, run ".into(),
-                                                        command.clone().cyan(),
-                                                    ];
-                                                    lines.push(spans.into());
-                                                }
-                                                self.chat_widget.add_plain_history_lines(lines);
-                                            }
-                                        }
-                                        Err(err) => {
-                                            self.chat_widget.add_error_message(format!(
-                                                "Forked via together ({child_thread_id}) but failed to open shared history: {err}"
-                                            ));
-                                            self.chat_widget.add_info_message(
-                                                format!("Resume it manually: codex resume {child_thread_id}"),
-                                                None,
-                                            );
-                                        }
+                                self.shutdown_current_thread().await;
+                                let init = self.chatwidget_init_for_forked_or_resumed_thread(
+                                    tui,
+                                    self.config.clone(),
+                                );
+                                self.chat_widget = ChatWidget::new_from_existing(
+                                    init,
+                                    forked.thread,
+                                    forked.session_configured,
+                                );
+                                self.reset_thread_event_state();
+                                if let Some(summary) = summary.as_ref() {
+                                    let mut lines: Vec<Line<'static>> =
+                                        vec![summary.usage_line.clone().into()];
+                                    if let Some(command) = summary.resume_command.as_ref() {
+                                        let spans = vec![
+                                            "To continue this session, run ".into(),
+                                            command.clone().cyan(),
+                                        ];
+                                        lines.push(spans.into());
                                     }
-                                } else {
-                                    match find_thread_path_by_id_str(
-                                        self.config.codex_home.as_path(),
-                                        &child_thread_id,
-                                    )
-                                    .await
-                                    {
-                                        Ok(Some(path)) => {
-                                            match self
-                                                .server
-                                                .resume_thread_from_rollout(
-                                                    self.config.clone(),
-                                                    path.clone(),
-                                                    self.auth_manager.clone(),
-                                                )
-                                                .await
-                                            {
-                                                Ok(resumed) => {
-                                                    self.swap_in_existing_thread(tui, resumed)
-                                                        .await;
-                                                    self.chat_widget.set_together_checkout_mode(
-                                                        forked.writable,
-                                                        forked.owner_email.as_str(),
-                                                    );
-                                                    self.read_only_together_checkout_return_path =
-                                                        None;
-                                                    if let Some(summary) = summary.as_ref() {
-                                                        let mut lines: Vec<Line<'static>> =
-                                                            vec![summary.usage_line.clone().into()];
-                                                        if let Some(command) =
-                                                            summary.resume_command.as_ref()
-                                                        {
-                                                            let spans = vec![
-                                                                "To continue this session, run "
-                                                                    .into(),
-                                                                command.clone().cyan(),
-                                                            ];
-                                                            lines.push(spans.into());
-                                                        }
-                                                        self.chat_widget
-                                                            .add_plain_history_lines(lines);
-                                                    }
-                                                }
-                                                Err(err) => {
-                                                    let path_display = path.display();
-                                                    self.chat_widget.add_error_message(format!(
-                                                        "Forked via together ({child_thread_id}) but failed to open it from {path_display}: {err}"
-                                                    ));
-                                                    self.chat_widget.add_info_message(
-                                                        format!("Resume it manually: codex resume {child_thread_id}"),
-                                                        None,
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        Ok(None) => {
-                                            self.chat_widget.add_info_message(
-                                                format!(
-                                                    "Forked via together: {} -> {}. Resume with: codex resume {}",
-                                                    forked.parent_thread_id,
-                                                    child_thread_id,
-                                                    child_thread_id
-                                                ),
-                                                None,
-                                            );
-                                        }
-                                        Err(err) => {
-                                            self.chat_widget.add_error_message(format!(
-                                                "Forked via together, but failed to locate child thread {child_thread_id}: {err}"
-                                            ));
-                                            self.chat_widget.add_info_message(
-                                                format!(
-                                                    "Resume it manually: codex resume {child_thread_id}"
-                                                ),
-                                                None,
-                                            );
-                                        }
-                                    }
+                                    self.chat_widget.add_plain_history_lines(lines);
                                 }
-                                handled_via_together = true;
                             }
                             Err(err) => {
-                                self.chat_widget
-                                    .add_error_message(format!("Together /fork failed: {err}"));
-                                self.chat_widget.add_info_message(
-                                    "Use /threads to select a shared thread and press f to fork it."
-                                        .to_string(),
-                                    None,
-                                );
-                                handled_via_together = true;
+                                let path_display = path.display();
+                                self.chat_widget.add_error_message(format!(
+                                    "Failed to fork current session from {path_display}: {err}"
+                                ));
                             }
-                        }
-                    } else {
-                        self.chat_widget.add_error_message(
-                            "No together thread selected to fork. Use /threads and press Enter to checkout, then /fork."
-                                .to_string(),
-                        );
-                        handled_via_together = true;
-                    }
-                }
-
-                if !handled_via_together {
-                    if let Some(path) = self.chat_widget.rollout_path() {
-                        // Fresh threads expose a precomputed path, but the file is
-                        // materialized lazily on first user message.
-                        if path.exists() {
-                            match self
-                                .server
-                                .fork_thread(usize::MAX, self.config.clone(), path.clone(), false)
-                                .await
-                            {
-                                Ok(forked) => {
-                                    self.shutdown_current_thread().await;
-                                    let init = self.chatwidget_init_for_forked_or_resumed_thread(
-                                        tui,
-                                        self.config.clone(),
-                                    );
-                                    self.chat_widget = ChatWidget::new_from_existing(
-                                        init,
-                                        forked.thread,
-                                        forked.session_configured,
-                                    );
-                                    self.reset_thread_event_state();
-                                    if let Some(summary) = summary.as_ref() {
-                                        let mut lines: Vec<Line<'static>> =
-                                            vec![summary.usage_line.clone().into()];
-                                        if let Some(command) = summary.resume_command.as_ref() {
-                                            let spans = vec![
-                                                "To continue this session, run ".into(),
-                                                command.clone().cyan(),
-                                            ];
-                                            lines.push(spans.into());
-                                        }
-                                        self.chat_widget.add_plain_history_lines(lines);
-                                    }
-                                }
-                                Err(err) => {
-                                    let path_display = path.display();
-                                    self.chat_widget.add_error_message(format!(
-                                        "Failed to fork current session from {path_display}: {err}"
-                                    ));
-                                }
-                            }
-                        } else {
-                            self.chat_widget.add_error_message(
-                                "A thread must contain at least one turn before it can be forked."
-                                    .to_string(),
-                            );
                         }
                     } else {
                         self.chat_widget.add_error_message(
@@ -2386,6 +2422,11 @@ impl App {
                                 .to_string(),
                         );
                     }
+                } else {
+                    self.chat_widget.add_error_message(
+                        "A thread must contain at least one turn before it can be forked."
+                            .to_string(),
+                    );
                 }
 
                 tui.frame_requester().schedule_frame();
@@ -3371,25 +3412,50 @@ impl App {
                 self.chat_widget
                     .refresh_together_threads_view_if_open(threads);
             }
-            AppEvent::OpenTogetherHistoryView { lineage } => {
-                self.chat_widget.show_together_history_view(lineage);
+            AppEvent::StartTogetherComposerContextSearch { query } => {
+                self.start_together_composer_context_search(query);
             }
-            AppEvent::OpenTogetherCenterView { server_info } => {
-                self.chat_widget.show_together_center_view(server_info);
-            }
-            AppEvent::TogetherPresenceUpdated { server_info, state } => {
+            AppEvent::TogetherComposerContextSearchResult { query, results } => {
                 self.chat_widget
-                    .handle_together_presence_update(server_info, state);
+                    .apply_together_context_search_result(query, results);
             }
-            AppEvent::DismissBottomPaneView => {
-                self.chat_widget.dismiss_active_bottom_pane_view();
+            AppEvent::TogetherContextBundleResolved { response } => {
+                self.chat_widget
+                    .on_together_context_bundle_resolved(response);
             }
-            AppEvent::ReplayTogetherThread {
-                thread_id,
-                messages,
+            AppEvent::TogetherContextBundleResolveFailed { error } => {
+                self.chat_widget
+                    .on_together_context_bundle_resolve_failed(error);
+            }
+            AppEvent::OpenTogetherContextView { query, results } => {
+                self.chat_widget.show_together_context_view(query, results);
+            }
+            AppEvent::ToggleTogetherContextMark { actual_idx } => {
+                self.chat_widget.toggle_together_context_mark(actual_idx);
+            }
+            AppEvent::AttachTogetherContextSelection { actual_idx } => {
+                self.chat_widget
+                    .attach_together_context_selection(actual_idx);
+            }
+            AppEvent::PlanTogetherContextHandoff { actual_idx } => {
+                self.plan_together_context_handoff(actual_idx).await;
+            }
+            AppEvent::PlanTogetherContextWrite { actual_idx } => {
+                self.plan_together_context_write(actual_idx).await;
+            }
+            AppEvent::OpenTogetherHandoffReview { plan } => {
+                self.chat_widget.show_together_handoff_review(plan);
+            }
+            AppEvent::CommitTogetherHandoff {
+                plan_id,
+                draft_text,
+                context_refs,
             } => {
-                self.chat_widget
-                    .replay_together_thread_messages(thread_id, messages);
+                self.commit_together_handoff(tui, plan_id, draft_text, context_refs)
+                    .await;
+            }
+            AppEvent::CommitTogetherContextWrite { plan_id } => {
+                self.commit_together_context_write(plan_id).await;
             }
             AppEvent::ResumeTogetherThread {
                 thread_id,
@@ -3937,6 +4003,10 @@ impl App {
             }
         });
     }
+}
+
+fn existing_together_checkout_return_path(path: Option<PathBuf>) -> Option<PathBuf> {
+    path.filter(|path| path.exists())
 }
 
 #[cfg(test)]
@@ -5244,6 +5314,24 @@ mod tests {
             app.chat_widget.config_ref().tui_theme.as_deref(),
             Some("dracula")
         );
+    }
+
+    #[test]
+    fn existing_together_checkout_return_path_filters_missing_paths() {
+        let temp_dir = tempdir().expect("tempdir");
+        let existing = temp_dir.path().join("existing.jsonl");
+        std::fs::write(&existing, "").expect("write existing path");
+        let missing = temp_dir.path().join("missing.jsonl");
+
+        assert_eq!(
+            super::existing_together_checkout_return_path(Some(existing.clone())),
+            Some(existing)
+        );
+        assert_eq!(
+            super::existing_together_checkout_return_path(Some(missing)),
+            None
+        );
+        assert_eq!(super::existing_together_checkout_return_path(None), None);
     }
 
     #[tokio::test]

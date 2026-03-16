@@ -196,6 +196,7 @@ use codex_utils_fuzzy_match::fuzzy_match;
 use crate::app_event::AppEvent;
 use crate::app_event::ConnectorsSnapshot;
 use crate::app_event_sender::AppEventSender;
+use crate::bottom_pane::ContextBinding;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::MentionBinding;
 use crate::bottom_pane::textarea::TextArea;
@@ -209,6 +210,8 @@ use codex_chatgpt::connectors;
 use codex_chatgpt::connectors::AppInfo;
 use codex_core::skills::model::SkillMetadata;
 use codex_file_search::FileMatch;
+use codex_together_protocol::ContextRef;
+use codex_together_protocol::ContextSearchResult;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -352,6 +355,8 @@ pub(crate) struct ChatComposer {
     use_shift_enter_hint: bool,
     dismissed_file_popup_token: Option<String>,
     current_file_query: Option<String>,
+    dismissed_context_popup_token: Option<String>,
+    current_context_query: Option<String>,
     pending_pastes: Vec<(String, String)>,
     large_paste_counters: HashMap<usize, usize>,
     has_focus: bool,
@@ -389,6 +394,8 @@ pub(crate) struct ChatComposer {
     dismissed_mention_popup_token: Option<String>,
     mention_bindings: HashMap<u64, ComposerMentionBinding>,
     recent_submission_mention_bindings: Vec<MentionBinding>,
+    context_bindings: HashMap<u64, ContextRef>,
+    recent_submission_context_bindings: Vec<ContextBinding>,
     collaboration_modes_enabled: bool,
     config: ChatComposerConfig,
     collaboration_mode_indicator: Option<CollaborationModeIndicator>,
@@ -418,7 +425,8 @@ enum ActivePopup {
     None,
     Command(CommandPopup),
     File(FileSearchPopup),
-    Skill(SkillPopup),
+    Context(SkillPopup),
+    Mention(SkillPopup),
 }
 
 const FOOTER_SPACING_HEIGHT: u16 = 0;
@@ -467,6 +475,8 @@ impl ChatComposer {
             use_shift_enter_hint,
             dismissed_file_popup_token: None,
             current_file_query: None,
+            dismissed_context_popup_token: None,
+            current_context_query: None,
             pending_pastes: Vec::new(),
             large_paste_counters: HashMap::new(),
             has_focus: has_input_focus,
@@ -495,6 +505,8 @@ impl ChatComposer {
             dismissed_mention_popup_token: None,
             mention_bindings: HashMap::new(),
             recent_submission_mention_bindings: Vec::new(),
+            context_bindings: HashMap::new(),
+            recent_submission_context_bindings: Vec::new(),
             collaboration_modes_enabled: false,
             config,
             collaboration_mode_indicator: None,
@@ -553,6 +565,20 @@ impl ChatComposer {
             }
         }
         self.mention_bindings.clear();
+        ordered
+    }
+
+    pub(crate) fn take_context_bindings(&mut self) -> Vec<ContextBinding> {
+        let elements = self.current_context_elements();
+        let mut ordered = Vec::new();
+        for (id, label) in elements {
+            if let Some(context_ref) = self.context_bindings.remove(&id)
+                && context_ref.display_label == label
+            {
+                ordered.push(ContextBinding { context_ref });
+            }
+        }
+        self.context_bindings.clear();
         ordered
     }
 
@@ -630,7 +656,7 @@ impl ChatComposer {
                 Constraint::Max(popup.calculate_required_height(area.width))
             }
             ActivePopup::File(popup) => Constraint::Max(popup.calculate_required_height()),
-            ActivePopup::Skill(popup) => {
+            ActivePopup::Context(popup) | ActivePopup::Mention(popup) => {
                 Constraint::Max(popup.calculate_required_height(area.width))
             }
             ActivePopup::None => Constraint::Max(footer_total_height),
@@ -953,10 +979,11 @@ impl ChatComposer {
         text_elements: Vec<TextElement>,
         local_image_paths: Vec<PathBuf>,
     ) {
-        self.set_text_content_with_mention_bindings(
+        self.set_text_content_with_bindings(
             text,
             text_elements,
             local_image_paths,
+            Vec::new(),
             Vec::new(),
         );
     }
@@ -973,12 +1000,13 @@ impl ChatComposer {
     /// This helper intentionally places the cursor at the start of the restored text. Callers
     /// that need end-of-line restore behavior (for example shell-style history recall) should call
     /// [`Self::move_cursor_to_end`] after this method.
-    pub(crate) fn set_text_content_with_mention_bindings(
+    pub(crate) fn set_text_content_with_bindings(
         &mut self,
         text: String,
         text_elements: Vec<TextElement>,
         local_image_paths: Vec<PathBuf>,
         mention_bindings: Vec<MentionBinding>,
+        context_bindings: Vec<ContextBinding>,
     ) {
         #[cfg(not(target_os = "linux"))]
         self.stop_all_transcription_spinners();
@@ -988,6 +1016,7 @@ impl ChatComposer {
         self.pending_pastes.clear();
         self.attached_images.clear();
         self.mention_bindings.clear();
+        self.context_bindings.clear();
 
         self.textarea.set_text_with_elements(&text, &text_elements);
 
@@ -998,10 +1027,28 @@ impl ChatComposer {
         }
 
         self.bind_mentions_from_snapshot(mention_bindings);
+        self.bind_contexts_from_snapshot(context_bindings);
         self.relabel_attached_images_and_update_placeholders();
         self.selected_remote_image_index = None;
         self.textarea.set_cursor(0);
         self.sync_popups();
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_text_content_with_mention_bindings(
+        &mut self,
+        text: String,
+        text_elements: Vec<TextElement>,
+        local_image_paths: Vec<PathBuf>,
+        mention_bindings: Vec<MentionBinding>,
+    ) {
+        self.set_text_content_with_bindings(
+            text,
+            text_elements,
+            local_image_paths,
+            mention_bindings,
+            Vec::new(),
+        );
     }
 
     /// Update the placeholder text without changing input enablement.
@@ -1029,6 +1076,7 @@ impl ChatComposer {
         let pending_pastes = std::mem::take(&mut self.pending_pastes);
         let remote_image_urls = self.remote_image_urls.clone();
         let mention_bindings = self.snapshot_mention_bindings();
+        let context_bindings = self.snapshot_context_bindings();
         self.set_text_content(String::new(), Vec::new(), Vec::new());
         self.remote_image_urls.clear();
         self.selected_remote_image_index = None;
@@ -1039,6 +1087,7 @@ impl ChatComposer {
             local_image_paths,
             remote_image_urls,
             mention_bindings,
+            context_bindings,
             pending_pastes,
         });
         Some(previous)
@@ -1063,14 +1112,16 @@ impl ChatComposer {
             local_image_paths,
             remote_image_urls,
             mention_bindings,
+            context_bindings,
             pending_pastes,
         } = entry;
         self.set_remote_image_urls(remote_image_urls);
-        self.set_text_content_with_mention_bindings(
+        self.set_text_content_with_bindings(
             text,
             text_elements,
             local_image_paths,
             mention_bindings,
+            context_bindings,
         );
         self.set_pending_pastes(pending_pastes);
         self.move_cursor_to_end();
@@ -1102,8 +1153,16 @@ impl ChatComposer {
         self.snapshot_mention_bindings()
     }
 
+    pub(crate) fn context_bindings(&self) -> Vec<ContextBinding> {
+        self.snapshot_context_bindings()
+    }
+
     pub(crate) fn take_recent_submission_mention_bindings(&mut self) -> Vec<MentionBinding> {
         std::mem::take(&mut self.recent_submission_mention_bindings)
+    }
+
+    pub(crate) fn take_recent_submission_context_bindings(&mut self) -> Vec<ContextBinding> {
+        std::mem::take(&mut self.recent_submission_context_bindings)
     }
 
     fn prune_attached_images_for_submission(&mut self, text: &str, text_elements: &[TextElement]) {
@@ -1189,6 +1248,32 @@ impl ChatComposer {
 
         if let ActivePopup::File(popup) = &mut self.active_popup {
             popup.set_matches(&query, matches);
+        }
+    }
+
+    pub(crate) fn on_together_context_search_result(
+        &mut self,
+        query: String,
+        results: Vec<ContextSearchResult>,
+    ) {
+        let Some(current_token) = self.current_context_token() else {
+            return;
+        };
+        if !current_token.starts_with(&query) {
+            return;
+        }
+
+        let items = self.context_items(results);
+        match &mut self.active_popup {
+            ActivePopup::Context(popup) => {
+                popup.set_query(&current_token);
+                popup.set_mentions(items);
+            }
+            _ => {
+                let mut popup = SkillPopup::new(items);
+                popup.set_query(&current_token);
+                self.active_popup = ActivePopup::Context(popup);
+            }
         }
     }
 
@@ -1286,7 +1371,8 @@ impl ChatComposer {
         let result = match &mut self.active_popup {
             ActivePopup::Command(_) => self.handle_key_event_with_slash_popup(key_event),
             ActivePopup::File(_) => self.handle_key_event_with_file_popup(key_event),
-            ActivePopup::Skill(_) => self.handle_key_event_with_skill_popup(key_event),
+            ActivePopup::Context(_) => self.handle_key_event_with_context_popup(key_event),
+            ActivePopup::Mention(_) => self.handle_key_event_with_mention_popup(key_event),
             ActivePopup::None => self.handle_key_event_without_popup(key_event),
         };
         // Update (or hide/show) popup after processing the key.
@@ -1711,13 +1797,89 @@ impl ChatComposer {
         }
     }
 
-    fn handle_key_event_with_skill_popup(&mut self, key_event: KeyEvent) -> (InputResult, bool) {
+    fn handle_key_event_with_context_popup(&mut self, key_event: KeyEvent) -> (InputResult, bool) {
         if self.handle_shortcut_overlay_key(&key_event) {
             return (InputResult::None, true);
         }
         self.footer_mode = reset_mode_after_activity(self.footer_mode);
 
-        let ActivePopup::Skill(popup) = &mut self.active_popup else {
+        let ActivePopup::Context(popup) = &mut self.active_popup else {
+            unreachable!();
+        };
+
+        let mut selected_context: Option<ContextRef> = None;
+        let mut close_popup = false;
+
+        let result = match key_event {
+            KeyEvent {
+                code: KeyCode::Up, ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('p'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                popup.move_up();
+                (InputResult::None, true)
+            }
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('n'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                popup.move_down();
+                (InputResult::None, true)
+            }
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => {
+                if let Some(tok) = self.current_context_token() {
+                    self.dismissed_context_popup_token = Some(tok);
+                }
+                self.active_popup = ActivePopup::None;
+                (InputResult::None, true)
+            }
+            KeyEvent {
+                code: KeyCode::Tab, ..
+            }
+            | KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                if let Some(mention) = popup.selected_mention()
+                    && let Some(path) = mention.path.as_deref()
+                    && let Ok(context_ref) = serde_json::from_str::<ContextRef>(path)
+                {
+                    selected_context = Some(context_ref);
+                }
+                close_popup = true;
+                (InputResult::None, true)
+            }
+            input => self.handle_input_basic(input),
+        };
+
+        if close_popup {
+            if let Some(context_ref) = selected_context {
+                self.insert_selected_context(context_ref);
+            }
+            self.active_popup = ActivePopup::None;
+        }
+
+        result
+    }
+
+    fn handle_key_event_with_mention_popup(&mut self, key_event: KeyEvent) -> (InputResult, bool) {
+        if self.handle_shortcut_overlay_key(&key_event) {
+            return (InputResult::None, true);
+        }
+        self.footer_mode = reset_mode_after_activity(self.footer_mode);
+
+        let ActivePopup::Mention(popup) = &mut self.active_popup else {
             unreachable!();
         };
 
@@ -1793,7 +1955,7 @@ impl ChatComposer {
             || lower.ends_with(".webp")
     }
 
-    fn trim_text_elements(
+    pub(crate) fn trim_text_elements(
         original: &str,
         trimmed: &str,
         elements: Vec<TextElement>,
@@ -1930,9 +2092,9 @@ impl ChatComposer {
     /// - If the token under the cursor starts with `prefix`, that token is
     ///   returned without the leading prefix. When `allow_empty` is true, a
     ///   lone prefix character yields `Some(String::new())` to surface hints.
-    fn current_prefixed_token(
+    fn current_prefixed_token_str(
         textarea: &TextArea,
-        prefix: char,
+        prefix: &str,
         allow_empty: bool,
     ) -> Option<String> {
         let cursor_offset = textarea.cursor();
@@ -2003,18 +2165,17 @@ impl ChatComposer {
             None
         };
 
-        let prefix_str = prefix.to_string();
         let left_match = token_left.filter(|t| t.starts_with(prefix));
         let right_match = token_right.filter(|t| t.starts_with(prefix));
 
-        let left_prefixed = left_match.map(|t| t[prefix.len_utf8()..].to_string());
-        let right_prefixed = right_match.map(|t| t[prefix.len_utf8()..].to_string());
+        let left_prefixed = left_match.map(|t| t[prefix.len()..].to_string());
+        let right_prefixed = right_match.map(|t| t[prefix.len()..].to_string());
 
         if at_whitespace {
             if right_prefixed.is_some() {
                 return right_prefixed;
             }
-            if token_left.is_some_and(|t| t == prefix_str) {
+            if token_left.is_some_and(|t| t == prefix) {
                 return allow_empty.then(String::new);
             }
             return left_prefixed;
@@ -2033,6 +2194,15 @@ impl ChatComposer {
         left_prefixed.or(right_prefixed)
     }
 
+    fn current_prefixed_token(
+        textarea: &TextArea,
+        prefix: char,
+        allow_empty: bool,
+    ) -> Option<String> {
+        let prefix = prefix.to_string();
+        Self::current_prefixed_token_str(textarea, prefix.as_str(), allow_empty)
+    }
+
     /// Extract the `@token` that the cursor is currently positioned on, if any.
     ///
     /// The returned string **does not** include the leading `@`.
@@ -2045,6 +2215,13 @@ impl ChatComposer {
             return None;
         }
         Self::current_prefixed_token(&self.textarea, '$', true)
+    }
+
+    fn current_context_token(&self) -> Option<String> {
+        if !self.collaboration_modes_enabled {
+            return None;
+        }
+        Self::current_prefixed_token_str(&self.textarea, "##", true)
     }
 
     /// Replace the active `@token` (the one under the cursor) with `path`.
@@ -2138,6 +2315,56 @@ impl ChatComposer {
         self.textarea.set_cursor(new_cursor);
     }
 
+    fn insert_selected_context(&mut self, context_ref: ContextRef) {
+        let insert_text = context_binding_text(&context_ref);
+        let cursor_offset = self.textarea.cursor();
+        let text = self.textarea.text();
+        let safe_cursor = Self::clamp_to_char_boundary(text, cursor_offset);
+
+        let before_cursor = &text[..safe_cursor];
+        let after_cursor = &text[safe_cursor..];
+
+        let start_idx = before_cursor
+            .char_indices()
+            .rfind(|(_, c)| c.is_whitespace())
+            .map(|(idx, c)| idx + c.len_utf8())
+            .unwrap_or(0);
+
+        let end_rel_idx = after_cursor
+            .char_indices()
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(idx, _)| idx)
+            .unwrap_or(after_cursor.len());
+        let end_idx = safe_cursor + end_rel_idx;
+
+        self.textarea.replace_range(start_idx..end_idx, "");
+        self.textarea.set_cursor(start_idx);
+        let id = self.textarea.insert_element(&insert_text);
+        self.context_bindings.insert(id, context_ref);
+        self.textarea.insert_str(" ");
+        let new_cursor = start_idx
+            .saturating_add(insert_text.len())
+            .saturating_add(1);
+        self.textarea.set_cursor(new_cursor);
+    }
+
+    pub(crate) fn insert_context_binding(&mut self, context_ref: ContextRef) {
+        let insert_text = context_binding_text(&context_ref);
+        let needs_leading_space = self
+            .textarea
+            .text()
+            .get(..self.textarea.cursor())
+            .and_then(|prefix| prefix.chars().next_back())
+            .is_some_and(|ch| !ch.is_whitespace());
+        if needs_leading_space {
+            self.textarea.insert_str(" ");
+        }
+        let id = self.textarea.insert_element(&insert_text);
+        self.context_bindings.insert(id, context_ref);
+        self.textarea.insert_str(" ");
+        self.sync_popups();
+    }
+
     fn mention_name_from_insert_text(insert_text: &str) -> Option<String> {
         let name = insert_text.strip_prefix('$')?;
         if name.is_empty() {
@@ -2165,6 +2392,16 @@ impl ChatComposer {
             .collect()
     }
 
+    fn current_context_elements(&self) -> Vec<(u64, String)> {
+        self.textarea
+            .text_element_snapshots()
+            .into_iter()
+            .filter_map(|snapshot| {
+                context_binding_label(snapshot.text.as_str()).map(|label| (snapshot.id, label))
+            })
+            .collect()
+    }
+
     fn snapshot_mention_bindings(&self) -> Vec<MentionBinding> {
         let mut ordered = Vec::new();
         for (id, mention) in self.current_mention_elements() {
@@ -2174,6 +2411,20 @@ impl ChatComposer {
                 ordered.push(MentionBinding {
                     mention: binding.mention.clone(),
                     path: binding.path.clone(),
+                });
+            }
+        }
+        ordered
+    }
+
+    fn snapshot_context_bindings(&self) -> Vec<ContextBinding> {
+        let mut ordered = Vec::new();
+        for (id, label) in self.current_context_elements() {
+            if let Some(context_ref) = self.context_bindings.get(&id)
+                && context_ref.display_label == label
+            {
+                ordered.push(ContextBinding {
+                    context_ref: context_ref.clone(),
                 });
             }
         }
@@ -2215,6 +2466,35 @@ impl ChatComposer {
         }
     }
 
+    fn bind_contexts_from_snapshot(&mut self, context_bindings: Vec<ContextBinding>) {
+        self.context_bindings.clear();
+        if context_bindings.is_empty() {
+            return;
+        }
+
+        let text = self.textarea.text().to_string();
+        let mut scan_from = 0usize;
+        for binding in context_bindings {
+            let token = context_binding_text(&binding.context_ref);
+            let Some(start_offset) = text[scan_from..].find(token.as_str()) else {
+                continue;
+            };
+            let start = scan_from + start_offset;
+            let range = start..start.saturating_add(token.len());
+
+            let id = if let Some(id) = self.textarea.add_element_range(range.clone()) {
+                Some(id)
+            } else {
+                self.textarea.element_id_for_exact_range(range.clone())
+            };
+
+            if let Some(id) = id {
+                self.context_bindings.insert(id, binding.context_ref);
+                scan_from = range.end;
+            }
+        }
+    }
+
     /// Prepare text for submission/queuing. Returns None if submission should be suppressed.
     /// On success, clears pending paste payloads because placeholders have been expanded.
     ///
@@ -2227,6 +2507,7 @@ impl ChatComposer {
         let original_input = text.clone();
         let original_text_elements = self.textarea.text_elements();
         let original_mention_bindings = self.snapshot_mention_bindings();
+        let original_context_bindings = self.snapshot_context_bindings();
         let original_local_image_paths = self
             .attached_images
             .iter()
@@ -2236,6 +2517,7 @@ impl ChatComposer {
         let mut text_elements = original_text_elements.clone();
         let input_starts_with_space = original_input.starts_with(' ');
         self.recent_submission_mention_bindings.clear();
+        self.recent_submission_context_bindings.clear();
         self.textarea.set_text_clearing_elements("");
 
         if !self.pending_pastes.is_empty() {
@@ -2283,11 +2565,12 @@ impl ChatComposer {
                     self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
                         history_cell::new_info_event(message, None),
                     )));
-                    self.set_text_content_with_mention_bindings(
+                    self.set_text_content_with_bindings(
                         original_input.clone(),
                         original_text_elements,
                         original_local_image_paths,
                         original_mention_bindings,
+                        original_context_bindings,
                     );
                     self.pending_pastes.clone_from(&original_pending_pastes);
                     self.textarea.set_cursor(original_input.len());
@@ -2304,11 +2587,12 @@ impl ChatComposer {
                         self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
                             history_cell::new_error_event(err.user_message()),
                         )));
-                        self.set_text_content_with_mention_bindings(
+                        self.set_text_content_with_bindings(
                             original_input.clone(),
                             original_text_elements,
                             original_local_image_paths,
                             original_mention_bindings,
+                            original_context_bindings,
                         );
                         self.pending_pastes.clone_from(&original_pending_pastes);
                         self.textarea.set_cursor(original_input.len());
@@ -2326,11 +2610,12 @@ impl ChatComposer {
             self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
                 history_cell::new_error_event(message),
             )));
-            self.set_text_content_with_mention_bindings(
+            self.set_text_content_with_bindings(
                 original_input.clone(),
                 original_text_elements,
                 original_local_image_paths,
                 original_mention_bindings,
+                original_context_bindings,
             );
             self.pending_pastes.clone_from(&original_pending_pastes);
             self.textarea.set_cursor(original_input.len());
@@ -2343,6 +2628,7 @@ impl ChatComposer {
             return None;
         }
         self.recent_submission_mention_bindings = original_mention_bindings.clone();
+        self.recent_submission_context_bindings = original_context_bindings.clone();
         if record_history
             && (!text.is_empty()
                 || !self.attached_images.is_empty()
@@ -2359,6 +2645,7 @@ impl ChatComposer {
                 local_image_paths,
                 remote_image_urls: self.remote_image_urls.clone(),
                 mention_bindings: original_mention_bindings,
+                context_bindings: original_context_bindings,
                 pending_pastes: Vec::new(),
             });
         }
@@ -2423,6 +2710,7 @@ impl ChatComposer {
         let original_input = self.textarea.text().to_string();
         let original_text_elements = self.textarea.text_elements();
         let original_mention_bindings = self.snapshot_mention_bindings();
+        let original_context_bindings = self.snapshot_context_bindings();
         let original_local_image_paths = self
             .attached_images
             .iter()
@@ -2454,11 +2742,12 @@ impl ChatComposer {
             }
         } else {
             // Restore text if submission was suppressed.
-            self.set_text_content_with_mention_bindings(
+            self.set_text_content_with_bindings(
                 original_input,
                 original_text_elements,
                 original_local_image_paths,
                 original_mention_bindings,
+                original_context_bindings,
             );
             self.pending_pastes = original_pending_pastes;
             (InputResult::None, true)
@@ -3209,6 +3498,7 @@ impl ChatComposer {
             return;
         }
         let file_token = Self::current_at_token(&self.textarea);
+        let context_token = self.current_context_token();
         let browsing_history = self
             .history
             .should_handle_navigation(self.textarea.text(), self.textarea.cursor());
@@ -3220,13 +3510,16 @@ impl ChatComposer {
                     .send(AppEvent::StartFileSearch(String::new()));
                 self.current_file_query = None;
             }
+            self.current_context_query = None;
             self.active_popup = ActivePopup::None;
             return;
         }
         let mention_token = self.current_mention_token();
 
-        let allow_command_popup =
-            self.slash_commands_enabled() && file_token.is_none() && mention_token.is_none();
+        let allow_command_popup = self.slash_commands_enabled()
+            && file_token.is_none()
+            && context_token.is_none()
+            && mention_token.is_none();
         self.sync_command_popup(allow_command_popup);
 
         if matches!(self.active_popup, ActivePopup::Command(_)) {
@@ -3235,10 +3528,24 @@ impl ChatComposer {
                     .send(AppEvent::StartFileSearch(String::new()));
                 self.current_file_query = None;
             }
+            self.current_context_query = None;
             self.dismissed_file_popup_token = None;
+            self.dismissed_context_popup_token = None;
             self.dismissed_mention_popup_token = None;
             return;
         }
+
+        if let Some(token) = context_token {
+            if self.current_file_query.is_some() {
+                self.app_event_tx
+                    .send(AppEvent::StartFileSearch(String::new()));
+                self.current_file_query = None;
+            }
+            self.sync_context_popup(token);
+            return;
+        }
+        self.dismissed_context_popup_token = None;
+        self.current_context_query = None;
 
         if let Some(token) = mention_token {
             if self.current_file_query.is_some() {
@@ -3264,7 +3571,7 @@ impl ChatComposer {
         self.dismissed_file_popup_token = None;
         if matches!(
             self.active_popup,
-            ActivePopup::File(_) | ActivePopup::Skill(_)
+            ActivePopup::Context(_) | ActivePopup::File(_) | ActivePopup::Mention(_)
         ) {
             self.active_popup = ActivePopup::None;
         }
@@ -3534,14 +3841,39 @@ impl ChatComposer {
         }
 
         match &mut self.active_popup {
-            ActivePopup::Skill(popup) => {
+            ActivePopup::Mention(popup) => {
                 popup.set_query(&query);
                 popup.set_mentions(mentions);
             }
             _ => {
                 let mut popup = SkillPopup::new(mentions);
                 popup.set_query(&query);
-                self.active_popup = ActivePopup::Skill(popup);
+                self.active_popup = ActivePopup::Mention(popup);
+            }
+        }
+    }
+
+    fn sync_context_popup(&mut self, query: String) {
+        if self.dismissed_context_popup_token.as_ref() == Some(&query) {
+            return;
+        }
+
+        if self.current_context_query.as_ref() != Some(&query) {
+            self.app_event_tx
+                .send(AppEvent::StartTogetherComposerContextSearch {
+                    query: query.clone(),
+                });
+            self.current_context_query = Some(query.clone());
+        }
+
+        match &mut self.active_popup {
+            ActivePopup::Context(popup) => {
+                popup.set_query(&query);
+            }
+            _ => {
+                let mut popup = SkillPopup::new(Vec::new());
+                popup.set_query(&query);
+                self.active_popup = ActivePopup::Context(popup);
             }
         }
     }
@@ -3605,6 +3937,38 @@ impl ChatComposer {
         }
 
         mentions
+    }
+
+    fn context_items(&self, results: Vec<ContextSearchResult>) -> Vec<MentionItem> {
+        results
+            .into_iter()
+            .map(|result| {
+                let context_ref = context_ref_from_search_result(&result);
+                let description = Some(context_row_description(&result));
+                let mut search_terms = vec![result.title.clone()];
+                if let Some(location) = &result.location {
+                    search_terms.push(location.clone());
+                }
+                if let Some(summary) = &result.summary {
+                    search_terms.push(summary.clone());
+                }
+                MentionItem {
+                    display_name: result.title,
+                    description,
+                    insert_text: context_binding_text(&context_ref),
+                    search_terms,
+                    path: serde_json::to_string(&context_ref).ok(),
+                    category_tag: Some(match context_ref.kind {
+                        codex_together_protocol::ContextKind::SharedThread => {
+                            "[Thread]".to_string()
+                        }
+                        codex_together_protocol::ContextKind::RepoContextFile => {
+                            "[Repo]".to_string()
+                        }
+                    }),
+                }
+            })
+            .collect()
     }
 
     fn connector_brief_description(connector: &AppInfo) -> String {
@@ -4005,6 +4369,54 @@ fn skill_description(skill: &SkillMetadata) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+fn context_ref_from_search_result(result: &ContextSearchResult) -> ContextRef {
+    let source_thread_id = (result.kind == codex_together_protocol::ContextKind::SharedThread)
+        .then(|| {
+            result
+                .ref_id
+                .strip_prefix("ctx:thread:")
+                .map(str::to_string)
+        })
+        .flatten();
+    let repo_context_id = (result.kind == codex_together_protocol::ContextKind::RepoContextFile)
+        .then(|| result.location.clone())
+        .flatten();
+
+    ContextRef {
+        ref_id: result.ref_id.clone(),
+        kind: result.kind,
+        display_label: result.title.clone(),
+        source_thread_id,
+        repo_context_id,
+        git_branch: None,
+        stale_state: None,
+    }
+}
+
+fn context_row_description(result: &ContextSearchResult) -> String {
+    let kind = match result.kind {
+        codex_together_protocol::ContextKind::SharedThread => "shared thread",
+        codex_together_protocol::ContextKind::RepoContextFile => "repo context",
+    };
+    match (&result.location, &result.summary) {
+        (Some(location), Some(summary)) => format!("{kind} · {location} · {summary}"),
+        (Some(location), None) => format!("{kind} · {location}"),
+        (None, Some(summary)) => format!("{kind} · {summary}"),
+        (None, None) => kind.to_string(),
+    }
+}
+
+fn context_binding_text(context_ref: &ContextRef) -> String {
+    format!("[ctx: {}]", context_ref.display_label)
+}
+
+fn context_binding_label(text: &str) -> Option<String> {
+    let label = text
+        .strip_prefix("[ctx: ")
+        .and_then(|value| value.strip_suffix(']'))?;
+    (!label.is_empty()).then(|| label.to_string())
+}
+
 fn is_mention_name_char(byte: u8) -> bool {
     matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-')
 }
@@ -4079,7 +4491,9 @@ impl Renderable for ChatComposer {
                 ActivePopup::None => footer_total_height,
                 ActivePopup::Command(c) => c.calculate_required_height(width),
                 ActivePopup::File(c) => c.calculate_required_height(),
-                ActivePopup::Skill(c) => c.calculate_required_height(width),
+                ActivePopup::Context(c) | ActivePopup::Mention(c) => {
+                    c.calculate_required_height(width)
+                }
             }
     }
 
@@ -4099,7 +4513,7 @@ impl ChatComposer {
             ActivePopup::File(popup) => {
                 popup.render_ref(popup_rect, buf);
             }
-            ActivePopup::Skill(popup) => {
+            ActivePopup::Context(popup) | ActivePopup::Mention(popup) => {
                 popup.render_ref(popup_rect, buf);
             }
             ActivePopup::None => {
@@ -5210,7 +5624,7 @@ mod tests {
         }];
         composer.set_connector_mentions(Some(ConnectorsSnapshot { connectors }));
 
-        let ActivePopup::Skill(popup) = &composer.active_popup else {
+        let ActivePopup::Mention(popup) = &composer.active_popup else {
             panic!("expected mention popup to open after connectors update");
         };
         let mention = popup
@@ -5251,6 +5665,115 @@ mod tests {
         composer.set_connector_mentions(Some(ConnectorsSnapshot { connectors }));
 
         assert!(matches!(composer.active_popup, ActivePopup::None));
+    }
+
+    #[test]
+    fn context_popup_snapshot() {
+        snapshot_composer_state("context_popup", true, |composer| {
+            composer.set_collaboration_modes_enabled(true);
+            composer.set_text_content("##plan".to_string(), Vec::new(), Vec::new());
+            composer.on_together_context_search_result(
+                "plan".to_string(),
+                vec![
+                    ContextSearchResult {
+                        ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+                        kind: codex_together_protocol::ContextKind::RepoContextFile,
+                        title: "Planning Overview".to_string(),
+                        summary: Some(
+                            "plan · public · Ship the context browser first.".to_string(),
+                        ),
+                        location: Some(".codex/context/overview.md".to_string()),
+                        body: None,
+                    },
+                    ContextSearchResult {
+                        ref_id: "ctx:thread:thread-1".to_string(),
+                        kind: codex_together_protocol::ContextKind::SharedThread,
+                        title: "planning sync".to_string(),
+                        summary: Some(
+                            "owner=owner@example.com · shared_by=owner@example.com".to_string(),
+                        ),
+                        location: Some("thread/thread-1".to_string()),
+                        body: None,
+                    },
+                ],
+            );
+        });
+    }
+
+    #[test]
+    fn context_popup_inserts_binding_and_captures_submission_bindings() {
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+        composer.set_collaboration_modes_enabled(true);
+
+        composer.set_text_content("##plan".to_string(), Vec::new(), Vec::new());
+
+        match rx.try_recv() {
+            Ok(AppEvent::StartTogetherComposerContextSearch { query }) => {
+                assert_eq!(query, "plan".to_string());
+            }
+            other => panic!("expected context search request, got {other:?}"),
+        }
+
+        let result = ContextSearchResult {
+            ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+            kind: codex_together_protocol::ContextKind::RepoContextFile,
+            title: "Planning Overview".to_string(),
+            summary: Some("plan · public".to_string()),
+            location: Some(".codex/context/overview.md".to_string()),
+            body: None,
+        };
+        let expected_ref = context_ref_from_search_result(&result);
+        composer.on_together_context_search_result("plan".to_string(), vec![result]);
+
+        let ActivePopup::Context(popup) = &composer.active_popup else {
+            panic!("expected context popup to open");
+        };
+        let mention = popup
+            .selected_mention()
+            .expect("expected context row to be selected");
+        assert_eq!(mention.insert_text, "[ctx: Planning Overview]".to_string());
+        assert_eq!(mention.path, serde_json::to_string(&expected_ref).ok());
+
+        let (result, needs_redraw) = composer.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(result, InputResult::None);
+        assert!(needs_redraw);
+        assert_eq!(
+            composer.current_text(),
+            "[ctx: Planning Overview] ".to_string()
+        );
+        assert_eq!(
+            composer.context_bindings(),
+            vec![ContextBinding {
+                context_ref: expected_ref.clone(),
+            }]
+        );
+
+        let (result, needs_redraw) = composer.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert!(needs_redraw);
+        assert_eq!(
+            result,
+            InputResult::Submitted {
+                text: "[ctx: Planning Overview]".to_string(),
+                text_elements: vec![TextElement::new(
+                    (0.."[ctx: Planning Overview]".len()).into(),
+                    Some("[ctx: Planning Overview]".to_string()),
+                )],
+            }
+        );
+        assert_eq!(
+            composer.take_recent_submission_context_bindings(),
+            vec![ContextBinding {
+                context_ref: expected_ref,
+            }]
+        );
     }
 
     #[test]
@@ -6922,6 +7445,41 @@ mod tests {
                 );
             }
             _ => panic!("expected CommandWithArgs for /plan with args"),
+        }
+    }
+
+    #[test]
+    fn slash_host_stop_dispatches_with_inline_args() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+        composer.set_collaboration_modes_enabled(true);
+
+        type_chars_humanlike(
+            &mut composer,
+            &['/', 'h', 'o', 's', 't', ' ', 's', 't', 'o', 'p'],
+        );
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        match result {
+            InputResult::CommandWithArgs(cmd, args, text_elements) => {
+                assert_eq!(cmd.command(), "host");
+                assert_eq!(args, "stop");
+                assert!(text_elements.is_empty());
+            }
+            _ => panic!("expected CommandWithArgs for /host stop"),
         }
     }
 

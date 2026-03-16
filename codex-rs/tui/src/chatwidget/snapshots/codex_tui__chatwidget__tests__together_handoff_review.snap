@@ -1,0 +1,24 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: terminal.backend()
+---
+"                                                                                                                        "
+"                                                                                                                        "
+"  Handoff                                                    Create fresh thread from selected context                  "
+"  Handoff includes 2 context items                                                                                      "
+"                                                             Goal                                                       "
+"› 1. Create fresh thread  Start a new writable thread from   isolate mobile expiry investigation                        "
+"                          this handoff bundle                                                                           "
+"  2. Cancel               Keep the current thread unchanged  Source thread: thread-local-1                              "
+"                                                                                                                        "
+"  Enter create · Esc cancel                                                                                             "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "

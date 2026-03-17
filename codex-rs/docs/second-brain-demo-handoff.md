@@ -1,10 +1,12 @@
 # Second Brain Demo Handoff
 
-Last updated: 2026-03-17
+Last updated: 2026-03-18
 
 ## Goal
 
 Build a Codex Together demo where a repo acts as a "second brain" for humans and OpenClaw-style agents working through Codex threads.
+
+For the current proposed graph shape, see `docs/context-graph-model.md`.
 
 Core idea:
 
@@ -49,23 +51,35 @@ These are the decisions the next thread should treat as settled unless the user 
 - Thread-local context should be reconstructed from native Codex thread history and exposed through the shared graph engine; Together should consume that view, not own a separate thread-memory source of truth.
 - Attached context should use progressive disclosure: give the model refs, summaries, hotspots, and traversal paths first, not full concatenated bodies.
 - `context_graph` should be a native core tool backed by the same shared graph engine that powers `/context`.
+- The graph model should use one synthetic `anchor` node and two real content node types: `thread` and `repo`.
+- Thread context should remain one rooted graph projection, not separate "self-thread" and "lineage" storage systems.
+- Fork and handoff provenance should be represented through anchor metadata plus mounted/provenance edges.
 - Runtime graph indexes can live under `.codex/context/.graph/` as ignored, rebuildable discovery artifacts.
 - Promoted notes should keep direct source graph refs so persistent memory stays tied to the artifact graph instead of only whole-thread backlinks.
 - `codex-together` should be pruned back toward native Codex CLI behavior before adding graph/handoff demo features.
-- The graph should eventually include both repo-specific and agent-specific nodes.
+- `codex-together-server` should become the collaboration and discovery boundary for both Codex and non-Codex agents.
 
 ## What was discussed before pruning
 
-The high-level implementation plan that was agreed:
+The high-level implementation plan that was agreed before the graph simplification:
 
 - First-class actor model for humans and agents
-- Graph nodes for actor/thread/repo-note/file/handoff, with agent nodes first-class
+- richer graph node taxonomy including actor/thread/repo-note/file/handoff
 - Real graph edges instead of search-only stubs
 - Durable server-side handoff objects
 - Repo-backed context writes with provenance
 - Autonomous agent writes and commits
 - TUI `/context` as the main browsing surface
 - TUI `/handoff` as the main routing surface
+
+Current direction:
+
+- keep the actor model and handoff flow
+- simplify the graph to:
+  - one synthetic anchor
+  - thread nodes
+  - repo nodes
+- express fork/handoff/imported context through metadata and edges instead of more top-level node kinds
 
 Important long-term design calls:
 
@@ -105,12 +119,12 @@ At a high level, the current branch has already been pushed much closer to the d
 
 Once the next thread confirms the prune baseline is green, the next major workstream should be:
 
-1. Real graph model and indexer
-2. Actor identity for humans and `🦞` agents
-3. TUI `/context` graph view
-4. TUI `/handoff` advertised-target flow
-5. Durable handoff objects
-6. Repo-backed autonomous context updates
+1. Unified anchor/thread/repo graph schema
+2. Rooted graph queries and provenance-aware traversal
+3. TUI `/context` graph view with "here" / "from prev" / "handoff" / "repo" treatments
+4. TUI `/handoff` addressed-target flow for connected agents
+5. Shared thread ingestion and discovery for non-Codex agents
+6. Additive repo-memory promotion from selected thread nodes
 
 ## Important warning for the next thread
 

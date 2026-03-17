@@ -18,12 +18,18 @@ pub const METHOD_SESSION_JOIN: &str = "session/join";
 pub const METHOD_SESSION_LEAVE: &str = "session/leave";
 pub const METHOD_CONTEXT_SEARCH: &str = "context/search";
 pub const METHOD_CONTEXT_GRAPH: &str = "context/graph";
+pub const METHOD_CONTEXT_QUERY: &str = "context/query";
 pub const METHOD_CONTEXT_PREVIEW: &str = "context/preview";
 pub const METHOD_CONTEXT_RESOLVE_BUNDLE: &str = "context/resolveBundle";
 pub const METHOD_HANDOFF_PLAN: &str = "handoff/plan";
 pub const METHOD_HANDOFF_COMMIT: &str = "handoff/commit";
 pub const METHOD_CONTEXT_WRITE_PLAN: &str = "context/writePlan";
 pub const METHOD_CONTEXT_WRITE_COMMIT: &str = "context/writeCommit";
+pub const METHOD_MEMORY_PROMOTE: &str = "memory/promote";
+pub const METHOD_THREAD_START: &str = "thread/start";
+pub const METHOD_THREAD_APPEND_ITEMS: &str = "thread/appendItems";
+pub const METHOD_THREAD_READ: &str = "thread/read";
+pub const METHOD_THREAD_LIST: &str = "thread/list";
 
 pub const NOTIFY_HOST_STOPPED: &str = "host/stopped";
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,6 +233,181 @@ pub struct ContextGraphResponse {
     pub edges: Vec<ContextGraphEdge>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ContextPrecursorKind {
+    Fork,
+    Handoff,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ThreadArtifactKind {
+    Plan,
+    FileRead,
+    FileChange,
+    Search,
+    ToolOutput,
+    GraphQuery,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RepoMemoryKind {
+    Concept,
+    Decision,
+    Playbook,
+    Hotspot,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ContextMountReason {
+    Local,
+    ForkSeed,
+    HandoffSeed,
+    RepoNeighbor,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ContextEdgeType {
+    Mounted,
+    Related,
+    CoveredBy,
+    PromotedTo,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ThreadGraphQueryOperation {
+    Search,
+    Open,
+    Neighbors,
+    Hotspots,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ThreadGraphQueryScope {
+    Current,
+    Rooted,
+    Repo,
+    Workspace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextQueryAnchor {
+    pub anchor_id: String,
+    #[serde(default)]
+    pub current_thread_id: Option<String>,
+    #[serde(default)]
+    pub precursor_thread_id: Option<String>,
+    #[serde(default)]
+    pub precursor_kind: Option<ContextPrecursorKind>,
+    #[serde(default)]
+    pub actor_id: Option<String>,
+    #[serde(default)]
+    pub repo_root: Option<String>,
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    #[serde(default)]
+    pub goal: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextThreadNode {
+    pub node_id: String,
+    pub artifact_kind: ThreadArtifactKind,
+    pub title: String,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub location: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+    pub origin_thread_id: String,
+    #[serde(default)]
+    pub source_files: Vec<String>,
+    #[serde(default)]
+    pub source_refs: Vec<String>,
+    #[serde(default)]
+    pub created_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextRepoNode {
+    pub node_id: String,
+    pub repo_kind: RepoMemoryKind,
+    pub title: String,
+    #[serde(default)]
+    pub summary: Option<String>,
+    pub path: String,
+    #[serde(default)]
+    pub source_threads: Vec<String>,
+    #[serde(default)]
+    pub source_refs: Vec<String>,
+    #[serde(default)]
+    pub source_files: Vec<String>,
+    #[serde(default)]
+    pub last_validated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "nodeType", rename_all = "camelCase")]
+pub enum ContextQueryNode {
+    Thread(ContextThreadNode),
+    Repo(ContextRepoNode),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextQueryEdge {
+    pub from_node_id: String,
+    pub to_node_id: String,
+    pub edge_type: ContextEdgeType,
+    #[serde(default)]
+    pub mount_reason: Option<ContextMountReason>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextQueryParams {
+    #[serde(default)]
+    pub current_thread_id: Option<String>,
+    #[serde(default)]
+    pub precursor_thread_id: Option<String>,
+    #[serde(default)]
+    pub precursor_kind: Option<ContextPrecursorKind>,
+    #[serde(default)]
+    pub actor_id: Option<String>,
+    #[serde(default)]
+    pub repo_root: Option<String>,
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    #[serde(default)]
+    pub goal: Option<String>,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub seed_ref_ids: Vec<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextQueryResponse {
+    pub anchor: ContextQueryAnchor,
+    pub nodes: Vec<ContextQueryNode>,
+    pub edges: Vec<ContextQueryEdge>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextPreviewParams {
@@ -321,6 +502,23 @@ pub struct ContextWriteCommitResponse {
     pub written_files: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryPromoteParams {
+    #[serde(default)]
+    pub current_thread_id: Option<String>,
+    #[serde(default)]
+    pub selected_node_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryPromoteResponse {
+    pub created: Vec<String>,
+    pub already_covered: Vec<String>,
+    pub proposal_required: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HandoffPlanParams {
@@ -330,6 +528,8 @@ pub struct HandoffPlanParams {
     pub selected_ref_ids: Vec<String>,
     #[serde(default)]
     pub goal: Option<String>,
+    #[serde(default)]
+    pub preview_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,6 +567,192 @@ pub struct HandoffCommitResponse {
     #[serde(default)]
     pub rollout_path: Option<String>,
     pub cwd: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadStartParams {
+    pub actor_id: String,
+    #[serde(default)]
+    pub repo_root: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub goal: Option<String>,
+    #[serde(default)]
+    pub precursor_thread_id: Option<String>,
+    #[serde(default)]
+    pub precursor_kind: Option<ContextPrecursorKind>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadStartResponse {
+    pub thread_id: String,
+    pub actor_id: String,
+    #[serde(default)]
+    pub repo_root: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub goal: Option<String>,
+    #[serde(default)]
+    pub precursor_thread_id: Option<String>,
+    #[serde(default)]
+    pub precursor_kind: Option<ContextPrecursorKind>,
+    #[serde(default)]
+    pub created_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadSummary {
+    pub thread_id: String,
+    #[serde(default)]
+    pub actor_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub preview: Option<String>,
+    #[serde(default)]
+    pub repo_root: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    #[serde(default)]
+    pub goal: Option<String>,
+    #[serde(default)]
+    pub precursor_thread_id: Option<String>,
+    #[serde(default)]
+    pub precursor_kind: Option<ContextPrecursorKind>,
+    #[serde(default)]
+    pub updated_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadReadParams {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadReadResponse {
+    pub thread: ThreadSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadListParams {
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub repo_root: Option<String>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadListResponse {
+    pub data: Vec<ThreadSummary>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ThreadAppendItem {
+    Plan {
+        #[serde(default)]
+        id: Option<String>,
+        text: String,
+        #[serde(default)]
+        created_at: Option<i64>,
+    },
+    FileRead {
+        #[serde(default)]
+        id: Option<String>,
+        path: String,
+        #[serde(default)]
+        summary: Option<String>,
+        #[serde(default)]
+        content: Option<String>,
+        #[serde(default)]
+        created_at: Option<i64>,
+    },
+    FileChange {
+        #[serde(default)]
+        id: Option<String>,
+        path: String,
+        #[serde(default)]
+        summary: Option<String>,
+        #[serde(default)]
+        diff: Option<String>,
+        #[serde(default)]
+        created_at: Option<i64>,
+    },
+    Search {
+        #[serde(default)]
+        id: Option<String>,
+        query: String,
+        #[serde(default)]
+        summary: Option<String>,
+        #[serde(default)]
+        result_body: Option<String>,
+        #[serde(default)]
+        created_at: Option<i64>,
+    },
+    ToolOutput {
+        #[serde(default)]
+        id: Option<String>,
+        tool_name: String,
+        #[serde(default)]
+        summary: Option<String>,
+        output: String,
+        #[serde(default)]
+        created_at: Option<i64>,
+    },
+    GraphQuery {
+        #[serde(default)]
+        id: Option<String>,
+        operation: ThreadGraphQueryOperation,
+        scope: ThreadGraphQueryScope,
+        #[serde(default)]
+        query: Option<String>,
+        #[serde(default)]
+        ref_ids: Vec<String>,
+        #[serde(default)]
+        result_ref_ids: Vec<String>,
+        #[serde(default)]
+        summary: Option<String>,
+        #[serde(default)]
+        created_at: Option<i64>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadAppendItemsParams {
+    pub thread_id: String,
+    pub items: Vec<ThreadAppendItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadAppendItemsResponse {
+    pub appended_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -422,5 +808,141 @@ impl TogetherError {
             Self::ServerClosed => -39003,
             Self::IdentityUnavailable => -39004,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ContextEdgeType;
+    use super::ContextMountReason;
+    use super::ContextPrecursorKind;
+    use super::ContextQueryAnchor;
+    use super::ContextQueryEdge;
+    use super::ContextQueryNode;
+    use super::ContextQueryResponse;
+    use super::ContextRepoNode;
+    use super::ContextThreadNode;
+    use super::MemoryPromoteParams;
+    use super::RepoMemoryKind;
+    use super::ThreadAppendItem;
+    use super::ThreadAppendItemsParams;
+    use super::ThreadArtifactKind;
+    use super::ThreadGraphQueryOperation;
+    use super::ThreadGraphQueryScope;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn context_query_response_round_trips() {
+        let response = ContextQueryResponse {
+            anchor: ContextQueryAnchor {
+                anchor_id: "anchor:thread-2".to_string(),
+                current_thread_id: Some("thread-2".to_string()),
+                precursor_thread_id: Some("thread-1".to_string()),
+                precursor_kind: Some(ContextPrecursorKind::Handoff),
+                actor_id: Some("reviewer@local".to_string()),
+                repo_root: Some("/repo".to_string()),
+                git_branch: Some("rewrite-codex-2gether-v2".to_string()),
+                goal: Some("Verify the simplified /context and /handoff flow.".to_string()),
+            },
+            nodes: vec![
+                ContextQueryNode::Thread(ContextThreadNode {
+                    node_id: "ctx:thread-insight:thread-1:plan-2".to_string(),
+                    artifact_kind: ThreadArtifactKind::Plan,
+                    title: "Simplify /context selection flow".to_string(),
+                    summary: Some("thread insight · retained plan output".to_string()),
+                    location: Some("insight/plan-2".to_string()),
+                    body: Some(
+                        "Only show one-line nodes and let Enter toggle selection.".to_string(),
+                    ),
+                    origin_thread_id: "thread-1".to_string(),
+                    source_files: Vec::new(),
+                    source_refs: Vec::new(),
+                    created_at: Some(1_773_792_000),
+                }),
+                ContextQueryNode::Repo(ContextRepoNode {
+                    node_id: "ctx:file:.codex/context/playbooks/handoff-selection-flow.md"
+                        .to_string(),
+                    repo_kind: RepoMemoryKind::Playbook,
+                    title: "Handoff selection flow".to_string(),
+                    summary: Some(
+                        "Selection-only handoff UI with auto-promotion on commit.".to_string(),
+                    ),
+                    path: ".codex/context/playbooks/handoff-selection-flow.md".to_string(),
+                    source_threads: vec!["thread-1".to_string()],
+                    source_refs: vec!["ctx:thread-insight:thread-1:plan-2".to_string()],
+                    source_files: vec!["tui/src/chatwidget.rs".to_string()],
+                    last_validated_at: Some("2026-03-18".to_string()),
+                }),
+            ],
+            edges: vec![
+                ContextQueryEdge {
+                    from_node_id: "anchor:thread-2".to_string(),
+                    to_node_id: "ctx:thread-insight:thread-1:plan-2".to_string(),
+                    edge_type: ContextEdgeType::Mounted,
+                    mount_reason: Some(ContextMountReason::HandoffSeed),
+                    reason: None,
+                },
+                ContextQueryEdge {
+                    from_node_id: "ctx:thread-insight:thread-1:plan-2".to_string(),
+                    to_node_id: "ctx:file:.codex/context/playbooks/handoff-selection-flow.md"
+                        .to_string(),
+                    edge_type: ContextEdgeType::CoveredBy,
+                    mount_reason: None,
+                    reason: None,
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&response).expect("serialize context query response");
+        let round_trip = serde_json::from_str::<ContextQueryResponse>(&json)
+            .expect("deserialize context query response");
+        assert_eq!(round_trip, response);
+    }
+
+    #[test]
+    fn thread_append_items_params_round_trip_graph_query_variant() {
+        let params = ThreadAppendItemsParams {
+            thread_id: "thread-2".to_string(),
+            items: vec![ThreadAppendItem::GraphQuery {
+                id: Some("graph-1".to_string()),
+                operation: ThreadGraphQueryOperation::Hotspots,
+                scope: ThreadGraphQueryScope::Rooted,
+                query: Some("handoff".to_string()),
+                ref_ids: vec!["ctx:thread-insight:thread-1:plan-2".to_string()],
+                result_ref_ids: vec![
+                    "ctx:file:.codex/context/playbooks/handoff-selection-flow.md".to_string(),
+                ],
+                summary: Some("1 rooted context hotspot(s)".to_string()),
+                created_at: Some(1_773_792_200),
+            }],
+        };
+
+        let json = serde_json::to_string(&params).expect("serialize thread append items params");
+        let round_trip = serde_json::from_str::<ThreadAppendItemsParams>(&json)
+            .expect("deserialize thread append items params");
+        assert_eq!(round_trip, params);
+    }
+
+    #[test]
+    fn memory_promote_params_serialize_selected_node_ids() {
+        let params = MemoryPromoteParams {
+            current_thread_id: Some("thread-2".to_string()),
+            selected_node_ids: vec![
+                "ctx:thread-insight:thread-2:plan-1".to_string(),
+                "ctx:thread-file:thread-2:tui-src-chatwidget-rs".to_string(),
+            ],
+        };
+
+        let value = serde_json::to_value(&params).expect("serialize memory promote params");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "currentThreadId": "thread-2",
+                "selectedNodeIds": [
+                    "ctx:thread-insight:thread-2:plan-1",
+                    "ctx:thread-file:thread-2:tui-src-chatwidget-rs"
+                ]
+            })
+        );
     }
 }

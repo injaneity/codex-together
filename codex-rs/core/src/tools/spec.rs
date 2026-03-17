@@ -19,6 +19,8 @@ use crate::tools::handlers::multi_agents::MIN_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::request_user_input_tool_description;
 use crate::tools::registry::ToolRegistryBuilder;
 use codex_protocol::config_types::WebSearchMode;
+use codex_protocol::context_graph::CONTEXT_GRAPH_TOOL_NAME;
+use codex_protocol::context_graph::ContextGraphToolArgs;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::VIEW_IMAGE_TOOL_NAME;
 use codex_protocol::openai_models::ApplyPatchToolType;
@@ -26,6 +28,7 @@ use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use schemars::schema_for;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -1148,6 +1151,21 @@ fn create_search_tool_bm25_tool(app_tools: &HashMap<String, ToolInfo>) -> ToolSp
     })
 }
 
+fn create_context_graph_tool() -> ToolSpec {
+    let schema = serde_json::to_value(schema_for!(ContextGraphToolArgs))
+        .unwrap_or_else(|err| panic!("context_graph args schema should serialize: {err}"));
+    let parameters = parse_tool_input_schema(&schema)
+        .unwrap_or_else(|err| panic!("context_graph args schema should parse: {err}"));
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: CONTEXT_GRAPH_TOOL_NAME.to_string(),
+        description: "Browse the current thread artifact graph and persistent repo memory under .codex/context through progressive disclosure. Search nodes, traverse neighbors, open a node, or surface promotion hotspots instead of loading everything at once."
+            .to_string(),
+        strict: false,
+        parameters,
+    })
+}
+
 fn create_read_file_tool() -> ToolSpec {
     let indentation_properties = BTreeMap::from([
         (
@@ -1649,6 +1667,7 @@ pub(crate) fn build_specs(
     dynamic_tools: &[DynamicToolSpec],
 ) -> ToolRegistryBuilder {
     use crate::tools::handlers::ApplyPatchHandler;
+    use crate::tools::handlers::ContextGraphHandler;
     use crate::tools::handlers::DynamicToolHandler;
     use crate::tools::handlers::GrepFilesHandler;
     use crate::tools::handlers::JsReplHandler;
@@ -1675,6 +1694,7 @@ pub(crate) fn build_specs(
     let plan_handler = Arc::new(PlanHandler);
     let apply_patch_handler = Arc::new(ApplyPatchHandler);
     let dynamic_tool_handler = Arc::new(DynamicToolHandler);
+    let context_graph_handler = Arc::new(ContextGraphHandler);
     let view_image_handler = Arc::new(ViewImageHandler);
     let mcp_handler = Arc::new(McpHandler);
     let mcp_resource_handler = Arc::new(McpResourceHandler);
@@ -1824,11 +1844,13 @@ pub(crate) fn build_specs(
 
     if config.collab_tools {
         let multi_agent_handler = Arc::new(MultiAgentHandler);
+        builder.push_spec_with_parallel_support(create_context_graph_tool(), true);
         builder.push_spec(create_spawn_agent_tool(config));
         builder.push_spec(create_send_input_tool());
         builder.push_spec(create_resume_agent_tool());
         builder.push_spec(create_wait_tool());
         builder.push_spec(create_close_agent_tool());
+        builder.register_handler(CONTEXT_GRAPH_TOOL_NAME, context_graph_handler);
         builder.register_handler("spawn_agent", multi_agent_handler.clone());
         builder.register_handler("send_input", multi_agent_handler.clone());
         builder.register_handler("resume_agent", multi_agent_handler.clone());
@@ -2113,6 +2135,7 @@ mod tests {
         assert_contains_tool_names(
             &tools,
             &[
+                "context_graph",
                 "spawn_agent",
                 "send_input",
                 "wait",
@@ -2142,6 +2165,7 @@ mod tests {
         assert_contains_tool_names(
             &tools,
             &[
+                "context_graph",
                 "spawn_agent",
                 "send_input",
                 "resume_agent",

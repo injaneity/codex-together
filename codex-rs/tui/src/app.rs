@@ -14,6 +14,7 @@ use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ExternalEditorState;
 use crate::chatwidget::commit_together_context_write_plan;
 use crate::chatwidget::commit_together_handoff_plan;
+use crate::chatwidget::fetch_together_context_graph;
 use crate::chatwidget::plan_together_context_handoff;
 use crate::chatwidget::plan_together_context_write;
 use crate::chatwidget::search_together_context;
@@ -938,6 +939,33 @@ impl App {
             Err(err) => self
                 .chat_widget
                 .add_error_message(format!("Failed to write repo context: {err}")),
+        }
+    }
+
+    async fn toggle_together_context_scope(&mut self) {
+        let Some(request) = self.chat_widget.together_context_toggle_request() else {
+            return;
+        };
+        let current_thread_id = matches!(
+            request.next_scope,
+            crate::chatwidget::TogetherContextScope::LocalThread
+        )
+        .then(|| {
+            self.chat_widget
+                .thread_id()
+                .map(|thread_id| thread_id.to_string())
+        })
+        .flatten();
+        match fetch_together_context_graph(request.query.clone(), current_thread_id).await {
+            Ok(graph) => self.chat_widget.show_together_context_view_with_marks(
+                request.query,
+                graph,
+                request.next_scope,
+                request.marked_ref_ids,
+            ),
+            Err(err) => self
+                .chat_widget
+                .add_error_message(format!("Failed to refresh context graph: {err}")),
         }
     }
 
@@ -3288,11 +3316,19 @@ impl App {
                 self.chat_widget
                     .on_together_context_bundle_resolve_failed(error);
             }
-            AppEvent::OpenTogetherContextView { query, graph } => {
-                self.chat_widget.show_together_context_view(query, graph);
+            AppEvent::OpenTogetherContextView {
+                query,
+                graph,
+                scope,
+            } => {
+                self.chat_widget
+                    .show_together_context_view(query, graph, scope);
             }
             AppEvent::ToggleTogetherContextMark { actual_idx } => {
                 self.chat_widget.toggle_together_context_mark(actual_idx);
+            }
+            AppEvent::ToggleTogetherContextScope => {
+                self.toggle_together_context_scope().await;
             }
             AppEvent::AttachTogetherContextSelection { actual_idx } => {
                 self.chat_widget

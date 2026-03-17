@@ -1837,6 +1837,14 @@ async fn together_context_view_snapshot() {
                     ),
                 },
                 ContextSearchResult {
+                    ref_id: format!("ctx:thread-insight:{thread_id}:plan-1"),
+                    kind: ContextKind::ThreadInsight,
+                    title: "Capture branch state".to_string(),
+                    summary: Some("thread insight · retained plan output".to_string()),
+                    location: Some("insight/plan-1".to_string()),
+                    body: Some("Capture branch state".to_string()),
+                },
+                ContextSearchResult {
                     ref_id: "ctx:file:.codex/context/overview.md".to_string(),
                     kind: ContextKind::RepoContextFile,
                     title: "Summarize this branch in one sentence.".to_string(),
@@ -1844,6 +1852,190 @@ async fn together_context_view_snapshot() {
                     location: Some(".codex/context/overview.md".to_string()),
                     body: Some(
                         "# Summarize this branch in one sentence.\n\nThis branch is simplifying /context so the active thread stays at the root and linked persistent notes read like summary context instead of extra graph rows."
+                            .to_string(),
+                    ),
+                },
+            ],
+            edges: vec![
+                ContextGraphEdge {
+                    from_ref_id: format!("ctx:thread:{thread_id}"),
+                    to_ref_id: format!("ctx:thread-insight:{thread_id}:plan-1"),
+                    label: "insight".to_string(),
+                },
+                ContextGraphEdge {
+                    from_ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+                    to_ref_id: format!("ctx:thread:{thread_id}"),
+                    label: "source".to_string(),
+                },
+                ContextGraphEdge {
+                    from_ref_id: format!("ctx:thread:{thread_id}"),
+                    to_ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+                    label: "branch".to_string(),
+                },
+            ],
+        },
+        TogetherContextScope::LocalThread,
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw context view");
+    assert_snapshot!("together_context_view", terminal.backend());
+}
+
+#[tokio::test]
+async fn together_context_global_view_snapshot() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
+    chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
+
+    chat.show_together_context_view(
+        None,
+        ContextGraphResponse {
+            nodes: vec![
+                ContextSearchResult {
+                    ref_id: format!("ctx:thread:{thread_id}"),
+                    kind: ContextKind::SharedThread,
+                    title: "🦞 lobster-worker · Current Thread".to_string(),
+                    summary: Some(
+                        "current thread · branch=rewrite-codex-2gether-v2".to_string(),
+                    ),
+                    location: Some(format!("thread/{thread_id}")),
+                    body: Some(
+                        format!(
+                            "Thread: {thread_id}\nCwd: /tmp/repo\nUpdated at: 1741422760\nAgent role: research\nAgent: lobster-worker\nGit branch: rewrite-codex-2gether-v2"
+                        ),
+                    ),
+                },
+                ContextSearchResult {
+                    ref_id: format!("ctx:thread-insight:{thread_id}:plan-1"),
+                    kind: ContextKind::ThreadInsight,
+                    title: "Capture branch state".to_string(),
+                    summary: Some("thread insight · retained plan output".to_string()),
+                    location: Some("insight/plan-1".to_string()),
+                    body: Some("Capture branch state".to_string()),
+                },
+                ContextSearchResult {
+                    ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+                    kind: ContextKind::RepoContextFile,
+                    title: "Summarize this branch in one sentence.".to_string(),
+                    summary: Some("concept · Branch summary for demo flow.".to_string()),
+                    location: Some(".codex/context/overview.md".to_string()),
+                    body: Some(
+                        "# Summarize this branch in one sentence.\n\nThis branch is simplifying /context so the active thread stays at the root and linked persistent notes read like summary context instead of extra graph rows."
+                            .to_string(),
+                    ),
+                },
+            ],
+            edges: vec![
+                ContextGraphEdge {
+                    from_ref_id: format!("ctx:thread:{thread_id}"),
+                    to_ref_id: format!("ctx:thread-insight:{thread_id}:plan-1"),
+                    label: "insight".to_string(),
+                },
+                ContextGraphEdge {
+                    from_ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+                    to_ref_id: format!("ctx:thread:{thread_id}"),
+                    label: "source".to_string(),
+                },
+                ContextGraphEdge {
+                    from_ref_id: format!("ctx:thread:{thread_id}"),
+                    to_ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+                    label: "branch".to_string(),
+                },
+            ],
+        },
+        TogetherContextScope::Global,
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw context view");
+    assert_snapshot!("together_context_view_global", terminal.backend());
+}
+
+#[tokio::test]
+async fn together_context_local_view_without_anchor_snapshot() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
+    chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
+
+    chat.show_together_context_view(
+        None,
+        ContextGraphResponse {
+            nodes: vec![
+                ContextSearchResult {
+                    ref_id: format!("ctx:thread-insight:{thread_id}:plan-1"),
+                    kind: ContextKind::ThreadInsight,
+                    title: "Capture branch state".to_string(),
+                    summary: Some("thread insight · retained plan output".to_string()),
+                    location: Some("insight/plan-1".to_string()),
+                    body: Some("Capture branch state".to_string()),
+                },
+                ContextSearchResult {
+                    ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+                    kind: ContextKind::RepoContextFile,
+                    title: "Summarize this branch in one sentence.".to_string(),
+                    summary: Some("concept · Branch summary for demo flow.".to_string()),
+                    location: Some(".codex/context/overview.md".to_string()),
+                    body: Some(
+                        "# Summarize this branch in one sentence.\n\nThis branch is simplifying /context so the active thread stays at the root and linked persistent notes read like summary context instead of extra graph rows."
+                            .to_string(),
+                    ),
+                },
+            ],
+            edges: Vec::new(),
+        },
+        TogetherContextScope::LocalThread,
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw context view");
+    assert_snapshot!(
+        "together_context_view_local_without_anchor",
+        terminal.backend()
+    );
+}
+
+#[tokio::test]
+async fn together_context_local_view_without_artifacts_snapshot() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
+    chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
+
+    chat.show_together_context_view(
+        None,
+        ContextGraphResponse {
+            nodes: vec![
+                ContextSearchResult {
+                    ref_id: format!("ctx:thread:{thread_id}"),
+                    kind: ContextKind::SharedThread,
+                    title: "🦞 lobster-worker · Current Thread".to_string(),
+                    summary: Some("current thread".to_string()),
+                    location: Some(format!("thread/{thread_id}")),
+                    body: Some(format!("Thread: {thread_id}\nAgent: lobster-worker")),
+                },
+                ContextSearchResult {
+                    ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+                    kind: ContextKind::RepoContextFile,
+                    title: "Summarize this branch in one sentence.".to_string(),
+                    summary: Some("concept · Branch summary for demo flow.".to_string()),
+                    location: Some(".codex/context/overview.md".to_string()),
+                    body: Some(
+                        "# Summarize this branch in one sentence.\n\nThis branch is simplifying /context."
                             .to_string(),
                     ),
                 },
@@ -1861,18 +2053,22 @@ async fn together_context_view_snapshot() {
                 },
             ],
         },
+        TogetherContextScope::LocalThread,
     );
 
     let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("create terminal");
     terminal
         .draw(|f| chat.render(f.area(), f.buffer_mut()))
         .expect("draw context view");
-    assert_snapshot!("together_context_view", terminal.backend());
+    assert_snapshot!(
+        "together_context_view_local_without_artifacts",
+        terminal.backend()
+    );
 }
 
 #[test]
-fn together_context_view_hides_linked_repo_note_row_in_default_thread_view() {
-    let rows = together_context_visible_tree_rows(
+fn together_context_local_scope_prefers_thread_artifacts_over_thread_summary() {
+    let rows = together_context_tree_rows_for_scope(
         vec![
             ContextSearchResult {
                 ref_id: "ctx:thread-insight:thread-1:plan-1".to_string(),
@@ -1917,19 +2113,185 @@ fn together_context_view_hides_linked_repo_note_row_in_default_thread_view() {
             },
         ],
         Some("ctx:thread:thread-1"),
-        None,
+        TogetherContextScope::LocalThread,
     );
 
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].result.ref_id, "ctx:thread:thread-1");
-    assert!(rows[0].is_current_thread);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].result.ref_id, "ctx:thread-insight:thread-1:plan-1");
+}
+
+#[test]
+fn together_context_local_scope_prefers_thread_artifacts_when_anchor_missing() {
+    let rows = together_context_tree_rows_for_scope(
+        vec![
+            ContextSearchResult {
+                ref_id: "ctx:thread-insight:thread-1:plan-1".to_string(),
+                kind: ContextKind::ThreadInsight,
+                title: "Capture the branch state.".to_string(),
+                summary: Some("insight".to_string()),
+                location: Some("insight/plan-1".to_string()),
+                body: None,
+            },
+            ContextSearchResult {
+                ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+                kind: ContextKind::RepoContextFile,
+                title: "Planning Overview".to_string(),
+                summary: Some("plan".to_string()),
+                location: Some(".codex/context/overview.md".to_string()),
+                body: None,
+            },
+        ],
+        &[],
+        Some("ctx:thread:thread-1"),
+        TogetherContextScope::LocalThread,
+    );
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.result.ref_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ctx:thread-insight:thread-1:plan-1"]
+    );
+}
+
+#[test]
+fn together_context_local_scope_is_empty_when_no_thread_artifacts_exist() {
+    let rows = together_context_tree_rows_for_scope(
+        vec![ContextSearchResult {
+            ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+            kind: ContextKind::RepoContextFile,
+            title: "Planning Overview".to_string(),
+            summary: Some("plan".to_string()),
+            location: Some(".codex/context/overview.md".to_string()),
+            body: None,
+        }],
+        &[],
+        Some("ctx:thread:thread-1"),
+        TogetherContextScope::LocalThread,
+    );
+
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn together_context_global_scope_keeps_linked_repo_note_row() {
+    let rows = together_context_tree_rows_for_scope(
+        vec![
+            ContextSearchResult {
+                ref_id: "ctx:thread-insight:thread-1:plan-1".to_string(),
+                kind: ContextKind::ThreadInsight,
+                title: "Capture the branch state.".to_string(),
+                summary: Some("insight".to_string()),
+                location: Some("insight/plan-1".to_string()),
+                body: None,
+            },
+            ContextSearchResult {
+                ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+                kind: ContextKind::RepoContextFile,
+                title: "Planning Overview".to_string(),
+                summary: Some("plan".to_string()),
+                location: Some(".codex/context/overview.md".to_string()),
+                body: None,
+            },
+            ContextSearchResult {
+                ref_id: "ctx:thread:thread-1".to_string(),
+                kind: ContextKind::SharedThread,
+                title: "planning sync".to_string(),
+                summary: Some("thread".to_string()),
+                location: Some("thread/thread-1".to_string()),
+                body: None,
+            },
+        ],
+        &[
+            ContextGraphEdge {
+                from_ref_id: "ctx:thread:thread-1".to_string(),
+                to_ref_id: "ctx:thread-insight:thread-1:plan-1".to_string(),
+                label: "insight".to_string(),
+            },
+            ContextGraphEdge {
+                from_ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+                to_ref_id: "ctx:thread:thread-1".to_string(),
+                label: "source".to_string(),
+            },
+            ContextGraphEdge {
+                from_ref_id: "ctx:thread:thread-1".to_string(),
+                to_ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+                label: "branch".to_string(),
+            },
+        ],
+        Some("ctx:thread:thread-1"),
+        TogetherContextScope::Global,
+    );
+
+    assert_eq!(rows.len(), 3);
     assert_eq!(rows[1].result.ref_id, "ctx:thread-insight:thread-1:plan-1");
-    assert_eq!(rows[1].relation_labels, vec!["insight".to_string()]);
+    assert_eq!(rows[2].result.ref_id, "ctx:file:.codex/context/overview.md");
+}
+
+#[test]
+fn together_context_global_scope_orders_derived_repo_note_under_artifact() {
+    let rows = together_context_tree_rows_for_scope(
+        vec![
+            ContextSearchResult {
+                ref_id: "ctx:thread-insight:thread-1:plan-1".to_string(),
+                kind: ContextKind::ThreadInsight,
+                title: "Capture the branch state.".to_string(),
+                summary: Some("insight".to_string()),
+                location: Some("insight/plan-1".to_string()),
+                body: None,
+            },
+            ContextSearchResult {
+                ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+                kind: ContextKind::RepoContextFile,
+                title: "Planning Overview".to_string(),
+                summary: Some("plan".to_string()),
+                location: Some(".codex/context/overview.md".to_string()),
+                body: None,
+            },
+            ContextSearchResult {
+                ref_id: "ctx:thread:thread-1".to_string(),
+                kind: ContextKind::SharedThread,
+                title: "planning sync".to_string(),
+                summary: Some("thread".to_string()),
+                location: Some("thread/thread-1".to_string()),
+                body: None,
+            },
+        ],
+        &[
+            ContextGraphEdge {
+                from_ref_id: "ctx:thread:thread-1".to_string(),
+                to_ref_id: "ctx:thread-insight:thread-1:plan-1".to_string(),
+                label: "insight".to_string(),
+            },
+            ContextGraphEdge {
+                from_ref_id: "ctx:thread-insight:thread-1:plan-1".to_string(),
+                to_ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+                label: "derived".to_string(),
+            },
+        ],
+        Some("ctx:thread:thread-1"),
+        TogetherContextScope::Global,
+    );
+
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.result.ref_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "ctx:thread:thread-1",
+            "ctx:thread-insight:thread-1:plan-1",
+            "ctx:file:.codex/context/overview.md",
+        ]
+    );
 }
 
 #[tokio::test]
 async fn together_context_view_emits_attach_mark_and_write_events() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(
+        ThreadId::from_string("019cf3a8-0cf0-7eb1-b748-738284242df8").expect("valid thread id"),
+    );
 
     chat.show_together_context_view(
         Some("planning".to_string()),
@@ -1944,6 +2306,7 @@ async fn together_context_view_emits_attach_mark_and_write_events() {
             }],
             edges: Vec::new(),
         },
+        TogetherContextScope::Global,
     );
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
@@ -1956,6 +2319,12 @@ async fn together_context_view_emits_attach_mark_and_write_events() {
     assert_matches!(
         rx.try_recv().expect("expected write event"),
         AppEvent::PlanTogetherContextWrite { actual_idx: 0 }
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT));
+    assert_matches!(
+        rx.try_recv().expect("expected toggle event"),
+        AppEvent::ToggleTogetherContextScope
     );
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -1992,6 +2361,7 @@ async fn together_context_marked_attach_inserts_all_marked_tokens() {
             ],
             edges: Vec::new(),
         },
+        TogetherContextScope::Global,
     );
 
     chat.toggle_together_context_mark(0);
@@ -2031,6 +2401,7 @@ async fn together_context_source_thread_id_prefers_selected_shared_thread() {
             ],
             edges: Vec::new(),
         },
+        TogetherContextScope::Global,
     );
 
     assert_eq!(

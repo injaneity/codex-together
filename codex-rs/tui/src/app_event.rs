@@ -442,12 +442,16 @@ pub(crate) enum AppEvent {
     OpenTogetherContextView {
         query: Option<String>,
         graph: ContextGraphResponse,
+        scope: crate::chatwidget::TogetherContextScope,
     },
 
     /// Toggle whether the selected collaboration context row is marked.
     ToggleTogetherContextMark {
         actual_idx: usize,
     },
+
+    /// Toggle between local-thread and global collaboration context scopes.
+    ToggleTogetherContextScope,
 
     /// Attach the current or marked collaboration context rows into the composer.
     AttachTogetherContextSelection {

@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -34,11 +33,17 @@ use codex_app_server_protocol::JSONRPCNotification as AppJsonRpcNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxMode as AppServerSandboxMode;
-use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_context_graph::ContextDocument;
+use codex_context_graph::build_context_graph as shared_build_context_graph;
+use codex_context_graph::context_thread_id_from_ref_id as shared_context_thread_id_from_ref_id;
+use codex_context_graph::repo_context_documents as shared_repo_context_documents;
+use codex_context_graph::search_context_documents as shared_search_context_documents;
+use codex_context_graph::thread_context_document as shared_thread_context_document;
+use codex_context_graph::thread_context_documents as shared_thread_context_documents;
 use codex_core::config::find_codex_home;
 use codex_core::git_info::current_branch_name;
 use codex_core::git_info::get_git_repo_root;
@@ -131,8 +136,6 @@ const RPC_ERR_OVERLOADED: i64 = -39007;
 const APP_SERVER_MAX_OVERLOAD_RETRIES: usize = 3;
 const APP_SERVER_OVERLOAD_BACKOFF_MS: [u64; APP_SERVER_MAX_OVERLOAD_RETRIES] = [100, 300, 900];
 const CONTEXT_DEFAULT_LIMIT: u32 = 40;
-const CONTEXT_MAX_LIMIT: u32 = 200;
-const CONTEXT_BODY_CHAR_LIMIT: usize = 4_000;
 
 #[derive(Clone)]
 struct AppState {
@@ -179,25 +182,6 @@ struct HostedServer {
     members: HashSet<String>,
 }
 
-#[derive(Debug, Clone)]
-struct ContextDocument {
-    ref_id: String,
-    kind: ContextKind,
-    title: String,
-    summary: Option<String>,
-    location: Option<String>,
-    body: Option<String>,
-    search_text: String,
-    graph: ContextDocumentGraphMetadata,
-}
-
-#[derive(Debug, Clone, Default)]
-struct ContextDocumentGraphMetadata {
-    branches: Vec<String>,
-    source_threads: Vec<String>,
-    source_files: Vec<String>,
-}
-
 #[derive(Debug, Default)]
 struct RepoContextMetadata {
     id: Option<String>,
@@ -206,6 +190,7 @@ struct RepoContextMetadata {
     branches: Vec<String>,
     source_threads: Vec<String>,
     source_files: Vec<String>,
+    source_refs: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -914,7 +899,7 @@ async fn handoff_plan(
 
     let mut kept_entries = vec![source_entry];
     kept_entries.extend(selected_context_entries(
-        documents,
+        &documents,
         &payload.selected_ref_ids,
     ));
     dedupe_context_entries(&mut kept_entries);
@@ -923,7 +908,7 @@ async fn handoff_plan(
         .iter()
         .map(|entry| entry.context_ref.clone())
         .collect::<Vec<_>>();
-    let token_estimate = estimate_context_bundle_tokens(&kept_entries);
+    let token_estimate = estimate_context_bundle_tokens(&documents, &kept_entries);
     let plan_id = Uuid::new_v4().to_string();
     let goal = payload.goal.filter(|value| !value.trim().is_empty());
 
@@ -1199,23 +1184,10 @@ fn broadcast_notification(state: &ServerState, method: &str, params: Value) {
     }
 }
 
-impl ContextDocument {
-    fn into_search_result(self) -> ContextSearchResult {
-        ContextSearchResult {
-            ref_id: self.ref_id,
-            kind: self.kind,
-            title: self.title,
-            summary: self.summary,
-            location: self.location,
-            body: self.body,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct ResolvedContextEntry {
     context_ref: ContextRef,
-    bundle_text: String,
+    document: ContextDocument,
 }
 
 #[derive(Debug, Clone)]
@@ -1234,7 +1206,7 @@ async fn context_search_results(
     current_thread_id: Option<&str>,
 ) -> Vec<ContextSearchResult> {
     let documents = context_documents(state, context_focus_thread_ids(current_thread_id)).await;
-    search_context_documents(documents, query, limit, current_thread_id)
+    shared_search_context_documents(documents, query, limit, current_thread_id)
 }
 
 fn build_context_graph(
@@ -1243,30 +1215,7 @@ fn build_context_graph(
     limit: u32,
     current_thread_id: Option<&str>,
 ) -> ContextGraphResponse {
-    let limit = limit.clamp(1, CONTEXT_MAX_LIMIT) as usize;
-    let all_edges = context_graph_edges(&documents);
-    let mut nodes = context_graph_documents(documents, &all_edges, query, limit, current_thread_id);
-    sort_context_documents(&mut nodes, query, current_thread_id);
-    if nodes.len() > limit {
-        nodes.truncate(limit);
-    }
-    let node_ref_ids = nodes
-        .iter()
-        .map(|document| document.ref_id.clone())
-        .collect::<HashSet<_>>();
-    let edges = all_edges
-        .into_iter()
-        .filter(|edge| {
-            node_ref_ids.contains(&edge.from_ref_id) && node_ref_ids.contains(&edge.to_ref_id)
-        })
-        .collect();
-    ContextGraphResponse {
-        nodes: nodes
-            .into_iter()
-            .map(ContextDocument::into_search_result)
-            .collect(),
-        edges,
-    }
+    shared_build_context_graph(documents, query, limit, current_thread_id)
 }
 
 async fn context_documents(
@@ -1281,7 +1230,7 @@ async fn context_documents(
         }
     };
 
-    let mut documents = repo_context_documents(repo_root.as_path());
+    let mut documents = shared_repo_context_documents(repo_root.as_path());
     documents.extend(
         current_thread_context_documents(state, focus_thread_ids, Some(repo_root.as_path())).await,
     );
@@ -1304,14 +1253,16 @@ fn context_focus_thread_ids(current_thread_id: Option<&str>) -> Vec<String> {
 }
 
 fn context_focus_thread_ids_for_ref_id(ref_id: &str) -> Vec<String> {
-    context_thread_id_from_ref_id(ref_id).into_iter().collect()
+    shared_context_thread_id_from_ref_id(ref_id)
+        .into_iter()
+        .collect()
 }
 
 fn context_focus_thread_ids_for_ref_ids(ref_ids: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
     ref_ids
         .iter()
-        .filter_map(|ref_id| context_thread_id_from_ref_id(ref_id))
+        .filter_map(|ref_id| shared_context_thread_id_from_ref_id(ref_id))
         .filter(|thread_id| seen.insert(thread_id.clone()))
         .collect()
 }
@@ -1332,154 +1283,17 @@ fn context_focus_thread_ids_for_handoff(
 }
 
 fn context_thread_id_from_ref_id(ref_id: &str) -> Option<String> {
-    [
-        "ctx:thread-insight:",
-        "ctx:thread-file:",
-        "ctx:thread-search:",
-        "ctx:thread-tool:",
-    ]
-    .into_iter()
-    .find_map(|prefix| {
-        ref_id.strip_prefix(prefix).and_then(|rest| {
-            rest.split_once(':')
-                .map(|(thread_id, _)| thread_id.to_string())
-        })
-    })
-    .or_else(|| ref_id.strip_prefix("ctx:thread:").map(str::to_string))
+    shared_context_thread_id_from_ref_id(ref_id)
 }
 
+#[cfg(test)]
 fn search_context_documents(
     documents: Vec<ContextDocument>,
     query: Option<&str>,
     limit: u32,
     current_thread_id: Option<&str>,
 ) -> Vec<ContextSearchResult> {
-    search_context_documents_internal(documents, query, limit, current_thread_id)
-        .into_iter()
-        .map(ContextDocument::into_search_result)
-        .collect()
-}
-
-fn search_context_documents_internal(
-    mut documents: Vec<ContextDocument>,
-    query: Option<&str>,
-    limit: u32,
-    current_thread_id: Option<&str>,
-) -> Vec<ContextDocument> {
-    let limit = limit.clamp(1, CONTEXT_MAX_LIMIT) as usize;
-    let query = query.map(str::trim).filter(|value| !value.is_empty());
-
-    if let Some(query) = query {
-        let query_lower = query.to_ascii_lowercase();
-        let tokens = query_lower.split_whitespace().collect::<Vec<_>>();
-        documents.retain(|document| document_matches_query(document, &tokens));
-    }
-
-    sort_context_documents(&mut documents, query, current_thread_id);
-
-    if documents.len() > limit {
-        documents.truncate(limit);
-    }
-
-    documents
-}
-
-fn context_graph_documents(
-    documents: Vec<ContextDocument>,
-    edges: &[ContextGraphEdge],
-    query: Option<&str>,
-    limit: usize,
-    current_thread_id: Option<&str>,
-) -> Vec<ContextDocument> {
-    let current_component_ref_ids = current_thread_id
-        .map(|thread_id| format!("ctx:thread:{thread_id}"))
-        .map(|thread_ref_id| context_connected_ref_ids(edges, thread_ref_id.as_str()))
-        .unwrap_or_default();
-    let query = query.map(str::trim).filter(|value| !value.is_empty());
-
-    if query.is_none() {
-        if current_component_ref_ids.is_empty() {
-            return documents;
-        }
-        return documents
-            .into_iter()
-            .filter(|document| current_component_ref_ids.contains(&document.ref_id))
-            .collect();
-    }
-
-    let matched_documents = search_context_documents_internal(
-        documents.clone(),
-        query,
-        limit.try_into().unwrap_or(u32::MAX),
-        current_thread_id,
-    );
-    let matched_ref_ids = matched_documents
-        .iter()
-        .map(|document| document.ref_id.clone())
-        .collect::<HashSet<_>>();
-    let mut included_ref_ids = current_component_ref_ids;
-    included_ref_ids.extend(matched_ref_ids.iter().cloned());
-    included_ref_ids.extend(context_neighbor_ref_ids(edges, &matched_ref_ids));
-
-    documents
-        .into_iter()
-        .filter(|document| included_ref_ids.contains(&document.ref_id))
-        .collect()
-}
-
-fn sort_context_documents(
-    documents: &mut [ContextDocument],
-    query: Option<&str>,
-    current_thread_id: Option<&str>,
-) {
-    let query = query.map(str::trim).filter(|value| !value.is_empty());
-    let mut score_by_ref_id = HashMap::new();
-    if let Some(query) = query {
-        let query_lower = query.to_ascii_lowercase();
-        let tokens = query_lower.split_whitespace().collect::<Vec<_>>();
-        score_by_ref_id = documents
-            .iter()
-            .map(|document| {
-                let score = if document_matches_query(document, &tokens) {
-                    context_match_score(document, &query_lower, &tokens)
-                } else {
-                    0
-                };
-                (document.ref_id.clone(), score)
-            })
-            .collect();
-    }
-
-    let distance_by_ref_id = context_focus_distance_by_ref_id(documents, current_thread_id);
-    documents.sort_by(|left, right| {
-        score_by_ref_id
-            .get(&right.ref_id)
-            .copied()
-            .unwrap_or_default()
-            .cmp(
-                &score_by_ref_id
-                    .get(&left.ref_id)
-                    .copied()
-                    .unwrap_or_default(),
-            )
-            .then_with(|| {
-                context_focus_sort_key(left, &distance_by_ref_id)
-                    .cmp(&context_focus_sort_key(right, &distance_by_ref_id))
-            })
-    });
-}
-
-fn context_connected_ref_ids(edges: &[ContextGraphEdge], root_ref_id: &str) -> HashSet<String> {
-    let mut connected_ref_ids = HashSet::from([root_ref_id.to_string()]);
-    let mut queue = VecDeque::from([root_ref_id.to_string()]);
-    while let Some(ref_id) = queue.pop_front() {
-        for neighbor_ref_id in context_neighbor_ref_ids(edges, &HashSet::from([ref_id.clone()])) {
-            if connected_ref_ids.insert(neighbor_ref_id.clone()) {
-                queue.push_back(neighbor_ref_id);
-            }
-        }
-    }
-    connected_ref_ids
+    shared_search_context_documents(documents, query, limit, current_thread_id)
 }
 
 fn context_neighbor_ref_ids(
@@ -1538,6 +1352,18 @@ fn context_graph_edges(documents: &[ContextDocument]) -> Vec<ContextGraphEdge> {
             }
         }
         if document.kind == ContextKind::RepoContextFile {
+            for source_ref in &document.graph.source_refs {
+                if documents
+                    .iter()
+                    .any(|candidate| candidate.ref_id == *source_ref)
+                {
+                    edges.push(ContextGraphEdge {
+                        from_ref_id: source_ref.clone(),
+                        to_ref_id: document.ref_id.clone(),
+                        label: "derived".to_string(),
+                    });
+                }
+            }
             for thread_id in &document.graph.source_threads {
                 if let Some(target_ref_id) = thread_ref_ids.get(thread_id.as_str()) {
                     edges.push(ContextGraphEdge {
@@ -1620,118 +1446,6 @@ fn context_thread_ref_matches_branch(
     })
 }
 
-fn context_focus_distance_by_ref_id(
-    documents: &[ContextDocument],
-    current_thread_id: Option<&str>,
-) -> HashMap<String, usize> {
-    let Some(current_thread_id) = current_thread_id else {
-        return HashMap::new();
-    };
-    let current_ref_id = format!("ctx:thread:{current_thread_id}");
-    if !documents
-        .iter()
-        .any(|document| document.ref_id == current_ref_id)
-    {
-        return HashMap::new();
-    }
-
-    let mut adjacency = HashMap::<String, Vec<String>>::new();
-    for edge in context_graph_edges(documents) {
-        adjacency
-            .entry(edge.from_ref_id.clone())
-            .or_default()
-            .push(edge.to_ref_id.clone());
-        adjacency
-            .entry(edge.to_ref_id)
-            .or_default()
-            .push(edge.from_ref_id);
-    }
-
-    let mut distance_by_ref_id = HashMap::from([(current_ref_id.clone(), 0usize)]);
-    let mut queue = VecDeque::from([(current_ref_id, 0usize)]);
-    while let Some((ref_id, distance)) = queue.pop_front() {
-        for neighbor_ref_id in adjacency.get(&ref_id).into_iter().flatten() {
-            if distance_by_ref_id.contains_key(neighbor_ref_id) {
-                continue;
-            }
-            let next_distance = distance.saturating_add(1);
-            distance_by_ref_id.insert(neighbor_ref_id.clone(), next_distance);
-            queue.push_back((neighbor_ref_id.clone(), next_distance));
-        }
-    }
-
-    distance_by_ref_id
-}
-
-fn context_focus_sort_key(
-    document: &ContextDocument,
-    distance_by_ref_id: &HashMap<String, usize>,
-) -> (usize, u8, String, String) {
-    let (kind_rank, title, ref_id) = context_default_sort_key(document);
-    (
-        distance_by_ref_id
-            .get(&document.ref_id)
-            .copied()
-            .unwrap_or(usize::MAX),
-        kind_rank,
-        title,
-        ref_id,
-    )
-}
-
-fn context_match_score(document: &ContextDocument, query: &str, tokens: &[&str]) -> usize {
-    let title = document.title.to_ascii_lowercase();
-    let summary = document
-        .summary
-        .clone()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let location = document
-        .location
-        .clone()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let body = document
-        .body
-        .clone()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-
-    let mut score = 0usize;
-    if title.contains(query) {
-        score += 100;
-    }
-    if location.contains(query) {
-        score += 80;
-    }
-    if summary.contains(query) {
-        score += 60;
-    }
-    if body.contains(query) {
-        score += 40;
-    }
-    score
-        + tokens
-            .iter()
-            .filter(|token| {
-                title.contains(**token)
-                    || summary.contains(**token)
-                    || location.contains(**token)
-                    || body.contains(**token)
-            })
-            .count()
-}
-
-fn document_matches_query(document: &ContextDocument, tokens: &[&str]) -> bool {
-    if tokens.is_empty() {
-        return true;
-    }
-
-    tokens
-        .iter()
-        .all(|token| document.search_text.contains(*token))
-}
-
 fn context_default_sort_key(document: &ContextDocument) -> (u8, String, String) {
     let kind_rank = context_kind_rank(document.kind);
     (
@@ -1772,130 +1486,9 @@ fn context_artifact_edge_label(document: &ContextDocument) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn repo_context_documents(repo_root: &Path) -> Vec<ContextDocument> {
-    let context_root = repo_root.join(".codex").join("context");
-    let mut markdown_files = Vec::new();
-    collect_markdown_files(context_root.as_path(), &mut markdown_files);
-    markdown_files.sort();
-
-    markdown_files
-        .into_iter()
-        .filter_map(|path| repo_context_document(repo_root, path.as_path()))
-        .collect()
-}
-
-fn collect_markdown_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            collect_markdown_files(path.as_path(), out);
-        } else if file_type.is_file()
-            && path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-        {
-            out.push(path);
-        }
-    }
-}
-
-fn repo_context_document(repo_root: &Path, path: &Path) -> Option<ContextDocument> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(err) => {
-            warn!(error = %err, path = %path.display(), "failed to read repo context file");
-            return None;
-        }
-    };
-
-    let relative_path = path
-        .strip_prefix(repo_root)
-        .ok()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| path.to_path_buf());
-    let (frontmatter, body) = split_optional_frontmatter(&content);
-    let metadata = frontmatter
-        .as_deref()
-        .map(parse_repo_context_metadata)
-        .unwrap_or_default();
-    let body = normalize_repo_context_body(body.trim());
-    let title = metadata
-        .title
-        .clone()
-        .or_else(|| first_markdown_heading(body.as_str()))
-        .or_else(|| {
-            path.file_stem()
-                .and_then(|value| value.to_str())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| relative_path.display().to_string());
-    let location = relative_path.display().to_string();
-    let summary = repo_context_summary(&metadata, body.as_str());
-    let body = non_empty_string(truncate_context_body(body.as_str()));
-    let search_text = format!(
-        "{}\n{}\n{}\n{}\n{}",
-        title,
-        summary.clone().unwrap_or_default(),
-        location,
-        frontmatter.unwrap_or_default(),
-        body.clone().unwrap_or_default()
-    )
-    .to_ascii_lowercase();
-
-    Some(ContextDocument {
-        ref_id: format!("ctx:file:{location}"),
-        kind: ContextKind::RepoContextFile,
-        title,
-        summary,
-        location: Some(location),
-        body,
-        search_text,
-        graph: ContextDocumentGraphMetadata {
-            branches: metadata.branches,
-            source_threads: metadata.source_threads,
-            source_files: metadata.source_files,
-        },
-    })
-}
-
-fn repo_context_summary(metadata: &RepoContextMetadata, body: &str) -> Option<String> {
-    let summary_line = first_meaningful_body_line(body)
-        .filter(|line| !is_repo_context_detail_line(line))
-        .or_else(|| repo_context_metadata_summary_line(metadata));
-    match (metadata.kind.as_deref(), summary_line) {
-        (Some(kind), Some(line)) => Some(format!("{kind} · {line}")),
-        (Some(kind), None) => Some(kind.to_string()),
-        (None, Some(line)) => Some(line),
-        (None, None) => None,
-    }
-}
-
-fn repo_context_metadata_summary_line(metadata: &RepoContextMetadata) -> Option<String> {
-    let mut parts = Vec::new();
-    match metadata.branches.as_slice() {
-        [branch] => parts.push(format!("branch={branch}")),
-        branches if !branches.is_empty() => parts.push(format!("branches={}", branches.len())),
-        _ => {}
-    }
-    match metadata.source_threads.as_slice() {
-        [_] => parts.push("1 source thread".to_string()),
-        threads if !threads.is_empty() => parts.push(format!("{} source threads", threads.len())),
-        _ => {}
-    }
-    match metadata.source_files.as_slice() {
-        [_] => parts.push("1 source file".to_string()),
-        files if !files.is_empty() => parts.push(format!("{} source files", files.len())),
-        _ => {}
-    }
-    (!parts.is_empty()).then(|| parts.join(" · "))
+    shared_repo_context_documents(repo_root)
 }
 
 fn split_optional_frontmatter(content: &str) -> (Option<String>, &str) {
@@ -1916,6 +1509,7 @@ fn parse_repo_context_metadata(frontmatter: &str) -> RepoContextMetadata {
         Branches,
         SourceThreads,
         SourceFiles,
+        SourceRefs,
     }
 
     let mut metadata = RepoContextMetadata::default();
@@ -1934,6 +1528,7 @@ fn parse_repo_context_metadata(frontmatter: &str) -> RepoContextMetadata {
                 Some(RepoContextList::Branches) => metadata.branches.push(value),
                 Some(RepoContextList::SourceThreads) => metadata.source_threads.push(value),
                 Some(RepoContextList::SourceFiles) => metadata.source_files.push(value),
+                Some(RepoContextList::SourceRefs) => metadata.source_refs.push(value),
                 None => {}
             }
             continue;
@@ -1959,6 +1554,10 @@ fn parse_repo_context_metadata(frontmatter: &str) -> RepoContextMetadata {
                 && value.trim().is_empty()
             {
                 current_list = Some(RepoContextList::SourceFiles);
+            } else if let Some(value) = trimmed.strip_prefix("source_refs:")
+                && value.trim().is_empty()
+            {
+                current_list = Some(RepoContextList::SourceRefs);
             }
         } else if in_applies_to && indent == 2 && trimmed == "branches:" {
             current_list = Some(RepoContextList::Branches);
@@ -1969,74 +1568,6 @@ fn parse_repo_context_metadata(frontmatter: &str) -> RepoContextMetadata {
 
 fn strip_yaml_quotes(value: &str) -> &str {
     value.trim().trim_matches('"').trim_matches('\'')
-}
-
-fn first_markdown_heading(body: &str) -> Option<String> {
-    body.lines()
-        .find_map(|line| line.trim().strip_prefix("# ").map(str::trim))
-        .map(str::to_string)
-}
-
-fn first_meaningful_body_line(body: &str) -> Option<String> {
-    body.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(str::to_string)
-}
-
-fn normalize_repo_context_body(body: &str) -> String {
-    let mut normalized = Vec::new();
-    let mut previous_blank = false;
-    for raw_line in body.lines() {
-        let trimmed = raw_line.trim();
-        if is_legacy_repo_context_line(trimmed) {
-            continue;
-        }
-        if trimmed.is_empty() {
-            if !previous_blank {
-                normalized.push(String::new());
-                previous_blank = true;
-            }
-            continue;
-        }
-        normalized.push(raw_line.to_string());
-        previous_blank = false;
-    }
-
-    while normalized.first().is_some_and(String::is_empty) {
-        normalized.remove(0);
-    }
-    while normalized.last().is_some_and(String::is_empty) {
-        normalized.pop();
-    }
-    normalized.join("\n")
-}
-
-fn is_legacy_repo_context_line(line: &str) -> bool {
-    line.starts_with("owner=")
-        || matches!(
-            line,
-            line if line.starts_with("Owner:")
-                || line.starts_with("Shared by:")
-                || line.starts_with("Shared at:")
-                || line.starts_with("Visibility:")
-        )
-}
-
-fn is_repo_context_detail_line(line: &str) -> bool {
-    matches!(
-        line,
-        line if line.starts_with("Thread:")
-            || line.starts_with("Preview:")
-            || line.starts_with("Repo root:")
-            || line.starts_with("Git branch:")
-            || line.starts_with("Git SHA:")
-            || line.starts_with("Git origin:")
-            || line.starts_with("Recent transcript:")
-            || line.starts_with("- thread:")
-            || line.starts_with("- repo context:")
-            || line.starts_with("- shared thread:")
-    )
 }
 
 async fn current_thread_context_documents(
@@ -2069,7 +1600,7 @@ async fn current_thread_context_documents(
         }
 
         let is_current_thread = current_thread_id.as_deref() == Some(thread.id.as_str());
-        documents.extend(thread_context_documents(
+        documents.extend(shared_thread_context_documents(
             &thread,
             is_current_thread,
             repo_root,
@@ -2129,15 +1660,25 @@ async fn build_context_bundle(
         .map(|entry| entry.context_ref.clone())
         .collect::<Vec<_>>();
 
+    let artifact_paths = resolve_context_root().ok().and_then(|repo_root| {
+        match sync_context_graph_artifacts(repo_root.as_path(), &documents, &kept_entries) {
+            Ok(paths) => Some(paths),
+            Err(err) => {
+                warn!(error = %err, "failed to sync context graph artifacts");
+                None
+            }
+        }
+    });
+
     ContextResolveBundleResponse {
-        bundle_text: render_context_bundle(&kept_entries),
+        bundle_text: render_context_bundle(&documents, &kept_entries, artifact_paths.as_ref()),
         kept_refs,
         dropped_refs,
     }
 }
 
 fn selected_context_entries(
-    documents: Vec<ContextDocument>,
+    documents: &[ContextDocument],
     selected_ref_ids: &[String],
 ) -> Vec<ResolvedContextEntry> {
     if selected_ref_ids.is_empty() {
@@ -2146,8 +1687,9 @@ fn selected_context_entries(
 
     let selected = selected_ref_ids.iter().cloned().collect::<HashSet<_>>();
     documents
-        .into_iter()
+        .iter()
         .filter(|document| selected.contains(&document.ref_id))
+        .cloned()
         .map(resolved_entry_from_document)
         .collect()
 }
@@ -2168,20 +1710,27 @@ fn dedupe_context_entries(entries: &mut Vec<ResolvedContextEntry>) {
     entries.retain(|entry| seen.insert(entry.context_ref.ref_id.clone()));
 }
 
-fn estimate_context_bundle_tokens(entries: &[ResolvedContextEntry]) -> u32 {
-    let chars = entries
-        .iter()
-        .map(|entry| entry.bundle_text.chars().count())
-        .sum::<usize>();
+#[derive(Debug, Clone)]
+struct ContextGraphArtifactPaths {
+    index_relative_path: String,
+    node_relative_path_by_ref_id: HashMap<String, String>,
+}
+
+fn estimate_context_bundle_tokens(
+    documents: &[ContextDocument],
+    entries: &[ResolvedContextEntry],
+) -> u32 {
+    let chars = render_context_bundle(documents, entries, None)
+        .chars()
+        .count();
     ((chars / 4).max(1)).try_into().unwrap_or(u32::MAX)
 }
 
 fn resolved_entry_from_document(document: ContextDocument) -> ResolvedContextEntry {
     let context_ref = context_ref_from_document(&document);
-    let bundle_text = document_bundle_text(&document);
     ResolvedContextEntry {
         context_ref,
-        bundle_text,
+        document,
     }
 }
 
@@ -2243,6 +1792,12 @@ fn document_bundle_text(document: &ContextDocument) -> String {
             document.graph.source_files.join(", ")
         ));
     }
+    if !document.graph.source_refs.is_empty() {
+        lines.push(format!(
+            "Source refs: {}",
+            document.graph.source_refs.join(", ")
+        ));
+    }
     if let Some(body) = &document.body
         && !body.trim().is_empty()
     {
@@ -2252,136 +1807,560 @@ fn document_bundle_text(document: &ContextDocument) -> String {
     lines.join("\n")
 }
 
-fn render_context_bundle(entries: &[ResolvedContextEntry]) -> String {
-    entries
+fn render_context_bundle(
+    documents: &[ContextDocument],
+    entries: &[ResolvedContextEntry],
+    artifact_paths: Option<&ContextGraphArtifactPaths>,
+) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+
+    let selected_ref_ids = entries
         .iter()
-        .map(|entry| entry.bundle_text.clone())
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
+        .map(|entry| entry.document.ref_id.clone())
+        .collect::<HashSet<_>>();
+    let all_edges = context_graph_edges(documents);
+    let hotspot_scores = context_hotspot_scores(documents, &all_edges, &selected_ref_ids);
+    let mut focus_ref_ids = selected_ref_ids.clone();
+    focus_ref_ids.extend(context_neighbor_ref_ids(&all_edges, &selected_ref_ids));
 
-fn thread_context_document(thread: codex_app_server_protocol::Thread) -> ContextDocument {
-    thread_context_documents(&thread, false, None)
+    let mut hotspot_documents = documents
+        .iter()
+        .filter(|document| focus_ref_ids.contains(&document.ref_id))
+        .collect::<Vec<_>>();
+    hotspot_documents.sort_by(|left, right| {
+        hotspot_scores
+            .get(&right.ref_id)
+            .copied()
+            .unwrap_or_default()
+            .cmp(
+                &hotspot_scores
+                    .get(&left.ref_id)
+                    .copied()
+                    .unwrap_or_default(),
+            )
+            .then_with(|| context_default_sort_key(left).cmp(&context_default_sort_key(right)))
+    });
+
+    let mut lines = vec![
+        "Attached collaboration context is discoverable via the repo graph.".to_string(),
+        "Only summaries, refs, and hotspots are attached inline. Inspect graph files on demand before relying on details.".to_string(),
+    ];
+    if let Some(paths) = artifact_paths {
+        lines.push(format!("Graph index: {}", paths.index_relative_path));
+    }
+    lines.push(String::new());
+    lines.push("Selected nodes:".to_string());
+    for entry in entries {
+        let document = &entry.document;
+        let mut line = format!(
+            "- {} {} · {}",
+            context_short_hash(document.ref_id.as_str()),
+            context_kind_label(document.kind),
+            single_line_excerpt(document.title.as_str(), 80),
+        );
+        if let Some(summary) = &document.summary {
+            line.push_str(&format!(" · {}", single_line_excerpt(summary.as_str(), 96)));
+        }
+        if let Some(node_path) = artifact_paths
+            .and_then(|paths| paths.node_relative_path_by_ref_id.get(&document.ref_id))
+        {
+            line.push_str(&format!(" · {node_path}"));
+        }
+        lines.push(line);
+    }
+
+    let hotspots = hotspot_documents
         .into_iter()
-        .next()
-        .unwrap_or_else(|| ContextDocument {
-            ref_id: format!("ctx:thread:{}", thread.id),
-            kind: ContextKind::SharedThread,
-            title: thread.id.clone(),
-            summary: None,
-            location: Some(format!("thread/{}", thread.id)),
-            body: None,
-            search_text: thread.id.to_ascii_lowercase(),
-            graph: ContextDocumentGraphMetadata::default(),
-        })
+        .filter(|document| !matches!(document.kind, ContextKind::SharedThread))
+        .take(4)
+        .collect::<Vec<_>>();
+    if !hotspots.is_empty() {
+        lines.push(String::new());
+        lines.push("Hotspots to inspect or promote:".to_string());
+        for document in hotspots {
+            let score = hotspot_scores
+                .get(&document.ref_id)
+                .copied()
+                .unwrap_or_default();
+            let promotion_kind = inferred_context_write_kind(document);
+            lines.push(format!(
+                "- {} {} · score={} · promote as {} · {}",
+                context_short_hash(document.ref_id.as_str()),
+                context_kind_label(document.kind),
+                score,
+                promotion_kind,
+                context_hotspot_reason(document, &all_edges, &selected_ref_ids),
+            ));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("Traversal:".to_string());
+    if artifact_paths.is_some() {
+        lines.push(
+            "- start with the graph index, then open node files only for the refs you need"
+                .to_string(),
+        );
+    } else {
+        lines.push(
+            "- use the selected refs and summaries to decide which nodes need deeper inspection"
+                .to_string(),
+        );
+    }
+    lines.push(
+        "- treat repo notes as durable memory and thread artifacts as evidence or recent working context"
+            .to_string(),
+    );
+    lines.push(
+        "- promote stable hotspots into .codex/context notes instead of relying on raw thread history"
+            .to_string(),
+    );
+    lines.join("\n")
 }
 
+fn sync_context_graph_artifacts(
+    repo_root: &Path,
+    documents: &[ContextDocument],
+    entries: &[ResolvedContextEntry],
+) -> Result<ContextGraphArtifactPaths> {
+    let artifact_paths = context_graph_artifact_paths(documents);
+    let graph_root = repo_root.join(".codex").join("context").join(".graph");
+    let nodes_root = graph_root.join("nodes");
+    std::fs::create_dir_all(&nodes_root)
+        .with_context(|| format!("failed to create {}", nodes_root.display()))?;
+
+    let all_edges = context_graph_edges(documents);
+    let selected_ref_ids = entries
+        .iter()
+        .map(|entry| entry.document.ref_id.clone())
+        .collect::<HashSet<_>>();
+    let hotspot_scores = context_hotspot_scores(documents, &all_edges, &selected_ref_ids);
+
+    for document in documents {
+        let Some(relative_path) = artifact_paths
+            .node_relative_path_by_ref_id
+            .get(&document.ref_id)
+        else {
+            continue;
+        };
+        let path = repo_root.join(relative_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        std::fs::write(
+            &path,
+            render_context_graph_node_file(
+                document,
+                documents,
+                &all_edges,
+                &artifact_paths.node_relative_path_by_ref_id,
+                &hotspot_scores,
+                &selected_ref_ids,
+            ),
+        )
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+
+    let index_path = repo_root.join(&artifact_paths.index_relative_path);
+    if let Some(parent) = index_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    std::fs::write(
+        &index_path,
+        render_context_graph_index(
+            documents,
+            entries,
+            &all_edges,
+            &artifact_paths.node_relative_path_by_ref_id,
+            &hotspot_scores,
+        ),
+    )
+    .with_context(|| format!("failed to write {}", index_path.display()))?;
+
+    Ok(artifact_paths)
+}
+
+fn context_graph_artifact_paths(documents: &[ContextDocument]) -> ContextGraphArtifactPaths {
+    ContextGraphArtifactPaths {
+        index_relative_path: ".codex/context/.graph/index.md".to_string(),
+        node_relative_path_by_ref_id: documents
+            .iter()
+            .map(|document| {
+                (
+                    document.ref_id.clone(),
+                    format!(
+                        ".codex/context/.graph/nodes/{}/{}-{}.md",
+                        context_graph_kind_directory(document.kind),
+                        context_short_hash(document.ref_id.as_str()),
+                        context_graph_title_slug(document.title.as_str()),
+                    ),
+                )
+            })
+            .collect(),
+    }
+}
+
+fn render_context_graph_index(
+    documents: &[ContextDocument],
+    entries: &[ResolvedContextEntry],
+    edges: &[ContextGraphEdge],
+    node_relative_path_by_ref_id: &HashMap<String, String>,
+    hotspot_scores: &HashMap<String, usize>,
+) -> String {
+    let selected_ref_ids = entries
+        .iter()
+        .map(|entry| entry.document.ref_id.clone())
+        .collect::<HashSet<_>>();
+    let mut lines = vec![
+        "# Context Graph".to_string(),
+        String::new(),
+        format!("Generated: {}", Utc::now().to_rfc3339()),
+        format!("Nodes: {}", documents.len()),
+        format!("Edges: {}", edges.len()),
+        String::new(),
+        "Selected nodes".to_string(),
+    ];
+    for entry in entries {
+        let document = &entry.document;
+        let node_path = node_relative_path_by_ref_id
+            .get(&document.ref_id)
+            .cloned()
+            .unwrap_or_default();
+        lines.push(format!(
+            "- {} | {} | {} | {}",
+            context_short_hash(document.ref_id.as_str()),
+            context_kind_label(document.kind),
+            single_line_excerpt(document.title.as_str(), 80),
+            node_path,
+        ));
+    }
+
+    let mut hotspot_documents = documents.iter().collect::<Vec<_>>();
+    hotspot_documents.sort_by(|left, right| {
+        hotspot_scores
+            .get(&right.ref_id)
+            .copied()
+            .unwrap_or_default()
+            .cmp(
+                &hotspot_scores
+                    .get(&left.ref_id)
+                    .copied()
+                    .unwrap_or_default(),
+            )
+            .then_with(|| context_default_sort_key(left).cmp(&context_default_sort_key(right)))
+    });
+    lines.push(String::new());
+    lines.push("Promotion hotspots".to_string());
+    for document in hotspot_documents
+        .into_iter()
+        .filter(|document| !matches!(document.kind, ContextKind::SharedThread))
+        .take(8)
+    {
+        let selected = if selected_ref_ids.contains(&document.ref_id) {
+            "selected"
+        } else {
+            "linked"
+        };
+        lines.push(format!(
+            "- {} | {} | score={} | {} | {}",
+            context_short_hash(document.ref_id.as_str()),
+            inferred_context_write_kind(document),
+            hotspot_scores
+                .get(&document.ref_id)
+                .copied()
+                .unwrap_or_default(),
+            selected,
+            single_line_excerpt(document.title.as_str(), 96),
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push("Nodes".to_string());
+    for document in documents {
+        let node_path = node_relative_path_by_ref_id
+            .get(&document.ref_id)
+            .cloned()
+            .unwrap_or_default();
+        let summary = document
+            .summary
+            .as_deref()
+            .map(|summary| single_line_excerpt(summary, 80))
+            .unwrap_or_else(|| context_kind_label(document.kind).to_string());
+        lines.push(format!(
+            "- {} | {} | {} | {} | {}",
+            context_short_hash(document.ref_id.as_str()),
+            context_kind_label(document.kind),
+            single_line_excerpt(document.title.as_str(), 72),
+            summary,
+            node_path,
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push("Edges".to_string());
+    for edge in edges {
+        lines.push(format!(
+            "- {} -{}-> {}",
+            context_short_hash(edge.from_ref_id.as_str()),
+            edge.label,
+            context_short_hash(edge.to_ref_id.as_str()),
+        ));
+    }
+    lines.join("\n")
+}
+
+fn render_context_graph_node_file(
+    document: &ContextDocument,
+    documents: &[ContextDocument],
+    edges: &[ContextGraphEdge],
+    node_relative_path_by_ref_id: &HashMap<String, String>,
+    hotspot_scores: &HashMap<String, usize>,
+    selected_ref_ids: &HashSet<String>,
+) -> String {
+    let neighbors = context_neighbor_ref_ids(edges, &HashSet::from([document.ref_id.clone()]));
+    let related_lines = edges
+        .iter()
+        .filter_map(|edge| {
+            if edge.from_ref_id == document.ref_id {
+                Some((edge.label.as_str(), edge.to_ref_id.as_str()))
+            } else if edge.to_ref_id == document.ref_id {
+                Some((edge.label.as_str(), edge.from_ref_id.as_str()))
+            } else {
+                None
+            }
+        })
+        .filter_map(|(label, ref_id)| {
+            documents
+                .iter()
+                .find(|candidate| candidate.ref_id == ref_id)
+                .map(|neighbor| {
+                    let node_path = node_relative_path_by_ref_id
+                        .get(ref_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    format!(
+                        "- {} -> {} {} · {}",
+                        label,
+                        context_short_hash(ref_id),
+                        single_line_excerpt(neighbor.title.as_str(), 72),
+                        node_path,
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+
+    let mut lines = vec![format!("# {}", document.title), String::new()];
+    lines.push(format!("Ref: {}", document.ref_id));
+    lines.push(format!("Kind: {}", context_kind_label(document.kind)));
+    lines.push(format!(
+        "Hotspot score: {}",
+        hotspot_scores
+            .get(&document.ref_id)
+            .copied()
+            .unwrap_or_default()
+    ));
+    lines.push(format!(
+        "Promotion kind: {}",
+        inferred_context_write_kind(document)
+    ));
+    lines.push(format!(
+        "Selected: {}",
+        if selected_ref_ids.contains(&document.ref_id) {
+            "yes"
+        } else {
+            "no"
+        }
+    ));
+    lines.push(format!("Linked nodes: {}", neighbors.len()));
+    if let Some(location) = &document.location {
+        lines.push(format!("Location: {location}"));
+    }
+    if let Some(summary) = &document.summary {
+        lines.push(format!("Summary: {summary}"));
+    }
+    if !document.graph.source_threads.is_empty() {
+        lines.push(format!(
+            "Source threads: {}",
+            document.graph.source_threads.join(", ")
+        ));
+    }
+    if !document.graph.source_files.is_empty() {
+        lines.push(format!(
+            "Source files: {}",
+            document.graph.source_files.join(", ")
+        ));
+    }
+    if !document.graph.source_refs.is_empty() {
+        lines.push(format!(
+            "Source refs: {}",
+            document.graph.source_refs.join(", ")
+        ));
+    }
+    if !related_lines.is_empty() {
+        lines.push(String::new());
+        lines.push("## Related".to_string());
+        lines.push(String::new());
+        lines.extend(related_lines);
+    }
+    lines.push(String::new());
+    lines.push("## Excerpt".to_string());
+    lines.push(String::new());
+    lines.push(document_bundle_text(document));
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn context_hotspot_scores(
+    documents: &[ContextDocument],
+    edges: &[ContextGraphEdge],
+    selected_ref_ids: &HashSet<String>,
+) -> HashMap<String, usize> {
+    let mut degree_by_ref_id = HashMap::<String, usize>::new();
+    for edge in edges {
+        *degree_by_ref_id
+            .entry(edge.from_ref_id.clone())
+            .or_default() += 1;
+        *degree_by_ref_id.entry(edge.to_ref_id.clone()).or_default() += 1;
+    }
+
+    documents
+        .iter()
+        .map(|document| {
+            let degree = degree_by_ref_id
+                .get(&document.ref_id)
+                .copied()
+                .unwrap_or_default();
+            let mut score = degree.saturating_mul(3);
+            score += match document.kind {
+                ContextKind::ThreadFile => 8,
+                ContextKind::ThreadInsight => 7,
+                ContextKind::RepoContextFile => 6,
+                ContextKind::ThreadSearch | ContextKind::ThreadTool => 4,
+                ContextKind::SharedThread => 1,
+            };
+            if selected_ref_ids.contains(&document.ref_id) {
+                score += 5;
+            }
+            if !document.graph.source_files.is_empty() {
+                score += 3;
+            }
+            if !document.graph.source_refs.is_empty() {
+                score += 2;
+            }
+            let haystack = format!(
+                "{} {} {}",
+                document.title,
+                document.summary.clone().unwrap_or_default(),
+                document.body.clone().unwrap_or_default()
+            )
+            .to_ascii_lowercase();
+            if haystack.contains("decision") || haystack.contains("tradeoff") {
+                score += 3;
+            }
+            if haystack.contains("hotspot")
+                || haystack.contains("failure")
+                || haystack.contains("sharp edge")
+            {
+                score += 3;
+            }
+            if haystack.contains("playbook")
+                || haystack.contains("workflow")
+                || haystack.contains("debug")
+            {
+                score += 2;
+            }
+            (document.ref_id.clone(), score)
+        })
+        .collect()
+}
+
+fn context_hotspot_reason(
+    document: &ContextDocument,
+    edges: &[ContextGraphEdge],
+    selected_ref_ids: &HashSet<String>,
+) -> String {
+    let linked_count = edges
+        .iter()
+        .filter(|edge| edge.from_ref_id == document.ref_id || edge.to_ref_id == document.ref_id)
+        .count();
+    if !document.graph.source_files.is_empty() {
+        format!("grounded in {} file(s)", document.graph.source_files.len())
+    } else if !document.graph.source_refs.is_empty() {
+        format!(
+            "derived from {} graph ref(s)",
+            document.graph.source_refs.len()
+        )
+    } else if selected_ref_ids.contains(&document.ref_id) {
+        "explicitly selected for this turn".to_string()
+    } else if linked_count > 0 {
+        format!("linked to {linked_count} nearby node(s)")
+    } else {
+        "recent context evidence".to_string()
+    }
+}
+
+fn context_graph_kind_directory(kind: ContextKind) -> &'static str {
+    match kind {
+        ContextKind::SharedThread => "threads",
+        ContextKind::ThreadInsight => "insights",
+        ContextKind::ThreadFile => "files",
+        ContextKind::ThreadSearch => "searches",
+        ContextKind::ThreadTool => "tools",
+        ContextKind::RepoContextFile => "notes",
+    }
+}
+
+fn context_graph_title_slug(title: &str) -> String {
+    let slug = slugify_context_value(title);
+    let truncated = slug.chars().take(48).collect::<String>();
+    if truncated.is_empty() {
+        "context".to_string()
+    } else {
+        truncated
+    }
+}
+
+fn context_short_hash(ref_id: &str) -> String {
+    let candidate = ref_id.rsplit(':').next().unwrap_or(ref_id);
+    let compact = candidate.split('-').next().unwrap_or(candidate);
+    let compact = compact.chars().take(8).collect::<String>();
+    if compact.len() >= 6 && compact.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return compact;
+    }
+
+    let hash = ref_id.bytes().fold(2_166_136_261_u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
+    });
+    format!("{hash:08x}")
+}
+
+fn context_kind_label(kind: ContextKind) -> &'static str {
+    match kind {
+        ContextKind::SharedThread => "thread",
+        ContextKind::ThreadInsight => "insight",
+        ContextKind::ThreadFile => "file",
+        ContextKind::ThreadSearch => "search",
+        ContextKind::ThreadTool => "tool",
+        ContextKind::RepoContextFile => "note",
+    }
+}
+
+#[cfg(test)]
+fn thread_context_document(thread: codex_app_server_protocol::Thread) -> ContextDocument {
+    shared_thread_context_document(thread)
+}
+
+#[cfg(test)]
 fn thread_context_documents(
     thread: &codex_app_server_protocol::Thread,
     is_current_thread: bool,
     repo_root: Option<&Path>,
 ) -> Vec<ContextDocument> {
-    let artifact_documents = thread_artifact_documents(thread, repo_root);
-    let branch = thread
-        .git_info
-        .as_ref()
-        .and_then(|info| info.branch.clone());
-    let location = format!("thread/{}", thread.id);
-    let title = agent_thread_title(
-        thread_context_title(thread, is_current_thread),
-        thread.agent_nickname.as_deref(),
-        thread.agent_role.as_deref(),
-    );
-    let insight_count = artifact_documents
-        .iter()
-        .filter(|document| document.kind == ContextKind::ThreadInsight)
-        .count();
-    let file_count = artifact_documents
-        .iter()
-        .filter(|document| document.kind == ContextKind::ThreadFile)
-        .count();
-    let search_count = artifact_documents
-        .iter()
-        .filter(|document| document.kind == ContextKind::ThreadSearch)
-        .count();
-    let tool_count = artifact_documents
-        .iter()
-        .filter(|document| document.kind == ContextKind::ThreadTool)
-        .count();
-    let artifact_count = artifact_documents.len();
-    let mut summary_parts = vec![if is_current_thread {
-        "current thread".to_string()
-    } else {
-        "thread".to_string()
-    }];
-    if artifact_count > 0 {
-        summary_parts.push(format!("{artifact_count} retained artifacts"));
-    }
-    summary_parts.push(thread_context_summary(thread));
-    let body = thread_context_body(
-        thread,
-        insight_count,
-        file_count,
-        search_count,
-        tool_count,
-        &artifact_documents,
-    );
-    let search_text = thread_context_search_text(thread, &title, &location, body.as_deref());
-
-    let mut documents = Vec::with_capacity(artifact_documents.len().saturating_add(1));
-    documents.push(ContextDocument {
-        ref_id: format!("ctx:thread:{}", thread.id),
-        kind: ContextKind::SharedThread,
-        title,
-        summary: Some(summary_parts.join(" · ")),
-        location: Some(location),
-        body,
-        search_text,
-        graph: ContextDocumentGraphMetadata {
-            branches: branch.into_iter().collect(),
-            source_threads: vec![thread.id.clone()],
-            ..ContextDocumentGraphMetadata::default()
-        },
-    });
-    documents.extend(artifact_documents);
-    documents
-}
-
-fn thread_context_title(
-    thread: &codex_app_server_protocol::Thread,
-    is_current_thread: bool,
-) -> String {
-    thread
-        .name
-        .clone()
-        .and_then(non_empty_string)
-        .unwrap_or_else(|| {
-            if is_current_thread {
-                "Current Thread".to_string()
-            } else {
-                let short_id = thread.id.chars().take(8).collect::<String>();
-                format!("Thread {short_id}")
-            }
-        })
-}
-
-fn agent_thread_title(
-    base_title: String,
-    agent_nickname: Option<&str>,
-    agent_role: Option<&str>,
-) -> String {
-    let Some(agent_label) = agent_nickname
-        .filter(|label| !label.is_empty())
-        .or(agent_role.filter(|label| !label.is_empty()))
-    else {
-        return base_title;
-    };
-
-    if base_title.eq_ignore_ascii_case(agent_label) {
-        format!("🦞 {base_title}")
-    } else {
-        format!("🦞 {agent_label} · {base_title}")
-    }
+    shared_thread_context_documents(thread, is_current_thread, repo_root)
 }
 
 async fn source_thread_context_entry(
@@ -2389,9 +2368,9 @@ async fn source_thread_context_entry(
     thread_id: &str,
 ) -> Result<ResolvedContextEntry, AppServerError> {
     let thread_read = thread_read_with_turn_fallback(bridge, thread_id).await?;
-    Ok(resolved_entry_from_document(thread_context_document(
-        thread_read.thread,
-    )))
+    Ok(resolved_entry_from_document(
+        shared_thread_context_document(thread_read.thread),
+    ))
 }
 
 async fn thread_read_with_turn_fallback(
@@ -2413,566 +2392,6 @@ async fn source_thread_cwd(
 ) -> Result<String, AppServerError> {
     let thread_read = bridge.thread_read(thread_id.to_string(), false).await?;
     Ok(thread_read.thread.cwd.display().to_string())
-}
-
-fn thread_context_summary(thread: &codex_app_server_protocol::Thread) -> String {
-    let mut parts = Vec::new();
-    if let Some(nickname) = thread.agent_nickname.as_deref() {
-        parts.push(format!("agent={nickname}"));
-    }
-    if let Some(role) = thread.agent_role.as_deref() {
-        parts.push(format!("role={role}"));
-    }
-    parts.push(format!("cwd={}", thread.cwd.display()));
-    parts.push(format!("updated_at={}", thread.updated_at));
-    if let Some(branch) = thread
-        .git_info
-        .as_ref()
-        .and_then(|info| info.branch.as_deref())
-    {
-        parts.push(format!("branch={branch}"));
-    }
-    parts.join(" · ")
-}
-
-fn thread_context_search_text(
-    thread: &codex_app_server_protocol::Thread,
-    title: &str,
-    location: &str,
-    body: Option<&str>,
-) -> String {
-    format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-        title,
-        thread_context_summary(thread),
-        location,
-        thread.id,
-        thread.cwd.display(),
-        thread.agent_role.clone().unwrap_or_default(),
-        thread.agent_nickname.clone().unwrap_or_default(),
-        thread
-            .git_info
-            .as_ref()
-            .and_then(|info| info.branch.clone())
-            .unwrap_or_default(),
-        thread
-            .git_info
-            .as_ref()
-            .and_then(|info| info.sha.clone())
-            .unwrap_or_default(),
-        body.unwrap_or_default()
-    )
-    .to_ascii_lowercase()
-}
-
-fn thread_context_body(
-    thread: &codex_app_server_protocol::Thread,
-    insight_count: usize,
-    file_count: usize,
-    search_count: usize,
-    tool_count: usize,
-    artifact_documents: &[ContextDocument],
-) -> Option<String> {
-    let mut lines = vec![
-        format!("Thread: {}", thread.id),
-        format!("Cwd: {}", thread.cwd.display()),
-        format!("Updated at: {}", thread.updated_at),
-    ];
-    if let Some(name) = &thread.name {
-        lines.push(format!("Title: {name}"));
-    }
-    if let Some(role) = thread.agent_role.as_deref() {
-        lines.push(format!("Agent role: {role}"));
-    }
-    if let Some(nickname) = thread.agent_nickname.as_deref() {
-        lines.push(format!("Agent: {nickname}"));
-    }
-    if let Some(git_info) = &thread.git_info {
-        if let Some(branch) = git_info.branch.as_deref() {
-            lines.push(format!("Git branch: {branch}"));
-        }
-        if let Some(sha) = git_info.sha.as_deref() {
-            lines.push(format!("Git SHA: {sha}"));
-        }
-        if let Some(origin_url) = git_info.origin_url.as_deref() {
-            lines.push(format!("Git origin: {origin_url}"));
-        }
-    }
-    if !artifact_documents.is_empty() {
-        lines.push(String::new());
-        lines.push(format!(
-            "Retained context: {insight_count} insight(s) · {file_count} file(s) · {search_count} search result(s) · {tool_count} tool result(s)"
-        ));
-        for document in artifact_documents.iter().take(6) {
-            let kind = match document.kind {
-                ContextKind::ThreadInsight => "insight",
-                ContextKind::ThreadFile => "file",
-                ContextKind::ThreadSearch => "search",
-                ContextKind::ThreadTool => "tool",
-                ContextKind::SharedThread | ContextKind::RepoContextFile => "context",
-            };
-            lines.push(format!("- {kind}: {}", document.title));
-        }
-    }
-
-    non_empty_string(truncate_context_body(&lines.join("\n")))
-}
-
-fn thread_artifact_documents(
-    thread: &codex_app_server_protocol::Thread,
-    repo_root: Option<&Path>,
-) -> Vec<ContextDocument> {
-    let branches = thread
-        .git_info
-        .as_ref()
-        .and_then(|info| info.branch.clone())
-        .into_iter()
-        .collect::<Vec<_>>();
-    let mut documents_by_ref_id = HashMap::<String, ContextDocument>::new();
-
-    for turn in &thread.turns {
-        for item in &turn.items {
-            match item {
-                ThreadItem::Plan { id, text } => {
-                    if let Some(body) = non_empty_string(text.clone()) {
-                        let title = body
-                            .lines()
-                            .map(str::trim)
-                            .find(|line| !line.is_empty())
-                            .map(|line| single_line_excerpt(line, 80))
-                            .unwrap_or_else(|| "Plan update".to_string());
-                        let summary = Some("thread insight · retained plan output".to_string());
-                        let location = Some(format!("insight/{id}"));
-                        let body = Some(truncate_context_body(body.as_str()));
-                        let search_text = format!(
-                            "{}\n{}\n{}\n{}",
-                            title,
-                            summary.clone().unwrap_or_default(),
-                            location.clone().unwrap_or_default(),
-                            body.clone().unwrap_or_default()
-                        )
-                        .to_ascii_lowercase();
-                        documents_by_ref_id.insert(
-                            format!("ctx:thread-insight:{}:{id}", thread.id),
-                            ContextDocument {
-                                ref_id: format!("ctx:thread-insight:{}:{id}", thread.id),
-                                kind: ContextKind::ThreadInsight,
-                                title,
-                                summary,
-                                location,
-                                body,
-                                search_text,
-                                graph: ContextDocumentGraphMetadata {
-                                    branches: branches.clone(),
-                                    source_threads: vec![thread.id.clone()],
-                                    ..ContextDocumentGraphMetadata::default()
-                                },
-                            },
-                        );
-                    }
-                }
-                ThreadItem::FileChange {
-                    changes, status, ..
-                } if !matches!(
-                    status,
-                    codex_app_server_protocol::PatchApplyStatus::Failed
-                        | codex_app_server_protocol::PatchApplyStatus::Declined
-                ) =>
-                {
-                    for change in changes {
-                        if let Some(location) = normalize_thread_file_location(
-                            change.path.as_str(),
-                            repo_root,
-                            &thread.cwd,
-                        ) {
-                            let summary = Some(match &change.kind {
-                                codex_app_server_protocol::PatchChangeKind::Add => {
-                                    "linked file · added in thread".to_string()
-                                }
-                                codex_app_server_protocol::PatchChangeKind::Delete => {
-                                    "linked file · deleted in thread".to_string()
-                                }
-                                codex_app_server_protocol::PatchChangeKind::Update {
-                                    move_path,
-                                } => match move_path {
-                                    Some(move_path) => {
-                                        format!("linked file · moved from {}", move_path.display())
-                                    }
-                                    None => "linked file · updated in thread".to_string(),
-                                },
-                            });
-                            upsert_thread_file_document(
-                                &mut documents_by_ref_id,
-                                thread,
-                                &branches,
-                                location,
-                                summary,
-                                context_excerpt(change.diff.as_str(), 12, 1_200),
-                            );
-                        }
-                    }
-                }
-                ThreadItem::CommandExecution {
-                    id,
-                    status,
-                    command_actions,
-                    aggregated_output,
-                    ..
-                } if matches!(
-                    status,
-                    codex_app_server_protocol::CommandExecutionStatus::Completed
-                ) =>
-                {
-                    let output_excerpt = aggregated_output
-                        .as_deref()
-                        .and_then(|output| context_excerpt(output, 14, 1_600));
-                    for action in command_actions {
-                        match action {
-                            codex_app_server_protocol::CommandAction::Read { path, .. } => {
-                                if let Some(location) =
-                                    normalize_thread_path_location(path, repo_root, &thread.cwd)
-                                {
-                                    upsert_thread_file_document(
-                                        &mut documents_by_ref_id,
-                                        thread,
-                                        &branches,
-                                        location,
-                                        Some("linked file · read during thread".to_string()),
-                                        output_excerpt.clone(),
-                                    );
-                                }
-                            }
-                            codex_app_server_protocol::CommandAction::Search { path, .. } => {
-                                let Some(body) = output_excerpt.clone() else {
-                                    continue;
-                                };
-                                let location = path
-                                    .as_deref()
-                                    .and_then(|value| {
-                                        normalize_thread_file_location(
-                                            value,
-                                            repo_root,
-                                            &thread.cwd,
-                                        )
-                                    })
-                                    .unwrap_or_else(|| format!("search/{id}"));
-                                let title = if location.starts_with("search/") {
-                                    "Search results".to_string()
-                                } else {
-                                    format!("Search results in {location}")
-                                };
-                                let summary = Some(
-                                    "thread search result · retained command output".to_string(),
-                                );
-                                let search_text = format!(
-                                    "{}\n{}\n{}\n{}",
-                                    title,
-                                    summary.clone().unwrap_or_default(),
-                                    location,
-                                    body
-                                )
-                                .to_ascii_lowercase();
-                                documents_by_ref_id.insert(
-                                    format!("ctx:thread-search:{}:{id}", thread.id),
-                                    ContextDocument {
-                                        ref_id: format!("ctx:thread-search:{}:{id}", thread.id),
-                                        kind: ContextKind::ThreadSearch,
-                                        title,
-                                        summary,
-                                        location: Some(location),
-                                        body: Some(body),
-                                        search_text,
-                                        graph: ContextDocumentGraphMetadata {
-                                            branches: branches.clone(),
-                                            source_threads: vec![thread.id.clone()],
-                                            ..ContextDocumentGraphMetadata::default()
-                                        },
-                                    },
-                                );
-                            }
-                            codex_app_server_protocol::CommandAction::ListFiles { .. }
-                            | codex_app_server_protocol::CommandAction::Unknown { .. } => {}
-                        }
-                    }
-                }
-                ThreadItem::DynamicToolCall {
-                    id,
-                    tool,
-                    status,
-                    content_items,
-                    success,
-                    ..
-                } if matches!(
-                    status,
-                    codex_app_server_protocol::DynamicToolCallStatus::Completed
-                ) && success.unwrap_or(false) =>
-                {
-                    let body = content_items.as_ref().and_then(|items| {
-                        context_excerpt(
-                            &items
-                                .iter()
-                                .filter_map(|item| match item {
-                                    codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText { text } => {
-                                        non_empty_string(text.clone())
-                                    }
-                                    codex_app_server_protocol::DynamicToolCallOutputContentItem::InputImage {
-                                        image_url,
-                                    } => Some(format!("[image] {image_url}")),
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                            12,
-                            1_200,
-                        )
-                    });
-                    if let Some(body) = body {
-                        let title = format!("{tool} result");
-                        let summary = Some("thread tool result · retained tool output".to_string());
-                        let location = Some(format!("tool/{tool}"));
-                        let search_text = format!(
-                            "{}\n{}\n{}\n{}",
-                            title,
-                            summary.clone().unwrap_or_default(),
-                            location.clone().unwrap_or_default(),
-                            body
-                        )
-                        .to_ascii_lowercase();
-                        documents_by_ref_id.insert(
-                            format!("ctx:thread-tool:{}:{id}", thread.id),
-                            ContextDocument {
-                                ref_id: format!("ctx:thread-tool:{}:{id}", thread.id),
-                                kind: ContextKind::ThreadTool,
-                                title,
-                                summary,
-                                location,
-                                body: Some(body),
-                                search_text,
-                                graph: ContextDocumentGraphMetadata {
-                                    branches: branches.clone(),
-                                    source_threads: vec![thread.id.clone()],
-                                    ..ContextDocumentGraphMetadata::default()
-                                },
-                            },
-                        );
-                    }
-                }
-                ThreadItem::McpToolCall {
-                    id,
-                    server,
-                    tool,
-                    status,
-                    result,
-                    ..
-                } if matches!(
-                    status,
-                    codex_app_server_protocol::McpToolCallStatus::Completed
-                ) =>
-                {
-                    let body = result.as_ref().and_then(|result| {
-                        let mut parts = result
-                            .content
-                            .iter()
-                            .filter_map(|value| serde_json::to_string_pretty(value).ok())
-                            .collect::<Vec<_>>();
-                        if let Some(structured_content) = &result.structured_content
-                            && let Ok(value) = serde_json::to_string_pretty(structured_content)
-                        {
-                            parts.push(value);
-                        }
-                        context_excerpt(parts.join("\n\n").as_str(), 12, 1_200)
-                    });
-                    if let Some(body) = body {
-                        let title = format!("{server}/{tool} result");
-                        let summary = Some("thread tool result · retained MCP output".to_string());
-                        let location = Some(format!("mcp/{server}/{tool}"));
-                        let search_text = format!(
-                            "{}\n{}\n{}\n{}",
-                            title,
-                            summary.clone().unwrap_or_default(),
-                            location.clone().unwrap_or_default(),
-                            body
-                        )
-                        .to_ascii_lowercase();
-                        documents_by_ref_id.insert(
-                            format!("ctx:thread-tool:{}:{id}", thread.id),
-                            ContextDocument {
-                                ref_id: format!("ctx:thread-tool:{}:{id}", thread.id),
-                                kind: ContextKind::ThreadTool,
-                                title,
-                                summary,
-                                location,
-                                body: Some(body),
-                                search_text,
-                                graph: ContextDocumentGraphMetadata {
-                                    branches: branches.clone(),
-                                    source_threads: vec![thread.id.clone()],
-                                    ..ContextDocumentGraphMetadata::default()
-                                },
-                            },
-                        );
-                    }
-                }
-                ThreadItem::ImageView { path, .. } => {
-                    if let Some(location) =
-                        normalize_thread_file_location(path, repo_root, &thread.cwd)
-                    {
-                        upsert_thread_file_document(
-                            &mut documents_by_ref_id,
-                            thread,
-                            &branches,
-                            location,
-                            Some("linked file · viewed in thread".to_string()),
-                            None,
-                        );
-                    }
-                }
-                ThreadItem::CommandExecution { .. }
-                | ThreadItem::FileChange { .. }
-                | ThreadItem::McpToolCall { .. }
-                | ThreadItem::DynamicToolCall { .. } => {}
-                ThreadItem::UserMessage { .. }
-                | ThreadItem::AgentMessage { .. }
-                | ThreadItem::Reasoning { .. }
-                | ThreadItem::CollabAgentToolCall { .. }
-                | ThreadItem::WebSearch { .. }
-                | ThreadItem::EnteredReviewMode { .. }
-                | ThreadItem::ExitedReviewMode { .. }
-                | ThreadItem::ContextCompaction { .. } => {}
-            }
-        }
-    }
-
-    let mut documents = documents_by_ref_id.into_values().collect::<Vec<_>>();
-    documents.sort_by_key(context_default_sort_key);
-    documents
-}
-
-fn upsert_thread_file_document(
-    documents_by_ref_id: &mut HashMap<String, ContextDocument>,
-    thread: &codex_app_server_protocol::Thread,
-    branches: &[String],
-    location: String,
-    summary: Option<String>,
-    body: Option<String>,
-) {
-    let ref_id = format!(
-        "ctx:thread-file:{}:{}",
-        thread.id,
-        encode_context_ref_fragment(location.as_str())
-    );
-    let entry = documents_by_ref_id
-        .entry(ref_id.clone())
-        .or_insert_with(|| {
-            let search_text = format!(
-                "{}\n{}\n{}\n{}",
-                location,
-                summary.clone().unwrap_or_default(),
-                location,
-                body.clone().unwrap_or_default()
-            )
-            .to_ascii_lowercase();
-            ContextDocument {
-                ref_id: ref_id.clone(),
-                kind: ContextKind::ThreadFile,
-                title: location.clone(),
-                summary: summary.clone(),
-                location: Some(location.clone()),
-                body: body.clone(),
-                search_text,
-                graph: ContextDocumentGraphMetadata {
-                    branches: branches.to_vec(),
-                    source_threads: vec![thread.id.clone()],
-                    source_files: vec![location.clone()],
-                },
-            }
-        });
-
-    if body.is_some() && entry.body.is_none() {
-        entry.body = body;
-    }
-    if let Some(summary) = summary
-        && entry
-            .summary
-            .as_deref()
-            .is_none_or(|existing| !existing.contains("updated") && summary.contains("updated"))
-    {
-        entry.summary = Some(summary);
-    }
-    entry.search_text = format!(
-        "{}\n{}\n{}\n{}",
-        entry.title,
-        entry.summary.clone().unwrap_or_default(),
-        entry.location.clone().unwrap_or_default(),
-        entry.body.clone().unwrap_or_default()
-    )
-    .to_ascii_lowercase();
-}
-
-fn normalize_thread_file_location(
-    path: &str,
-    repo_root: Option<&Path>,
-    cwd: &Path,
-) -> Option<String> {
-    normalize_thread_path_location(Path::new(path), repo_root, cwd)
-}
-
-fn normalize_thread_path_location(
-    path: &Path,
-    repo_root: Option<&Path>,
-    cwd: &Path,
-) -> Option<String> {
-    let candidate = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    };
-    if let Some(repo_root) = repo_root {
-        return candidate
-            .strip_prefix(repo_root)
-            .ok()
-            .map(|relative| relative.display().to_string());
-    }
-
-    Some(
-        path.to_str()
-            .map(str::to_string)
-            .unwrap_or_else(|| candidate.display().to_string()),
-    )
-}
-
-fn context_excerpt(text: &str, max_lines: usize, max_chars: usize) -> Option<String> {
-    let excerpt = text
-        .lines()
-        .map(str::trim_end)
-        .filter(|line| !line.is_empty())
-        .take(max_lines)
-        .collect::<Vec<_>>()
-        .join("\n");
-    if excerpt.is_empty() {
-        return None;
-    }
-    let excerpt = if excerpt.chars().count() <= max_chars {
-        excerpt
-    } else {
-        format!("{}…", excerpt.chars().take(max_chars).collect::<String>())
-    };
-    non_empty_string(truncate_context_body(excerpt.as_str()))
-}
-
-fn encode_context_ref_fragment(value: &str) -> String {
-    URL_SAFE_NO_PAD.encode(value.as_bytes())
-}
-
-fn truncate_context_body(body: &str) -> String {
-    let trimmed = body.trim();
-    if trimmed.chars().count() <= CONTEXT_BODY_CHAR_LIMIT {
-        return trimmed.to_string();
-    }
-    let truncated = trimmed
-        .chars()
-        .take(CONTEXT_BODY_CHAR_LIMIT)
-        .collect::<String>();
-    format!("{truncated}\n…")
 }
 
 fn plan_context_write_files(
@@ -3036,6 +2455,11 @@ fn plan_context_write_file(
         .unwrap_or_else(|| context_write_id_from_path(&relative_path));
     let source_threads = document.graph.source_threads.clone();
     let source_files = document.graph.source_files.clone();
+    let source_refs = if document.kind == ContextKind::RepoContextFile {
+        existing_metadata.source_refs
+    } else {
+        vec![document.ref_id.clone()]
+    };
     let content = render_context_write_file(
         ContextWriteMetadata {
             id,
@@ -3044,9 +2468,10 @@ fn plan_context_write_file(
             branch,
             source_threads,
             source_files,
+            source_refs: source_refs.clone(),
             last_validated_at: Utc::now().format("%Y-%m-%d").to_string(),
         },
-        context_write_body(document, existing_content.as_deref()),
+        context_write_body(document, existing_content.as_deref(), &source_refs),
     );
 
     Some(PlannedContextWriteFile {
@@ -3066,6 +2491,7 @@ struct ContextWriteMetadata {
     branch: Option<String>,
     source_threads: Vec<String>,
     source_files: Vec<String>,
+    source_refs: Vec<String>,
     last_validated_at: String,
 }
 
@@ -3085,6 +2511,7 @@ fn render_context_write_file(metadata: ContextWriteMetadata, body: String) -> St
     }
     lines.extend(render_yaml_list("source_threads", &metadata.source_threads));
     lines.extend(render_yaml_list("source_files", &metadata.source_files));
+    lines.extend(render_yaml_list("source_refs", &metadata.source_refs));
     lines.push(format!("last_validated_at: {}", metadata.last_validated_at));
     lines.push("---".to_string());
     lines.push(String::new());
@@ -3223,7 +2650,11 @@ fn slugify_context_value(value: &str) -> String {
     }
 }
 
-fn context_write_body(document: &ContextDocument, existing_content: Option<&str>) -> String {
+fn context_write_body(
+    document: &ContextDocument,
+    existing_content: Option<&str>,
+    source_refs: &[String],
+) -> String {
     if let Some(existing_content) = existing_content {
         let (_, body) = split_optional_frontmatter(existing_content);
         if !body.trim().is_empty() {
@@ -3257,6 +2688,9 @@ fn context_write_body(document: &ContextDocument, existing_content: Option<&str>
     }
     for source_file in &document.graph.source_files {
         lines.push(format!("- file: {source_file}"));
+    }
+    for source_ref in source_refs {
+        lines.push(format!("- ref: {source_ref}"));
     }
     lines.join("\n")
 }
@@ -3491,7 +2925,7 @@ impl AppServerBridge {
                 dynamic_tools: None,
                 mock_experimental_field: None,
                 experimental_raw_events: false,
-                persist_extended_history: false,
+                persist_extended_history: true,
             })
             .map_err(|err| {
                 AppServerError::Decode(anyhow::anyhow!(
@@ -3749,8 +3183,11 @@ fn is_pid_running(_pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::build_context_graph;
+    use super::context_graph_artifact_paths;
     use super::plan_context_write_files;
+    use super::render_context_bundle;
     use super::repo_context_documents;
+    use super::resolved_entry_from_document;
     use super::search_context_documents;
     use super::thread_context_document;
     use super::thread_context_documents;
@@ -3774,7 +3211,7 @@ mod tests {
         std::fs::create_dir_all(&context_dir).expect("create context dir");
         std::fs::write(
             context_dir.join("overview.md"),
-            "---\ntitle: Planning Notes\nkind: plan\napplies_to:\n  branches:\n    - \"rewrite-codex-2gether-v2\"\nsource_threads:\n  - \"thread-1\"\nsource_files:\n  - \".codex/context/reference.md\"\nvisibility: \"repo\"\n---\n# Planning Notes\n\nowner=zanechee@local · shared_by=zanechee@local · shared_at=2026-03-15T22:41:10.744997+00:00\nShip the context browser first.\nShared by: zanechee@local\n",
+            "---\ntitle: Planning Notes\nkind: plan\napplies_to:\n  branches:\n    - \"rewrite-codex-2gether-v2\"\nsource_threads:\n  - \"thread-1\"\nsource_files:\n  - \".codex/context/reference.md\"\nsource_refs:\n  - \"ctx:thread-insight:thread-1:plan-1\"\nvisibility: \"repo\"\n---\n# Planning Notes\n\nowner=zanechee@local · shared_by=zanechee@local · shared_at=2026-03-15T22:41:10.744997+00:00\nShip the context browser first.\nShared by: zanechee@local\n",
         )
         .expect("write repo context");
 
@@ -3804,6 +3241,10 @@ mod tests {
         assert_eq!(
             document.graph.source_files,
             vec![".codex/context/reference.md".to_string()]
+        );
+        assert_eq!(
+            document.graph.source_refs,
+            vec!["ctx:thread-insight:thread-1:plan-1".to_string()]
         );
 
         let _ = std::fs::remove_dir_all(temp_root);
@@ -3952,6 +3393,45 @@ mod tests {
     }
 
     #[test]
+    fn build_context_graph_links_repo_notes_to_artifacts_by_source_ref() {
+        let temp_root = temp_test_dir("context-graph-derived-links");
+        let context_dir = temp_root.join(".codex").join("context");
+        std::fs::create_dir_all(&context_dir).expect("create context dir");
+        std::fs::write(
+            context_dir.join("overview.md"),
+            "---\ntitle: Branch Plan\nkind: concept\nsource_threads:\n  - \"thread-1\"\nsource_refs:\n  - \"ctx:thread-insight:thread-1:plan-1\"\n---\n# Branch Plan\n\nShip the graph rewrite.\n",
+        )
+        .expect("write planning context");
+
+        let mut thread = sample_thread("thread-1", Some("planning sync"), Some("main"));
+        thread.turns = vec![Turn {
+            id: "turn-1".to_string(),
+            items: vec![ThreadItem::Plan {
+                id: "plan-1".to_string(),
+                text: "Ship the graph rewrite.".to_string(),
+            }],
+            status: AppTurnStatus::Completed,
+            error: None,
+        }];
+        let mut documents = repo_context_documents(&temp_root);
+        documents.extend(thread_context_documents(
+            &thread,
+            true,
+            Some(temp_root.as_path()),
+        ));
+
+        let graph = build_context_graph(documents, None, 10, Some("thread-1"));
+
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from_ref_id == "ctx:thread-insight:thread-1:plan-1"
+                && edge.to_ref_id == "ctx:file:.codex/context/overview.md"
+                && edge.label == "derived"
+        }));
+
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
     fn context_write_plan_updates_existing_repo_context_file() {
         let temp_root = temp_test_dir("repo-context-write-existing");
         let context_dir = temp_root.join(".codex").join("context");
@@ -4014,7 +3494,42 @@ mod tests {
     }
 
     #[test]
-    fn thread_context_documents_keep_retained_artifacts_not_web_queries() {
+    fn context_write_plan_creates_new_file_for_artifact_with_source_ref() {
+        let temp_root = temp_test_dir("repo-context-write-artifact");
+        let mut thread = sample_thread("thread-1", Some("planning sync"), None);
+        thread.turns = vec![Turn {
+            id: "turn-1".to_string(),
+            items: vec![ThreadItem::Plan {
+                id: "plan-1".to_string(),
+                text: "Capture the discovery-pack behavior.".to_string(),
+            }],
+            status: AppTurnStatus::Completed,
+            error: None,
+        }];
+        let documents = thread_context_documents(&thread, true, None);
+
+        let planned = plan_context_write_files(
+            &temp_root,
+            documents,
+            &["ctx:thread-insight:thread-1:plan-1".to_string()],
+            Some("main".to_string()),
+        );
+
+        assert_eq!(planned.len(), 1);
+        assert!(
+            planned[0]
+                .content
+                .contains("source_refs:\n  - \"ctx:thread-insight:thread-1:plan-1\"")
+        );
+        assert!(
+            planned[0]
+                .content
+                .contains("- ref: ctx:thread-insight:thread-1:plan-1")
+        );
+    }
+
+    #[test]
+    fn thread_context_documents_keep_retained_artifacts_including_web_queries() {
         let mut thread = sample_thread("thread-1", Some("planning sync"), Some("main"));
         let repo_root = PathBuf::from("/tmp/repo");
         thread.turns = vec![Turn {
@@ -4080,15 +3595,25 @@ mod tests {
                     ContextKind::ThreadSearch,
                     "Search results in src".to_string()
                 ),
+                (
+                    ContextKind::ThreadSearch,
+                    "what is a context graph".to_string()
+                ),
             ]
         );
-        assert!(documents.iter().all(|document| {
-            document.title != "what is a context graph"
-                && document
-                    .body
-                    .as_deref()
-                    .is_none_or(|body| !body.contains("what is a context graph"))
-        }));
+        let web_search_document = documents
+            .iter()
+            .find(|document| document.title == "what is a context graph")
+            .expect("retained web search document");
+        assert_eq!(
+            web_search_document.summary.as_deref(),
+            Some("thread search result · retained web search")
+        );
+        assert_eq!(web_search_document.location.as_deref(), Some("web/search"));
+        assert_eq!(
+            web_search_document.body.as_deref(),
+            Some("Query: what is a context graph")
+        );
     }
 
     #[test]
@@ -4173,6 +3698,36 @@ mod tests {
         assert_eq!(results[2].title, "Archive Notes");
 
         let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn render_context_bundle_prefers_discovery_pack_over_full_body() {
+        let mut thread = sample_thread("thread-1", Some("planning sync"), Some("main"));
+        thread.turns = vec![Turn {
+            id: "turn-1".to_string(),
+            items: vec![ThreadItem::Plan {
+                id: "plan-1".to_string(),
+                text: "Discovery pack rollout\nThis plan body should not be copied wholesale into the bundle.".to_string(),
+            }],
+            status: AppTurnStatus::Completed,
+            error: None,
+        }];
+        let documents = thread_context_documents(&thread, true, None);
+        let entries = documents
+            .iter()
+            .filter(|document| matches!(document.kind, ContextKind::ThreadInsight))
+            .cloned()
+            .map(resolved_entry_from_document)
+            .collect::<Vec<_>>();
+        let artifact_paths = context_graph_artifact_paths(&documents);
+
+        let bundle = render_context_bundle(&documents, &entries, Some(&artifact_paths));
+
+        assert!(bundle.contains("Graph index: .codex/context/.graph/index.md"));
+        assert!(bundle.contains("Hotspots to inspect or promote:"));
+        assert!(bundle.contains(".codex/context/.graph/nodes/insights/"));
+        assert!(bundle.contains("Discovery pack rollout"));
+        assert!(!bundle.contains("This plan body should not be copied wholesale into the bundle."));
     }
 
     fn sample_thread(id: &str, preview: Option<&str>, branch: Option<&str>) -> Thread {

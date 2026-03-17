@@ -3,6 +3,8 @@ use crate::protocol::v2::CollabAgentTool;
 use crate::protocol::v2::CollabAgentToolCallStatus;
 use crate::protocol::v2::CommandAction;
 use crate::protocol::v2::CommandExecutionStatus;
+use crate::protocol::v2::ContextGraphQueryOperation;
+use crate::protocol::v2::ContextGraphQueryScope;
 use crate::protocol::v2::DynamicToolCallOutputContentItem;
 use crate::protocol::v2::DynamicToolCallStatus;
 use crate::protocol::v2::FileUpdateChange;
@@ -18,7 +20,12 @@ use crate::protocol::v2::TurnError;
 use crate::protocol::v2::TurnStatus;
 use crate::protocol::v2::UserInput;
 use crate::protocol::v2::WebSearchAction;
+use codex_protocol::context_graph::CONTEXT_GRAPH_TOOL_NAME;
+use codex_protocol::context_graph::ContextGraphToolArgs;
+use codex_protocol::context_graph::ContextGraphToolOutput;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::MessagePhase;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentReasoningEvent;
 use codex_protocol::protocol::AgentReasoningRawContentEvent;
 use codex_protocol::protocol::AgentStatus;
@@ -71,6 +78,7 @@ pub struct ThreadHistoryBuilder {
     turns: Vec<Turn>,
     current_turn: Option<PendingTurn>,
     next_item_index: i64,
+    pending_context_graph_calls: HashMap<String, PendingContextGraphCall>,
 }
 
 impl Default for ThreadHistoryBuilder {
@@ -85,6 +93,7 @@ impl ThreadHistoryBuilder {
             turns: Vec::new(),
             current_turn: None,
             next_item_index: 1,
+            pending_context_graph_calls: HashMap::new(),
         }
     }
 
@@ -177,10 +186,90 @@ impl ThreadHistoryBuilder {
         match item {
             RolloutItem::EventMsg(event) => self.handle_event(event),
             RolloutItem::Compacted(payload) => self.handle_compacted(payload),
-            RolloutItem::TurnContext(_)
-            | RolloutItem::SessionMeta(_)
-            | RolloutItem::ResponseItem(_) => {}
+            RolloutItem::ResponseItem(item) => self.handle_response_item(item),
+            RolloutItem::TurnContext(_) | RolloutItem::SessionMeta(_) => {}
         }
+    }
+
+    fn handle_response_item(&mut self, item: &ResponseItem) {
+        match item {
+            ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            } => self.handle_function_call(name, arguments, call_id),
+            ResponseItem::FunctionCallOutput { call_id, output } => {
+                self.handle_function_call_output(call_id, output)
+            }
+            ResponseItem::Message { .. }
+            | ResponseItem::Reasoning { .. }
+            | ResponseItem::LocalShellCall { .. }
+            | ResponseItem::CustomToolCall { .. }
+            | ResponseItem::CustomToolCallOutput { .. }
+            | ResponseItem::WebSearchCall { .. }
+            | ResponseItem::GhostSnapshot { .. }
+            | ResponseItem::Compaction { .. }
+            | ResponseItem::Other => {}
+        }
+    }
+
+    fn handle_function_call(&mut self, name: &str, arguments: &str, call_id: &str) {
+        if name != CONTEXT_GRAPH_TOOL_NAME {
+            return;
+        }
+
+        let Ok(args) = serde_json::from_str::<ContextGraphToolArgs>(arguments) else {
+            warn!("failed to parse context_graph arguments for call `{call_id}`");
+            return;
+        };
+
+        self.pending_context_graph_calls.insert(
+            call_id.to_string(),
+            PendingContextGraphCall {
+                operation: args.op.into(),
+                scope: args.scope.into(),
+                ref_ids: context_graph_ref_ids(&args),
+                query: args
+                    .query
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|query| !query.is_empty())
+                    .map(str::to_string),
+            },
+        );
+    }
+
+    fn handle_function_call_output(&mut self, call_id: &str, output: &FunctionCallOutputPayload) {
+        let Some(call) = self.pending_context_graph_calls.remove(call_id) else {
+            return;
+        };
+
+        let raw_output = output.body.to_text().unwrap_or_default();
+        let parsed_output = serde_json::from_str::<ContextGraphToolOutput>(&raw_output).ok();
+        let success = output.success.unwrap_or(true) && parsed_output.is_some();
+        let result_ref_ids = parsed_output
+            .as_ref()
+            .map(|payload| payload.result_ref_ids.clone())
+            .unwrap_or_default();
+        let summary = parsed_output
+            .as_ref()
+            .map(|payload| payload.summary.clone())
+            .or_else(|| {
+                let text = raw_output.trim();
+                (!text.is_empty()).then(|| text.to_string())
+            });
+
+        self.upsert_item_in_current_turn(ThreadItem::ContextGraphQuery {
+            id: call_id.to_string(),
+            operation: call.operation,
+            scope: call.scope,
+            query: call.query,
+            ref_ids: call.ref_ids,
+            result_ref_ids,
+            summary,
+            success,
+        });
     }
 
     fn handle_user_message(&mut self, payload: &UserMessageEvent) {
@@ -1037,6 +1126,31 @@ fn upsert_turn_item(items: &mut Vec<ThreadItem>, item: ThreadItem) {
     items.push(item);
 }
 
+struct PendingContextGraphCall {
+    operation: ContextGraphQueryOperation,
+    scope: ContextGraphQueryScope,
+    query: Option<String>,
+    ref_ids: Vec<String>,
+}
+
+fn context_graph_ref_ids(args: &ContextGraphToolArgs) -> Vec<String> {
+    let mut ref_ids = Vec::new();
+    if let Some(ref_id) = args
+        .ref_id
+        .as_deref()
+        .filter(|ref_id| !ref_id.trim().is_empty())
+    {
+        ref_ids.push(ref_id.to_string());
+    }
+    for ref_id in &args.ref_ids {
+        if ref_id.trim().is_empty() || ref_ids.iter().any(|candidate| candidate == ref_id) {
+            continue;
+        }
+        ref_ids.push(ref_id.clone());
+    }
+    ref_ids
+}
+
 struct PendingTurn {
     id: String,
     items: Vec<ThreadItem>,
@@ -1088,10 +1202,17 @@ impl From<&PendingTurn> for Turn {
 mod tests {
     use super::*;
     use codex_protocol::ThreadId;
+    use codex_protocol::context_graph::CONTEXT_GRAPH_TOOL_NAME;
+    use codex_protocol::context_graph::ContextGraphToolArgs;
+    use codex_protocol::context_graph::ContextGraphToolOperation;
+    use codex_protocol::context_graph::ContextGraphToolOutput;
+    use codex_protocol::context_graph::ContextGraphToolScope;
     use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynamicToolCallOutputContentItem;
     use codex_protocol::items::TurnItem as CoreTurnItem;
     use codex_protocol::items::UserMessageItem as CoreUserMessageItem;
+    use codex_protocol::models::FunctionCallOutputPayload;
     use codex_protocol::models::MessagePhase as CoreMessagePhase;
+    use codex_protocol::models::ResponseItem;
     use codex_protocol::models::WebSearchAction as CoreWebSearchAction;
     use codex_protocol::parse_command::ParsedCommand;
     use codex_protocol::protocol::AgentMessageEvent;
@@ -1115,6 +1236,7 @@ mod tests {
     use codex_protocol::protocol::UserMessageEvent;
     use codex_protocol::protocol::WebSearchEndEvent;
     use pretty_assertions::assert_eq;
+    use serde_json::json;
     use std::path::PathBuf;
     use std::time::Duration;
     use uuid::Uuid;
@@ -1286,6 +1408,132 @@ mod tests {
                 text: "Final reply".into(),
                 phase: Some(MessagePhase::FinalAnswer),
             }
+        );
+    }
+
+    #[test]
+    fn reconstructs_context_graph_query_from_rollout_function_calls() {
+        let args = ContextGraphToolArgs {
+            op: ContextGraphToolOperation::Search,
+            scope: ContextGraphToolScope::Local,
+            query: Some("rust graph".to_string()),
+            ref_id: Some("ctx:thread-search:thread-1:search-1".to_string()),
+            ref_ids: vec!["ctx:thread-file:thread-1:file-1".to_string()],
+            limit: Some(5),
+        };
+        let output = ContextGraphToolOutput {
+            op: ContextGraphToolOperation::Search,
+            scope: ContextGraphToolScope::Local,
+            summary: "2 local context match(es) for rust graph".to_string(),
+            result_ref_ids: vec![
+                "ctx:thread-search:thread-1:search-1".to_string(),
+                "ctx:thread-file:thread-1:file-1".to_string(),
+            ],
+            data: json!({
+                "results": [
+                    { "refId": "ctx:thread-search:thread-1:search-1" },
+                    { "refId": "ctx:thread-file:thread-1:file-1" }
+                ]
+            }),
+        };
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "find thread context".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            })),
+            RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+                id: None,
+                name: CONTEXT_GRAPH_TOOL_NAME.to_string(),
+                arguments: serde_json::to_string(&args).expect("serialize args"),
+                call_id: "graph-1".to_string(),
+            }),
+            RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+                call_id: "graph-1".to_string(),
+                output: FunctionCallOutputPayload {
+                    body: codex_protocol::models::FunctionCallOutputBody::Text(
+                        serde_json::to_string(&output).expect("serialize output"),
+                    ),
+                    success: Some(true),
+                },
+            }),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].items,
+            vec![
+                ThreadItem::UserMessage {
+                    id: "item-1".into(),
+                    content: vec![UserInput::Text {
+                        text: "find thread context".into(),
+                        text_elements: Vec::new(),
+                    }],
+                },
+                ThreadItem::ContextGraphQuery {
+                    id: "graph-1".into(),
+                    operation: ContextGraphQueryOperation::Search,
+                    scope: ContextGraphQueryScope::Local,
+                    query: Some("rust graph".into()),
+                    ref_ids: vec![
+                        "ctx:thread-search:thread-1:search-1".into(),
+                        "ctx:thread-file:thread-1:file-1".into(),
+                    ],
+                    result_ref_ids: vec![
+                        "ctx:thread-search:thread-1:search-1".into(),
+                        "ctx:thread-file:thread-1:file-1".into(),
+                    ],
+                    summary: Some("2 local context match(es) for rust graph".into()),
+                    success: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reconstructs_failed_context_graph_query_from_rollout_function_output() {
+        let args = ContextGraphToolArgs {
+            op: ContextGraphToolOperation::Open,
+            scope: ContextGraphToolScope::Global,
+            query: None,
+            ref_id: Some("ctx:repo:note-1".to_string()),
+            ref_ids: Vec::new(),
+            limit: None,
+        };
+        let items = vec![
+            RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+                id: None,
+                name: CONTEXT_GRAPH_TOOL_NAME.to_string(),
+                arguments: serde_json::to_string(&args).expect("serialize args"),
+                call_id: "graph-open-1".to_string(),
+            }),
+            RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+                call_id: "graph-open-1".to_string(),
+                output: FunctionCallOutputPayload {
+                    body: codex_protocol::models::FunctionCallOutputBody::Text(
+                        "context node not found".to_string(),
+                    ),
+                    success: Some(false),
+                },
+            }),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].items,
+            vec![ThreadItem::ContextGraphQuery {
+                id: "graph-open-1".into(),
+                operation: ContextGraphQueryOperation::Open,
+                scope: ContextGraphQueryScope::Global,
+                query: None,
+                ref_ids: vec!["ctx:repo:note-1".into()],
+                result_ref_ids: Vec::new(),
+                summary: Some("context node not found".into()),
+                success: false,
+            }]
         );
     }
 

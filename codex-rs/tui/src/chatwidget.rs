@@ -8217,6 +8217,17 @@ impl ChatWidget {
         &mut self,
         query: Option<String>,
         graph: ContextGraphResponse,
+        scope: TogetherContextScope,
+    ) {
+        self.show_together_context_view_with_marks(query, graph, scope, HashSet::new());
+    }
+
+    pub(crate) fn show_together_context_view_with_marks(
+        &mut self,
+        query: Option<String>,
+        graph: ContextGraphResponse,
+        scope: TogetherContextScope,
+        marked_ref_ids: HashSet<String>,
     ) {
         if graph.nodes.is_empty() {
             let scope = query.unwrap_or_else(|| "current repo".to_string());
@@ -8225,12 +8236,13 @@ impl ChatWidget {
         }
 
         let current_thread_ref_id = self.thread_id.map(|id| format!("ctx:thread:{id}"));
-        let all_results = graph.nodes.clone();
-        let tree_rows = together_context_visible_tree_rows(
-            graph.nodes,
-            &graph.edges,
+        let all_results = graph.nodes;
+        let edges = graph.edges;
+        let tree_rows = together_context_tree_rows_for_scope(
+            all_results.clone(),
+            &edges,
             current_thread_ref_id.as_deref(),
-            query.as_deref(),
+            scope,
         );
         let results = tree_rows
             .iter()
@@ -8238,22 +8250,35 @@ impl ChatWidget {
             .collect::<Vec<_>>();
         let state = Arc::new(Mutex::new(TogetherContextViewState {
             query: query.clone(),
+            scope,
             results,
             all_results: all_results.clone(),
-            edges: graph.edges.clone(),
+            edges,
             current_thread_ref_id,
             selected_actual_idx: 0,
-            marked_ref_ids: HashSet::new(),
+            marked_ref_ids,
         }));
         self.together_context_view_state = Some(Arc::clone(&state));
-        self.bottom_pane
-            .show_selection_view(self.together_context_view_params(
-                query,
-                all_results,
-                tree_rows,
-                graph.edges,
-                state,
-            ));
+        let params = self.together_context_view_params(
+            query.clone(),
+            all_results.clone(),
+            tree_rows.clone(),
+            Arc::clone(&state),
+            None,
+        );
+        if !self
+            .bottom_pane
+            .replace_selection_view_if_active(TOGETHER_CONTEXT_SELECTION_VIEW_ID, params)
+        {
+            self.bottom_pane
+                .show_selection_view(self.together_context_view_params(
+                    query,
+                    all_results,
+                    tree_rows,
+                    state,
+                    None,
+                ));
+        }
     }
 
     pub(crate) fn apply_together_context_search_result(
@@ -8285,7 +8310,17 @@ impl ChatWidget {
             state.marked_ref_ids.remove(&ref_id);
         }
         drop(state);
-        self.request_redraw();
+        self.refresh_together_context_view();
+    }
+
+    pub(crate) fn together_context_toggle_request(&self) -> Option<TogetherContextToggleRequest> {
+        let state = self.together_context_view_state.as_ref()?;
+        let state = lock_together_context_view_state(state);
+        Some(TogetherContextToggleRequest {
+            query: state.query.clone(),
+            next_scope: state.scope.toggled(state.current_thread_ref_id.is_some()),
+            marked_ref_ids: state.marked_ref_ids.clone(),
+        })
     }
 
     pub(crate) fn together_context_action_ref_ids(&self, actual_idx: usize) -> Vec<String> {
@@ -8376,6 +8411,54 @@ impl ChatWidget {
             context_bindings,
         );
         self.bottom_pane.move_composer_cursor_to_end();
+    }
+
+    fn refresh_together_context_view(&mut self) {
+        let Some(state) = self.together_context_view_state.as_ref() else {
+            return;
+        };
+        let state_arc = Arc::clone(state);
+        let (query, all_results, tree_rows, selected_actual_idx, state_for_params) = {
+            let mut state = lock_together_context_view_state(&state_arc);
+            let selected_ref_id = state
+                .results
+                .get(state.selected_actual_idx)
+                .map(|result| result.ref_id.clone());
+            let tree_rows = together_context_tree_rows_for_scope(
+                state.all_results.clone(),
+                &state.edges,
+                state.current_thread_ref_id.as_deref(),
+                state.scope,
+            );
+            let results = tree_rows
+                .iter()
+                .map(|row| row.result.clone())
+                .collect::<Vec<_>>();
+            let selected_actual_idx = selected_ref_id
+                .as_ref()
+                .and_then(|ref_id| results.iter().position(|result| result.ref_id == *ref_id))
+                .or_else(|| (!results.is_empty()).then_some(0));
+            state.selected_actual_idx = selected_actual_idx.unwrap_or(0);
+            state.results = results;
+            (
+                state.query.clone(),
+                state.all_results.clone(),
+                tree_rows,
+                selected_actual_idx,
+                Arc::clone(&state_arc),
+            )
+        };
+        let _ = self.bottom_pane.replace_selection_view_if_active(
+            TOGETHER_CONTEXT_SELECTION_VIEW_ID,
+            self.together_context_view_params(
+                query,
+                all_results,
+                tree_rows,
+                state_for_params,
+                selected_actual_idx,
+            ),
+        );
+        self.request_redraw();
     }
 
     pub(crate) fn show_together_handoff_review(&mut self, plan: HandoffPlanResponse) {
@@ -8471,98 +8554,108 @@ impl ChatWidget {
         query: Option<String>,
         all_results: Vec<ContextSearchResult>,
         tree_rows: Vec<TogetherContextTreeRow>,
-        edges: Vec<ContextGraphEdge>,
         state: Arc<Mutex<TogetherContextViewState>>,
+        initial_selected_idx: Option<usize>,
     ) -> SelectionViewParams {
-        let footer_note = together_context_footer_note(&all_results, &tree_rows, &edges);
-        let link_counts = tree_rows
+        let (scope, marked_ref_ids, has_thread_context) = {
+            let state = lock_together_context_view_state(&state);
+            (
+                state.scope,
+                state.marked_ref_ids.clone(),
+                state.current_thread_ref_id.is_some(),
+            )
+        };
+        let header = together_context_header(scope, has_thread_context, query.as_deref());
+        let author_by_ref_id = tree_rows
             .iter()
             .map(|row| {
                 (
                     row.result.ref_id.clone(),
-                    edges
-                        .iter()
-                        .filter(|edge| {
-                            edge.from_ref_id == row.result.ref_id
-                                || edge.to_ref_id == row.result.ref_id
-                        })
-                        .count(),
+                    together_context_local_thread_author(&row.result, &all_results),
                 )
             })
             .collect::<HashMap<_, _>>();
-        let has_current_thread = tree_rows.iter().any(|row| row.is_current_thread);
-        let items = tree_rows
-            .into_iter()
-            .enumerate()
-            .map(|(actual_idx, row)| {
-                let result = &row.result;
-                let display_name = together_context_display_name(result);
-                let link_count = link_counts.get(&result.ref_id).copied().unwrap_or_default();
-                let mut search_value = format!(
-                    "{} {} {}",
-                    result.title,
-                    result.location.clone().unwrap_or_default(),
-                    result.summary.clone().unwrap_or_default()
-                );
-                if display_name != result.title {
+        let footer_note = Some(together_context_status_line(has_thread_context));
+        let items = if tree_rows.is_empty() {
+            vec![together_context_empty_state_item(
+                scope,
+                has_thread_context,
+            )]
+        } else {
+            tree_rows
+                .into_iter()
+                .enumerate()
+                .map(|(actual_idx, row)| {
+                    let result = &row.result;
+                    let display_name = together_context_display_name(result);
+                    let author = author_by_ref_id
+                        .get(&result.ref_id)
+                        .cloned()
+                        .unwrap_or_else(|| "context".to_string());
+                    let description = together_context_row_description(
+                        &row,
+                        author.as_str(),
+                        display_name.as_str(),
+                    );
+                    let mut search_value = format!(
+                        "{} {} {} {}",
+                        result.title,
+                        result.location.clone().unwrap_or_default(),
+                        result.summary.clone().unwrap_or_default(),
+                        together_context_kind_label(result.kind)
+                    );
+                    if display_name != result.title {
+                        search_value.push(' ');
+                        search_value.push_str(&display_name);
+                    }
                     search_value.push(' ');
-                    search_value.push_str(&display_name);
-                }
-                if let Some(body) = &result.body {
+                    search_value.push_str(&author);
+                    if !row.relation_labels.is_empty() {
+                        search_value.push(' ');
+                        search_value.push_str(&row.relation_labels.join(" "));
+                    }
+                    if let Some(body) = &result.body {
+                        search_value.push(' ');
+                        search_value.push_str(body);
+                    }
                     search_value.push(' ');
-                    search_value.push_str(body);
-                }
-                let selected_description = together_context_selected_description(
-                    result,
-                    link_count,
-                    &row.relation_labels,
-                    row.is_current_thread,
-                );
-                SelectionItem {
-                    name: display_name,
-                    name_prefix_spans: row.prefix_spans,
-                    description: None,
-                    selected_description,
-                    search_value: Some(search_value),
-                    actions: vec![Box::new(move |tx: &AppEventSender| {
-                        tx.send(AppEvent::AttachTogetherContextSelection { actual_idx });
-                    })],
-                    dismiss_on_select: true,
-                    ..Default::default()
-                }
-            })
-            .collect();
+                    search_value.push_str(&description);
+                    SelectionItem {
+                        name: together_context_row_name(result, author.as_str()),
+                        name_prefix_spans: together_context_graph_prefix_spans(
+                            &row,
+                            marked_ref_ids.contains(&result.ref_id),
+                        ),
+                        description: Some(description),
+                        selected_description: None,
+                        search_value: Some(search_value),
+                        actions: vec![Box::new(move |tx: &AppEventSender| {
+                            tx.send(AppEvent::AttachTogetherContextSelection { actual_idx });
+                        })],
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    }
+                })
+                .collect()
+        };
 
         SelectionViewParams {
             view_id: Some(TOGETHER_CONTEXT_SELECTION_VIEW_ID),
-            title: Some("Context".to_string()),
-            subtitle: Some(match query {
-                Some(query) if has_current_thread => {
-                    format!("Search thread-local + persistent knowledge for {query}")
-                }
-                Some(query) => format!("Search thread and repo knowledge for {query}"),
-                None if has_current_thread => {
-                    "Current thread context with linked persistent knowledge".to_string()
-                }
-                None => "Browse repo notes and live threads".to_string(),
-            }),
-            footer_note: Some(footer_note),
-            footer_hint: Some(
-                "Enter attach · Space mark · H handoff · W write · Esc dismiss".into(),
-            ),
+            title: None,
+            subtitle: None,
+            footer_note,
+            footer_hint: None,
             items,
             is_searchable: true,
-            search_placeholder: Some(if has_current_thread {
-                "Filter thread + repo knowledge".to_string()
-            } else {
-                "Filter graph nodes".to_string()
-            }),
+            search_placeholder: Some(
+                together_context_search_placeholder(scope, has_thread_context).to_string(),
+            ),
             col_width_mode: ColumnWidthMode::AutoAllRows,
-            side_content: Box::new(TogetherContextPreviewRenderable {
-                state: Arc::clone(&state),
-            }),
-            side_content_width: SideContentWidth::Half,
-            side_content_min_width: 32,
+            header: Box::new(header),
+            initial_selected_idx,
+            side_content: Box::new(()),
+            side_content_width: SideContentWidth::Fixed(0),
+            side_content_min_width: 0,
             on_selection_changed: Some(Box::new(move |idx, _tx| {
                 if let Ok(mut state) = state.lock() {
                     state.selected_actual_idx = idx;
@@ -8572,6 +8665,10 @@ impl ChatWidget {
                 move |pressed, actual_idx, tx: &AppEventSender| match pressed {
                     ' ' => {
                         tx.send(AppEvent::ToggleTogetherContextMark { actual_idx });
+                        true
+                    }
+                    'T' if has_thread_context => {
+                        tx.send(AppEvent::ToggleTogetherContextScope);
                         true
                     }
                     'H' => {
@@ -8609,8 +8706,16 @@ impl ChatWidget {
                     )));
                     if let Some(follow_up) = output.follow_up {
                         match follow_up {
-                            TogetherCommandFollowUp::OpenContextView { query, graph } => {
-                                tx.send(AppEvent::OpenTogetherContextView { query, graph });
+                            TogetherCommandFollowUp::OpenContextView {
+                                query,
+                                graph,
+                                scope,
+                            } => {
+                                tx.send(AppEvent::OpenTogetherContextView {
+                                    query,
+                                    graph,
+                                    scope,
+                                });
                             }
                             TogetherCommandFollowUp::OpenHandoffReview { plan } => {
                                 tx.send(AppEvent::OpenTogetherHandoffReview { plan });
@@ -8742,15 +8847,50 @@ enum TogetherCommandFollowUp {
     OpenContextView {
         query: Option<String>,
         graph: ContextGraphResponse,
+        scope: TogetherContextScope,
     },
     OpenHandoffReview {
         plan: HandoffPlanResponse,
     },
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TogetherContextScope {
+    LocalThread,
+    Global,
+}
+
+impl TogetherContextScope {
+    fn default_for(current_thread_ref_id: Option<&str>) -> Self {
+        if current_thread_ref_id.is_some() {
+            Self::LocalThread
+        } else {
+            Self::Global
+        }
+    }
+
+    fn toggled(self, has_current_thread: bool) -> Self {
+        if !has_current_thread {
+            return Self::Global;
+        }
+        match self {
+            Self::LocalThread => Self::Global,
+            Self::Global => Self::LocalThread,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TogetherContextToggleRequest {
+    pub(crate) query: Option<String>,
+    pub(crate) next_scope: TogetherContextScope,
+    pub(crate) marked_ref_ids: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
 struct TogetherContextViewState {
     query: Option<String>,
+    scope: TogetherContextScope,
     results: Vec<ContextSearchResult>,
     all_results: Vec<ContextSearchResult>,
     edges: Vec<ContextGraphEdge>,
@@ -8759,12 +8899,34 @@ struct TogetherContextViewState {
     marked_ref_ids: HashSet<String>,
 }
 
+impl Default for TogetherContextViewState {
+    fn default() -> Self {
+        Self {
+            query: None,
+            scope: TogetherContextScope::Global,
+            results: Vec::new(),
+            all_results: Vec::new(),
+            edges: Vec::new(),
+            current_thread_ref_id: None,
+            selected_actual_idx: 0,
+            marked_ref_ids: HashSet::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TogetherContextTreeRow {
     result: ContextSearchResult,
     relation_labels: Vec<String>,
-    prefix_spans: Vec<Span<'static>>,
+    graph_path: TogetherContextTreeGraphPath,
     is_current_thread: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TogetherContextTreeGraphPath {
+    depth: usize,
+    ancestor_last_flags: Vec<bool>,
+    is_last: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -8787,25 +8949,6 @@ struct TogetherContextTreePathState {
     relation_labels: Vec<String>,
 }
 
-struct TogetherContextPreviewRenderable {
-    state: Arc<Mutex<TogetherContextViewState>>,
-}
-
-impl Renderable for TogetherContextPreviewRenderable {
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        let state = lock_together_context_view_state(&self.state);
-        let lines = together_context_preview_lines(&state, area.width);
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .render(area, buf);
-    }
-
-    fn desired_height(&self, width: u16) -> u16 {
-        let state = lock_together_context_view_state(&self.state);
-        together_context_preview_lines(&state, width).len() as u16
-    }
-}
-
 fn lock_together_context_view_state(
     state: &Arc<Mutex<TogetherContextViewState>>,
 ) -> std::sync::MutexGuard<'_, TogetherContextViewState> {
@@ -8815,416 +8958,196 @@ fn lock_together_context_view_state(
     }
 }
 
-fn together_context_preview_lines(
-    state: &TogetherContextViewState,
-    width: u16,
-) -> Vec<Line<'static>> {
-    let selected = state.results.get(state.selected_actual_idx);
-    let wrap_width = width.max(1) as usize;
-    let mut lines = vec![Line::from(
-        selected
-            .map(together_context_display_name)
-            .unwrap_or_else(|| "Context".to_string())
-            .bold(),
-    )];
-
-    if let Some(query) = &state.query {
-        for line in wrap(format!("Search: {query}").as_str(), wrap_width) {
-            lines.push(Line::from(line.into_owned().dim()));
-        }
-    }
-
-    let Some(selected) = selected else {
-        return lines;
-    };
-
-    let linked_nodes = together_context_linked_nodes(state, &selected.ref_id);
-    let linked_repo_notes = linked_nodes
-        .iter()
-        .filter(|(result, _)| result.kind == ContextKind::RepoContextFile)
-        .count();
-    let linked_thread_local = linked_nodes.len().saturating_sub(linked_repo_notes);
-    let is_current_thread =
-        state.current_thread_ref_id.as_deref() == Some(selected.ref_id.as_str());
-    let summary_repo_note =
-        together_context_summary_repo_note(&linked_nodes, selected, state.query.as_deref());
-    let current_thread = state
-        .current_thread_ref_id
-        .as_deref()
-        .and_then(|current_thread_ref_id| {
-            state
-                .all_results
-                .iter()
-                .find(|result| result.ref_id == current_thread_ref_id)
-        });
-    let mut node_spans = vec!["Focus".cyan(), ": ".into()];
-    if is_current_thread {
-        node_spans.push("current thread".cyan());
-        node_spans.push(" · ".dim());
-    }
-    node_spans.push(together_context_marker_span(selected));
-    node_spans.push(" ".into());
-    node_spans.push(together_context_display_name(selected).into());
-    lines.push(Line::from(node_spans));
-    if let Some(location) = &selected.location {
-        for line in wrap(location, wrap_width.saturating_sub(2).max(1)) {
-            lines.push(Line::from(format!("  {}", line.into_owned()).cyan()));
-        }
-    }
-    if let Some(current_thread) = current_thread
-        && current_thread.ref_id != selected.ref_id
-    {
-        lines.push(Line::from(vec![
-            "Anchor".cyan(),
-            ": ".into(),
-            together_context_marker_span(current_thread),
-            " ".into(),
-            together_context_display_name(current_thread).into(),
-        ]));
-    }
-    lines.push(Line::from(vec![
-        "Graph".cyan(),
-        ": ".into(),
-        format!(
-            "{} · {} · {}",
-            together_context_kind_count_label(
-                linked_thread_local,
-                "thread-local node",
-                "thread-local nodes"
-            ),
-            together_context_kind_count_label(linked_repo_notes, "repo note", "repo notes"),
-            together_context_link_count_label(linked_nodes.len())
-        )
-        .dim(),
-    ]));
-
-    if linked_nodes.is_empty() {
-        lines.push(Line::from(vec![
-            "Links".cyan(),
-            ": ".into(),
-            "No linked nodes in this graph slice.".dim(),
-        ]));
-    } else {
-        together_context_push_related_lines(
-            &mut lines,
-            "Thread",
-            linked_nodes
-                .iter()
-                .filter(|(result, _)| result.kind == ContextKind::SharedThread),
-            wrap_width,
-        );
-        together_context_push_related_lines(
-            &mut lines,
-            "Insights",
-            linked_nodes
-                .iter()
-                .filter(|(result, _)| result.kind == ContextKind::ThreadInsight),
-            wrap_width,
-        );
-        together_context_push_related_lines(
-            &mut lines,
-            "Files",
-            linked_nodes
-                .iter()
-                .filter(|(result, _)| result.kind == ContextKind::ThreadFile),
-            wrap_width,
-        );
-        together_context_push_related_lines(
-            &mut lines,
-            "Search",
-            linked_nodes
-                .iter()
-                .filter(|(result, _)| result.kind == ContextKind::ThreadSearch),
-            wrap_width,
-        );
-        together_context_push_related_lines(
-            &mut lines,
-            "Tools",
-            linked_nodes
-                .iter()
-                .filter(|(result, _)| result.kind == ContextKind::ThreadTool),
-            wrap_width,
-        );
-        if summary_repo_note.is_none() {
-            together_context_push_related_lines(
-                &mut lines,
-                "Repo Notes",
-                linked_nodes
-                    .iter()
-                    .filter(|(result, _)| result.kind == ContextKind::RepoContextFile),
-                wrap_width,
-            );
-        }
-    }
-
-    if let Some(summary) = summary_repo_note
-        .and_then(|result| result.summary.as_deref())
-        .or(selected.summary.as_deref())
-        && let Some(line) = wrap(summary, wrap_width.saturating_sub(9).max(1))
-            .into_iter()
-            .next()
-    {
-        lines.push(Line::from(vec![
-            "Details".cyan(),
-            ": ".into(),
-            line.into_owned().dim(),
-        ]));
-    }
-
-    if let Some(summary_repo_note) = summary_repo_note {
-        lines.push(Line::from(vec![
-            "Summary".cyan(),
-            ": ".into(),
-            together_context_marker_span(summary_repo_note),
-            " ".into(),
-            together_context_display_name(summary_repo_note).into(),
-        ]));
-    }
-
-    let preview_source = summary_repo_note.unwrap_or(selected);
-    let body = preview_source
-        .body
-        .as_deref()
-        .map(str::trim)
-        .filter(|body| !body.is_empty())
-        .map(|body| {
-            let heading = format!("# {}", preview_source.title);
-            let display_heading = format!("# {}", together_context_display_name(preview_source));
-            let mut lines = body.lines();
-            if lines
-                .next()
-                .map(str::trim)
-                .is_some_and(|line| line == heading || line == display_heading)
-            {
-                lines.collect::<Vec<_>>().join("\n").trim().to_string()
-            } else {
-                body.to_string()
-            }
-        })
-        .filter(|body| !body.is_empty())
-        .unwrap_or_else(|| "No preview available.".to_string());
-    let preview_text = body
-        .lines()
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    if preview_text.is_empty() {
-        lines.push(Line::from(vec![
-            "Preview".cyan(),
-            ": ".into(),
-            "No preview available.".into(),
-        ]));
-    } else {
-        let preview_width = wrap_width.saturating_sub(9).max(1);
-        let mut wrapped = preview_text
-            .iter()
-            .flat_map(|line| wrap(line, preview_width).into_iter())
-            .peekable();
-        if let Some(line) = wrapped.next() {
-            lines.push(Line::from(vec![
-                "Preview".cyan(),
-                ": ".into(),
-                line.into_owned().into(),
-            ]));
-        }
-        for line in wrapped {
-            lines.push(Line::from(format!("         {}", line.into_owned())));
-        }
-    }
-
-    if !state.marked_ref_ids.is_empty() {
-        lines.push(Line::from(vec![
-            "Marked".cyan(),
-            ": ".into(),
-            format!("{} selected", state.marked_ref_ids.len()).dim(),
-        ]));
-        for result in state
-            .results
-            .iter()
-            .filter(|result| state.marked_ref_ids.contains(&result.ref_id))
-        {
-            lines.push(Line::from(vec![
-                "        ".into(),
-                "[x] ".green(),
-                together_context_marker_span(result),
-                " ".into(),
-                together_context_display_name(result).into(),
-            ]));
-        }
-    }
-
-    lines
-}
-
-fn together_context_footer_note(
-    all_results: &[ContextSearchResult],
-    tree_rows: &[TogetherContextTreeRow],
-    edges: &[ContextGraphEdge],
-) -> Line<'static> {
-    let thread_count = all_results
-        .iter()
-        .filter(|result| result.kind == ContextKind::SharedThread)
-        .count();
-    let repo_note_count = all_results
-        .iter()
-        .filter(|result| result.kind == ContextKind::RepoContextFile)
-        .count();
-    let thread_local_count = all_results
-        .len()
-        .saturating_sub(thread_count + repo_note_count);
-    let has_current_thread = tree_rows.iter().any(|row| row.is_current_thread);
-    Line::from(vec![
-        "Scope".cyan(),
-        ": ".into(),
-        if has_current_thread {
-            "thread-local + persistent".dim()
-        } else {
-            "persistent graph".dim()
-        },
-        " · ".dim(),
-        format!(
-            "{} · {} · {} · {}",
-            together_context_kind_count_label(thread_count, "thread", "threads"),
-            together_context_kind_count_label(
-                thread_local_count,
-                "thread-local node",
-                "thread-local nodes"
-            ),
-            together_context_kind_count_label(repo_note_count, "repo note", "repo notes"),
-            together_context_kind_count_label(edges.len(), "edge", "edges")
-        )
-        .dim(),
-    ])
-}
-
-fn together_context_push_related_lines<'a>(
-    lines: &mut Vec<Line<'static>>,
-    label: &str,
-    related_nodes: impl Iterator<Item = &'a (ContextSearchResult, Vec<String>)>,
-    wrap_width: usize,
-) {
-    let related_nodes = related_nodes.collect::<Vec<_>>();
-    if related_nodes.is_empty() {
-        return;
-    }
-
-    for (idx, (result, relation_labels)) in related_nodes.into_iter().enumerate() {
-        let detail = if !relation_labels.is_empty() {
-            relation_labels.join(", ")
-        } else {
-            result.location.clone().unwrap_or_default()
-        };
-        lines.push(Line::from(vec![
-            if idx == 0 {
-                format!("{label:<10}").cyan()
-            } else {
-                "          ".into()
-            },
-            if idx == 0 { ": ".into() } else { "".into() },
-            together_context_marker_span(result),
-            " ".into(),
-            together_context_display_name(result).into(),
-        ]));
-        if !detail.is_empty() {
-            for line in wrap(detail.as_str(), wrap_width.saturating_sub(10).max(1)) {
-                lines.push(Line::from(format!("          {}", line.into_owned()).dim()));
-            }
-        }
-    }
-}
-
-fn together_context_linked_nodes(
-    state: &TogetherContextViewState,
-    ref_id: &str,
-) -> Vec<(ContextSearchResult, Vec<String>)> {
-    let mut labels_by_ref_id = BTreeMap::<String, Vec<String>>::new();
-    for edge in &state.edges {
-        let other_ref_id = if edge.from_ref_id == ref_id {
-            Some(edge.to_ref_id.as_str())
-        } else if edge.to_ref_id == ref_id {
-            Some(edge.from_ref_id.as_str())
-        } else {
-            None
-        };
-        let Some(other_ref_id) = other_ref_id else {
-            continue;
-        };
-        let labels = labels_by_ref_id
-            .entry(other_ref_id.to_string())
-            .or_default();
-        if !labels.contains(&edge.label) {
-            labels.push(edge.label.clone());
-        }
-    }
-
-    let mut linked_nodes = labels_by_ref_id
-        .into_iter()
-        .filter_map(|(other_ref_id, mut labels)| {
-            labels.sort();
-            state
-                .all_results
-                .iter()
-                .find(|result| result.ref_id == other_ref_id)
-                .cloned()
-                .map(|result| (result, labels))
-        })
-        .collect::<Vec<_>>();
-    linked_nodes.sort_by(|(left, _), (right, _)| {
-        left.title
-            .to_ascii_lowercase()
-            .cmp(&right.title.to_ascii_lowercase())
-            .then_with(|| left.ref_id.cmp(&right.ref_id))
-    });
-    linked_nodes
-}
-
-fn together_context_summary_repo_note<'a>(
-    linked_nodes: &'a [(ContextSearchResult, Vec<String>)],
-    selected: &ContextSearchResult,
+fn together_context_header(
+    scope: TogetherContextScope,
+    has_thread_context: bool,
     query: Option<&str>,
-) -> Option<&'a ContextSearchResult> {
-    if query.is_some() || selected.kind != ContextKind::SharedThread {
-        return None;
+) -> ColumnRenderable {
+    let mut header = ColumnRenderable::new();
+    header.push(Line::from("Context".bold()));
+    header.push(together_context_scope_selector_line(scope, has_thread_context));
+    header.push(Line::from(
+        together_context_scope_description(scope, has_thread_context).dim(),
+    ));
+    if let Some(query) = query.map(str::trim).filter(|query| !query.is_empty()) {
+        header.push(Line::from(format!("Query: {query}").dim()));
     }
-
-    let has_thread_local_children = linked_nodes.iter().any(|(result, _)| {
-        matches!(
-            result.kind,
-            ContextKind::ThreadInsight
-                | ContextKind::ThreadFile
-                | ContextKind::ThreadSearch
-                | ContextKind::ThreadTool
-        )
-    });
-    if has_thread_local_children {
-        return None;
-    }
-
-    linked_nodes
-        .iter()
-        .find_map(|(result, _)| (result.kind == ContextKind::RepoContextFile).then_some(result))
+    header
 }
 
-fn together_context_visible_tree_rows(
+fn together_context_scope_selector_line(
+    scope: TogetherContextScope,
+    has_thread_context: bool,
+) -> Line<'static> {
+    let mut spans = vec!["Scope: ".dim()];
+    if has_thread_context {
+        spans.extend(together_context_scope_selector(
+            "Local thread",
+            scope == TogetherContextScope::LocalThread,
+        ));
+        spans.push(" ".into());
+    }
+    spans.extend(together_context_scope_selector(
+        "Global graph",
+        scope == TogetherContextScope::Global,
+    ));
+    Line::from(spans)
+}
+
+fn together_context_scope_selector(label: &str, is_active: bool) -> Vec<Span<'static>> {
+    vec![
+        "[".dim(),
+        if is_active {
+            label.green().bold()
+        } else {
+            label.dim()
+        },
+        "]".dim(),
+    ]
+}
+
+fn together_context_scope_description(
+    scope: TogetherContextScope,
+    has_thread_context: bool,
+) -> &'static str {
+    match (scope, has_thread_context) {
+        (TogetherContextScope::LocalThread, true) => {
+            "Retained thread artifacts only. Press T to switch to the broader graph."
+        }
+        (TogetherContextScope::LocalThread, false) => {
+            "No active thread is available for local artifact discovery."
+        }
+        (TogetherContextScope::Global, true) => {
+            "Persistent notes and linked thread context across the broader graph."
+        }
+        (TogetherContextScope::Global, false) => {
+            "Persistent notes and linked thread context across the broader graph."
+        }
+    }
+}
+
+fn together_context_search_placeholder(
+    scope: TogetherContextScope,
+    has_thread_context: bool,
+) -> &'static str {
+    match (scope, has_thread_context) {
+        (TogetherContextScope::LocalThread, true) => "Filter local artifacts",
+        (TogetherContextScope::LocalThread, false) => "Filter local scope",
+        (TogetherContextScope::Global, _) => "Filter global graph",
+    }
+}
+
+fn together_context_empty_state_item(
+    scope: TogetherContextScope,
+    has_thread_context: bool,
+) -> SelectionItem {
+    let (name, description) = match (scope, has_thread_context) {
+        (TogetherContextScope::LocalThread, true) => (
+            "No retained local artifacts".to_string(),
+            "Local scope only shows retained plans, file reads, searches, tool output, and graph queries from this thread. Press T for the global graph.".to_string(),
+        ),
+        (TogetherContextScope::LocalThread, false) => (
+            "No active thread context".to_string(),
+            "Start or resume a thread to browse local artifacts.".to_string(),
+        ),
+        (TogetherContextScope::Global, _) => (
+            "No context nodes".to_string(),
+            "Nothing matched the current graph selection.".to_string(),
+        ),
+    };
+    let search_value = format!("{name} {description}");
+    SelectionItem {
+        name,
+        description: Some(description),
+        is_disabled: true,
+        dismiss_on_select: false,
+        search_value: Some(search_value),
+        ..Default::default()
+    }
+}
+
+fn together_context_status_line(has_thread_context: bool) -> Line<'static> {
+    let mut spans = vec![
+        "enter".green(),
+        " attach".dim(),
+        " | ".dim(),
+        "space".green(),
+        " mark".dim(),
+    ];
+    if has_thread_context {
+        spans.extend([" | ".dim(), "T".green(), " scope".dim()]);
+    }
+    spans.extend([
+        " | ".dim(),
+        "H".green(),
+        " handoff".dim(),
+        " | ".dim(),
+        "W".green(),
+        " write".dim(),
+        " | ".dim(),
+        "esc".green(),
+        " close".dim(),
+    ]);
+    Line::from(spans)
+}
+
+fn together_context_tree_rows_for_scope(
     results: Vec<ContextSearchResult>,
     edges: &[ContextGraphEdge],
     current_thread_ref_id: Option<&str>,
-    query: Option<&str>,
+    scope: TogetherContextScope,
 ) -> Vec<TogetherContextTreeRow> {
-    let tree_rows = together_context_tree_rows(results, edges, current_thread_ref_id);
-    if query.is_some() || current_thread_ref_id.is_none() {
-        return tree_rows;
+    match scope {
+        TogetherContextScope::LocalThread => {
+            together_context_local_thread_tree_rows(results, edges, current_thread_ref_id)
+        }
+        TogetherContextScope::Global => {
+            together_context_tree_rows(results, edges, current_thread_ref_id)
+        }
     }
+}
 
-    tree_rows
-        .into_iter()
-        .filter(|row| {
-            row.result.kind != ContextKind::RepoContextFile
-                || !row
-                    .relation_labels
-                    .iter()
-                    .any(|label| label == "source" || label == "branch")
-        })
-        .collect()
+fn together_context_local_thread_tree_rows(
+    results: Vec<ContextSearchResult>,
+    edges: &[ContextGraphEdge],
+    current_thread_ref_id: Option<&str>,
+) -> Vec<TogetherContextTreeRow> {
+    let Some(current_thread_ref_id) = current_thread_ref_id else {
+        return Vec::new();
+    };
+    let Some(current_thread_id) = current_thread_ref_id.strip_prefix("ctx:thread:") else {
+        return Vec::new();
+    };
+    let thread_local_results = results
+        .iter()
+        .filter(|result| {
+            matches!(
+                result.kind,
+                ContextKind::ThreadInsight
+                    | ContextKind::ThreadFile
+                    | ContextKind::ThreadSearch
+                    | ContextKind::ThreadTool
+            ) && together_context_source_thread_id_for_result(result).as_deref()
+                == Some(current_thread_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+    if !thread_local_results.is_empty() {
+        let thread_local_ref_ids = thread_local_results
+            .iter()
+            .map(|result| result.ref_id.clone())
+            .collect::<HashSet<_>>();
+        let thread_local_edges = edges
+            .iter()
+            .filter(|edge| {
+                thread_local_ref_ids.contains(&edge.from_ref_id)
+                    && thread_local_ref_ids.contains(&edge.to_ref_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        return together_context_tree_rows(thread_local_results, &thread_local_edges, None);
+    }
+    Vec::new()
 }
 
 fn together_context_tree_rows(
@@ -9388,12 +9311,11 @@ fn together_context_push_tree_rows(
         return;
     };
     rows.push(TogetherContextTreeRow {
-        prefix_spans: together_context_tree_prefix_spans(
-            path.depth,
-            &path.ancestor_last_flags,
-            path.is_last,
-            &result,
-        ),
+        graph_path: TogetherContextTreeGraphPath {
+            depth: path.depth,
+            ancestor_last_flags: path.ancestor_last_flags.clone(),
+            is_last: path.is_last,
+        },
         is_current_thread: tree.current_thread_ref_id == Some(ref_id),
         relation_labels: path.relation_labels,
         result,
@@ -9422,31 +9344,182 @@ fn together_context_push_tree_rows(
     }
 }
 
-fn together_context_tree_prefix_spans(
-    depth: usize,
-    ancestor_last_flags: &[bool],
-    is_last: bool,
-    result: &ContextSearchResult,
+fn together_context_graph_prefix_spans(
+    row: &TogetherContextTreeRow,
+    is_marked: bool,
 ) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    for ancestor_is_last in ancestor_last_flags {
+    let hash_color = match row.result.kind {
+        ContextKind::SharedThread if row.is_current_thread => Color::Green,
+        ContextKind::SharedThread => Color::LightBlue,
+        ContextKind::ThreadInsight => Color::Yellow,
+        ContextKind::ThreadFile => Color::Blue,
+        ContextKind::ThreadSearch | ContextKind::ThreadTool => Color::Magenta,
+        ContextKind::RepoContextFile => Color::LightYellow,
+    };
+    let mut spans = vec![if is_marked { "[x] ".green() } else { "[ ] ".dim() }];
+    for ancestor_is_last in &row.graph_path.ancestor_last_flags {
         spans.push(if *ancestor_is_last {
-            "  ".dim()
+            "  ".into()
         } else {
             "│ ".dim()
         });
     }
-    if depth > 0 {
-        spans.push(if is_last {
-            "└─".dim()
+    if row.graph_path.depth > 0 {
+        spans.push(if row.graph_path.is_last {
+            "└ ".dim()
         } else {
-            "├─".dim()
+            "├ ".dim()
         });
-        spans.push(" ".into());
     }
-    spans.push(together_context_marker_span(result));
+    spans.push(Span::styled(
+        together_context_short_hash(&row.result),
+        Style::default().fg(hash_color),
+    ));
     spans.push(" ".into());
     spans
+}
+
+fn together_context_short_hash(result: &ContextSearchResult) -> String {
+    let candidate = result
+        .ref_id
+        .rsplit(':')
+        .next()
+        .unwrap_or(result.ref_id.as_str());
+    let compact = candidate.split('-').next().unwrap_or(candidate);
+    let compact = compact.chars().take(8).collect::<String>();
+    if compact.len() >= 6 && compact.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return compact;
+    }
+
+    let hash = result.ref_id.bytes().fold(2_166_136_261_u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
+    });
+    format!("{hash:08x}")
+}
+
+fn together_context_local_thread_author(
+    result: &ContextSearchResult,
+    all_results: &[ContextSearchResult],
+) -> String {
+    together_context_source_thread_id_for_result(result)
+        .and_then(|thread_id| {
+            let thread_ref_id = format!("ctx:thread:{thread_id}");
+            all_results
+                .iter()
+                .find(|candidate| candidate.ref_id == thread_ref_id)
+        })
+        .and_then(together_context_thread_author_label)
+        .or_else(|| together_context_thread_author_label(result))
+        .unwrap_or_else(|| match result.kind {
+            ContextKind::SharedThread => "thread".to_string(),
+            ContextKind::ThreadInsight => "insight".to_string(),
+            ContextKind::ThreadFile => "file".to_string(),
+            ContextKind::ThreadSearch => "search".to_string(),
+            ContextKind::ThreadTool => "tool".to_string(),
+            ContextKind::RepoContextFile => "repo".to_string(),
+        })
+}
+
+fn together_context_thread_author_label(result: &ContextSearchResult) -> Option<String> {
+    if let Some(body) = &result.body
+        && let Some(agent) = body
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix("Agent: "))
+            .map(str::trim)
+            .filter(|agent| !agent.is_empty())
+    {
+        return Some(agent.to_string());
+    }
+    if let Some(summary) = &result.summary
+        && let Some(agent) = summary
+            .split('·')
+            .map(str::trim)
+            .find_map(|part| {
+                part.strip_prefix("agent=")
+                    .or_else(|| part.strip_prefix("owner="))
+                    .or_else(|| part.strip_prefix("shared_by="))
+            })
+            .map(str::trim)
+            .filter(|agent| !agent.is_empty())
+    {
+        return Some(agent.to_string());
+    }
+    result
+        .title
+        .strip_prefix("🦞 ")
+        .and_then(|value| value.split(" · ").next())
+        .map(str::trim)
+        .filter(|author| !author.is_empty())
+        .map(str::to_string)
+}
+
+fn together_context_row_name(result: &ContextSearchResult, author: &str) -> String {
+    let display_name = together_context_display_name(result);
+    let author_prefix = format!("{author} · ");
+    let summary = display_name
+        .strip_prefix(author_prefix.as_str())
+        .unwrap_or(display_name.as_str());
+    let generic_author = together_context_kind_label(result.kind);
+    if author == generic_author || author == "repo" {
+        return together_context_inline_excerpt(summary, 72);
+    }
+    format!(
+        "{} {}",
+        together_context_inline_excerpt(author, 20),
+        together_context_inline_excerpt(summary, 72)
+    )
+}
+
+fn together_context_row_description(
+    row: &TogetherContextTreeRow,
+    author: &str,
+    display_name: &str,
+) -> String {
+    let mut parts = vec![together_context_kind_label(row.result.kind).to_string()];
+    if author != together_context_kind_label(row.result.kind) && author != "repo" {
+        parts.push(together_context_inline_excerpt(author, 24));
+    }
+    if let Some(location) = &row.result.location {
+        parts.push(location.clone());
+    }
+    if !row.relation_labels.is_empty() {
+        parts.push(format!("via {}", row.relation_labels.join(",")));
+    }
+    if let Some(summary) = &row.result.summary {
+        let summary = together_context_inline_excerpt(summary, 80);
+        if !summary.is_empty() && summary != display_name {
+            parts.push(summary);
+        }
+    }
+    parts.join(" · ")
+}
+
+fn together_context_kind_label(kind: ContextKind) -> &'static str {
+    match kind {
+        ContextKind::SharedThread => "thread",
+        ContextKind::ThreadInsight => "insight",
+        ContextKind::ThreadFile => "file",
+        ContextKind::ThreadSearch => "search",
+        ContextKind::ThreadTool => "tool",
+        ContextKind::RepoContextFile => "note",
+    }
+}
+
+fn together_context_inline_excerpt(text: &str, max_chars: usize) -> String {
+    let single_line = text
+        .split_whitespace()
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if single_line.chars().count() <= max_chars {
+        return single_line;
+    }
+    let truncated = single_line
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    format!("{truncated}…")
 }
 
 fn together_context_child_sort_key(
@@ -9457,20 +9530,22 @@ fn together_context_child_sort_key(
 ) -> (u8, u8, usize, String) {
     let relation_rank = if relation_labels.iter().any(|label| label == "source") {
         0
-    } else if relation_labels.iter().any(|label| label == "insight") {
+    } else if relation_labels.iter().any(|label| label == "derived") {
         1
-    } else if relation_labels.iter().any(|label| label == "file") {
+    } else if relation_labels.iter().any(|label| label == "insight") {
         2
-    } else if relation_labels.iter().any(|label| label == "search") {
+    } else if relation_labels.iter().any(|label| label == "file") {
         3
-    } else if relation_labels.iter().any(|label| label == "tool") {
+    } else if relation_labels.iter().any(|label| label == "search") {
         4
-    } else if relation_labels.iter().any(|label| label == "references") {
+    } else if relation_labels.iter().any(|label| label == "tool") {
         5
-    } else if relation_labels.iter().any(|label| label == "branch") {
+    } else if relation_labels.iter().any(|label| label == "references") {
         6
-    } else {
+    } else if relation_labels.iter().any(|label| label == "branch") {
         7
+    } else {
+        8
     };
     let kind_rank = match parent.kind {
         ContextKind::SharedThread => match child.kind {
@@ -9667,78 +9742,12 @@ fn together_context_source_thread_id_for_result(result: &ContextSearchResult) ->
     }
 }
 
-fn together_context_kind_label(result: &ContextSearchResult) -> &'static str {
-    match result.kind {
-        codex_together_protocol::ContextKind::SharedThread if result.title.starts_with("🦞 ") => {
-            "agent thread"
-        }
-        codex_together_protocol::ContextKind::SharedThread => "thread",
-        codex_together_protocol::ContextKind::ThreadInsight => "thread insight",
-        codex_together_protocol::ContextKind::ThreadFile => "thread file",
-        codex_together_protocol::ContextKind::ThreadSearch => "thread search result",
-        codex_together_protocol::ContextKind::ThreadTool => "thread tool result",
-        codex_together_protocol::ContextKind::RepoContextFile => "repo context",
-    }
-}
-
 fn together_context_display_name(result: &ContextSearchResult) -> String {
     result
         .title
         .strip_prefix("🦞 ")
         .unwrap_or(result.title.as_str())
         .to_string()
-}
-
-fn together_context_marker_span(result: &ContextSearchResult) -> Span<'static> {
-    match result.kind {
-        codex_together_protocol::ContextKind::SharedThread if result.title.starts_with("🦞 ") => {
-            "A".magenta()
-        }
-        codex_together_protocol::ContextKind::SharedThread => "T".cyan(),
-        codex_together_protocol::ContextKind::ThreadInsight => "I".magenta(),
-        codex_together_protocol::ContextKind::ThreadFile => "F".blue(),
-        codex_together_protocol::ContextKind::ThreadSearch => "S".magenta(),
-        codex_together_protocol::ContextKind::ThreadTool => "R".magenta(),
-        codex_together_protocol::ContextKind::RepoContextFile => "N".green(),
-    }
-}
-
-fn together_context_link_count_label(link_count: usize) -> String {
-    match link_count {
-        1 => "1 link".to_string(),
-        _ => format!("{link_count} links"),
-    }
-}
-
-fn together_context_selected_description(
-    result: &ContextSearchResult,
-    link_count: usize,
-    relation_labels: &[String],
-    is_current_thread: bool,
-) -> Option<String> {
-    let mut parts = Vec::new();
-    if is_current_thread {
-        parts.push("current thread".to_string());
-    } else if !relation_labels.is_empty() {
-        parts.push(relation_labels.join(", "));
-    }
-    if let Some(location) = &result.location {
-        parts.push(location.clone());
-    }
-    if link_count > 0 {
-        parts.push(together_context_link_count_label(link_count));
-    }
-    if parts.is_empty() {
-        parts.push(together_context_kind_label(result).to_string());
-    }
-    (!parts.is_empty()).then(|| parts.join(" · "))
-}
-
-fn together_context_kind_count_label(count: usize, singular: &str, plural: &str) -> String {
-    match count {
-        1 => format!("1 {singular}"),
-        _ => format!("{count} {plural}"),
-    }
 }
 
 fn collaboration_context_bundle_message(bundle_text: String) -> String {
@@ -10235,23 +10244,13 @@ async fn execute_together_command(
             }
         }
         "context" => {
-            let endpoint = current_together_endpoint();
-            let mut client = connect_and_auth(&endpoint).await?;
             let query = if rest.is_empty() {
                 None
             } else {
                 Some(rest.join(" "))
             };
-            let response: ContextGraphResponse = client
-                .call(
-                    METHOD_CONTEXT_GRAPH,
-                    ContextGraphParams {
-                        query: query.clone(),
-                        limit: Some(100),
-                        current_thread_id: current_thread_id.clone(),
-                    },
-                )
-                .await?;
+            let response =
+                fetch_together_context_graph(query.clone(), current_thread_id.clone()).await?;
             if response.nodes.is_empty() {
                 return Ok(TogetherCommandOutput {
                     message: "No context graph matches found.".to_string(),
@@ -10271,6 +10270,7 @@ async fn execute_together_command(
                 follow_up: Some(TogetherCommandFollowUp::OpenContextView {
                     query,
                     graph: response,
+                    scope: TogetherContextScope::default_for(current_thread_id.as_deref()),
                 }),
             })
         }
@@ -10371,6 +10371,24 @@ pub(crate) async fn search_together_context(
         )
         .await?;
     Ok(response.data)
+}
+
+pub(crate) async fn fetch_together_context_graph(
+    query: Option<String>,
+    current_thread_id: Option<String>,
+) -> anyhow::Result<ContextGraphResponse> {
+    let endpoint = current_together_endpoint();
+    let mut client = connect_and_auth(&endpoint).await?;
+    client
+        .call(
+            METHOD_CONTEXT_GRAPH,
+            ContextGraphParams {
+                query,
+                limit: Some(100),
+                current_thread_id,
+            },
+        )
+        .await
 }
 
 pub(crate) async fn plan_together_context_handoff(

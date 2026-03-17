@@ -1,6 +1,6 @@
 # Second Brain Demo Handoff
 
-Last updated: 2026-03-16
+Last updated: 2026-03-17
 
 ## Goal
 
@@ -46,6 +46,11 @@ These are the decisions the next thread should treat as settled unless the user 
 - Repo-backed notes are the canonical second brain.
 - `.codex/context/` is still the intended long-term canonical location.
 - Thread-local context should keep extracted artifacts, not raw prompts or raw search queries.
+- Thread-local context should be reconstructed from native Codex thread history and exposed through the shared graph engine; Together should consume that view, not own a separate thread-memory source of truth.
+- Attached context should use progressive disclosure: give the model refs, summaries, hotspots, and traversal paths first, not full concatenated bodies.
+- `context_graph` should be a native core tool backed by the same shared graph engine that powers `/context`.
+- Runtime graph indexes can live under `.codex/context/.graph/` as ignored, rebuildable discovery artifacts.
+- Promoted notes should keep direct source graph refs so persistent memory stays tied to the artifact graph instead of only whole-thread backlinks.
 - `codex-together` should be pruned back toward native Codex CLI behavior before adding graph/handoff demo features.
 - The graph should eventually include both repo-specific and agent-specific nodes.
 
@@ -89,6 +94,9 @@ At a high level, the current branch has already been pushed much closer to the d
 - thread visibility concepts were removed from repo-context metadata and related UI copy
 - `/context` now roots on the current thread and keeps retained artifacts plus linked repo notes
 - context search now indexes thread-local artifacts and persistent repo notes instead of prompt previews
+- attached context bundles now prefer compact discovery packs over eager full-body expansion
+- runtime graph artifacts are intended to be discoverable under `.codex/context/.graph/`
+- repo note promotion should preserve direct artifact refs for graph-derived provenance
 - persisted member bookkeeping was pruned from the state layer
 - unused member-update notifications were removed
 - user-facing Together status copy was simplified toward "server + participants" instead of "owner + member"

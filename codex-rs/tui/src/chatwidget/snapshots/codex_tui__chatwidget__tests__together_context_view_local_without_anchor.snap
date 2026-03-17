@@ -8,7 +8,7 @@ expression: terminal.backend()
 "  Local thread                                                                                                          "
 "                                                                                                                        "
 "  Filter context graph                                                                                                  "
-"›   f88f811a lobster-worker ◯ Capture branch state                                                                      "
+"›   f88f811a insight ◯ Capture branch state                                                                             "
 "                                                                                                                        "
 "  Attach: enter | Mark: space | Toggle Scope: T | Handoff: H | Write: W | Close: esc                                    "
 "                                                                                                                        "

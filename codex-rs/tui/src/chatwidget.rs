@@ -8839,7 +8839,7 @@ fn together_context_scope_selector(label: &str, is_active: bool) -> Vec<Span<'st
     vec![
         "[".dim(),
         if is_active {
-            label.green().bold()
+            label.cyan().bold()
         } else {
             label.dim()
         },
@@ -8889,16 +8889,16 @@ fn together_context_empty_state_item(
 }
 
 fn together_context_status_line(has_thread_context: bool) -> Line<'static> {
-    let mut spans = vec!["enter".green(), " select".dim()];
+    let mut spans = vec!["enter".cyan(), " select".dim()];
     if has_thread_context {
-        spans.extend([" | ".dim(), "t".green(), " scope".dim()]);
+        spans.extend([" | ".dim(), "t".cyan(), " scope".dim()]);
     }
     spans.extend([
         " | ".dim(),
-        "h".green(),
+        "h".cyan(),
         " handoff".dim(),
         " | ".dim(),
-        "esc".green(),
+        "esc".cyan(),
         " close".dim(),
     ]);
     Line::from(spans)
@@ -8927,12 +8927,16 @@ fn together_context_rows_for_scope(
                 .get(together_context_node_id(node))
                 .copied();
             match scope {
-                TogetherContextScope::LocalThread if has_thread_context => {
-                    mount_reason.map(|mount_reason| TogetherContextTreeRow {
-                        node: node.clone(),
-                        mount_reason: Some(mount_reason),
-                    })
-                }
+                TogetherContextScope::LocalThread if has_thread_context => matches!(
+                    mount_reason,
+                    Some(ContextMountReason::Local)
+                        | Some(ContextMountReason::ForkSeed)
+                        | Some(ContextMountReason::HandoffSeed)
+                )
+                .then_some(TogetherContextTreeRow {
+                    node: node.clone(),
+                    mount_reason,
+                }),
                 TogetherContextScope::LocalThread => None,
                 TogetherContextScope::Global => Some(TogetherContextTreeRow {
                     node: node.clone(),
@@ -8944,32 +8948,14 @@ fn together_context_rows_for_scope(
 }
 
 fn together_context_graph_prefix_spans(
-    row: &TogetherContextTreeRow,
+    _row: &TogetherContextTreeRow,
     is_marked: bool,
 ) -> Vec<Span<'static>> {
-    let hash_color = match &row.node {
-        ContextQueryNode::Thread(node) => match node.artifact_kind {
-            codex_together_protocol::ThreadArtifactKind::Plan => Color::Yellow,
-            codex_together_protocol::ThreadArtifactKind::FileRead
-            | codex_together_protocol::ThreadArtifactKind::FileChange => Color::Blue,
-            codex_together_protocol::ThreadArtifactKind::Search
-            | codex_together_protocol::ThreadArtifactKind::ToolOutput
-            | codex_together_protocol::ThreadArtifactKind::GraphQuery => Color::Magenta,
-        },
-        ContextQueryNode::Repo(_) => Color::LightYellow,
-    };
-    vec![
-        if is_marked {
-            "[x] ".green()
-        } else {
-            "[ ] ".dim()
-        },
-        Span::styled(
-            together_context_short_hash(together_context_row_node_id(row)),
-            Style::default().fg(hash_color),
-        ),
-        " ".into(),
-    ]
+    vec![if is_marked {
+        "[x] ".cyan()
+    } else {
+        "[ ] ".dim()
+    }]
 }
 
 fn together_context_short_hash(node_id: &str) -> String {
@@ -9005,7 +8991,6 @@ fn together_context_row_description(
     row: &TogetherContextTreeRow,
     anchor: &codex_together_protocol::ContextQueryAnchor,
 ) -> String {
-    let display_name = together_context_display_name(row);
     let mut parts = Vec::new();
     if let Some(provenance_label) = together_context_provenance_label(row) {
         parts.push(provenance_label.to_string());
@@ -9013,15 +8998,6 @@ fn together_context_row_description(
     parts.push(together_context_kind_label(&row.node).to_string());
     if let Some(origin_label) = together_context_origin_thread_label(row, anchor) {
         parts.push(origin_label);
-    }
-    if let Some(location) = together_context_node_location(&row.node) {
-        parts.push(together_context_inline_excerpt(location, 40));
-    }
-    if let Some(summary) = together_context_node_summary(&row.node) {
-        let summary = together_context_inline_excerpt(summary, 56);
-        if !summary.is_empty() && summary != display_name {
-            parts.push(summary);
-        }
     }
     parts.join(" · ")
 }
@@ -9031,8 +9007,8 @@ fn together_context_provenance_label(row: &TogetherContextTreeRow) -> Option<&'s
         Some(ContextMountReason::Local) => Some("here"),
         Some(ContextMountReason::ForkSeed) => Some("from prev"),
         Some(ContextMountReason::HandoffSeed) => Some("handoff"),
-        Some(ContextMountReason::RepoNeighbor) => Some("repo"),
         None if matches!(row.node, ContextQueryNode::Repo(_)) => Some("repo"),
+        Some(ContextMountReason::RepoNeighbor) => Some("repo"),
         None => None,
     }
 }
@@ -9045,10 +9021,20 @@ fn together_context_origin_thread_label(
         ContextQueryNode::Thread(node)
             if anchor.current_thread_id.as_deref() != Some(node.origin_thread_id.as_str()) =>
         {
-            Some(format!(
-                "thread {}",
-                together_context_short_hash(node.origin_thread_id.as_str())
-            ))
+            if matches!(
+                row.mount_reason,
+                Some(ContextMountReason::ForkSeed | ContextMountReason::HandoffSeed)
+            ) {
+                None
+            } else if anchor.precursor_thread_id.as_deref() == Some(node.origin_thread_id.as_str())
+            {
+                Some("prev thread".to_string())
+            } else {
+                Some(format!(
+                    "from thread {}",
+                    together_context_short_hash(node.origin_thread_id.as_str())
+                ))
+            }
         }
         _ => None,
     }
@@ -9077,13 +9063,6 @@ fn together_context_node_location(node: &ContextQueryNode) -> Option<&str> {
     match node {
         ContextQueryNode::Thread(node) => node.location.as_deref(),
         ContextQueryNode::Repo(node) => Some(node.path.as_str()),
-    }
-}
-
-fn together_context_node_summary(node: &ContextQueryNode) -> Option<&str> {
-    match node {
-        ContextQueryNode::Thread(node) => node.summary.as_deref(),
-        ContextQueryNode::Repo(node) => node.summary.as_deref(),
     }
 }
 
@@ -9136,11 +9115,59 @@ fn together_context_source_thread_id_for_row(row: &TogetherContextTreeRow) -> Op
 }
 
 fn together_context_display_name(row: &TogetherContextTreeRow) -> String {
-    let title = match &row.node {
-        ContextQueryNode::Thread(node) => node.title.as_str(),
-        ContextQueryNode::Repo(node) => node.title.as_str(),
-    };
-    title.strip_prefix("🦞 ").unwrap_or(title).to_string()
+    match &row.node {
+        ContextQueryNode::Thread(node) => match node.artifact_kind {
+            codex_together_protocol::ThreadArtifactKind::Plan => node
+                .title
+                .strip_prefix("🦞 ")
+                .unwrap_or(&node.title)
+                .to_string(),
+            codex_together_protocol::ThreadArtifactKind::FileRead => node
+                .location
+                .as_deref()
+                .map(|location| format!("Read {location}"))
+                .unwrap_or_else(|| format!("Read {}", node.title)),
+            codex_together_protocol::ThreadArtifactKind::FileChange => node
+                .location
+                .as_deref()
+                .map(|location| format!("Changed {location}"))
+                .unwrap_or_else(|| format!("Changed {}", node.title)),
+            codex_together_protocol::ThreadArtifactKind::Search => {
+                together_context_search_display_name(node)
+            }
+            codex_together_protocol::ThreadArtifactKind::ToolOutput => {
+                format!("Tool output: {}", node.title)
+            }
+            codex_together_protocol::ThreadArtifactKind::GraphQuery => {
+                together_context_graph_query_display_name(node)
+            }
+        },
+        ContextQueryNode::Repo(node) => node
+            .title
+            .strip_prefix("🦞 ")
+            .unwrap_or(&node.title)
+            .to_string(),
+    }
+}
+
+fn together_context_search_display_name(
+    node: &codex_together_protocol::ContextThreadNode,
+) -> String {
+    match node.location.as_deref() {
+        Some("web/search") => format!("Web search: {}", node.title),
+        Some("web/open-page") => format!("Opened page: {}", node.title),
+        Some("web/find-in-page") => format!("Find in page: {}", node.title),
+        _ => format!("Search: {}", node.title),
+    }
+}
+
+fn together_context_graph_query_display_name(
+    node: &codex_together_protocol::ContextThreadNode,
+) -> String {
+    node.title
+        .strip_prefix("Context graph: ")
+        .map(|query| format!("Graph search: {query}"))
+        .unwrap_or_else(|| format!("Graph search: {}", node.title))
 }
 
 fn collaboration_context_bundle_message(bundle_text: String) -> String {

@@ -1025,6 +1025,30 @@ fn context_query_edges(
         })
         .collect::<Vec<_>>();
 
+    for document in document_by_ref_id
+        .values()
+        .filter(|document| context_is_thread_artifact(document))
+    {
+        for source_ref in &document.graph.source_refs {
+            if !document_by_ref_id.contains_key(source_ref) || source_ref == &document.ref_id {
+                continue;
+            }
+            edges.push(ContextQueryEdge {
+                from_node_id: document.ref_id.clone(),
+                to_node_id: source_ref.clone(),
+                edge_type: ContextEdgeType::Related,
+                mount_reason: None,
+                reason: Some(
+                    if context_thread_artifact_kind(document) == ThreadArtifactKind::GraphQuery {
+                        "query_result".to_string()
+                    } else {
+                        "source_ref".to_string()
+                    },
+                ),
+            });
+        }
+    }
+
     for repo_document in document_by_ref_id
         .values()
         .filter(|document| document.kind == ContextKind::RepoContextFile)
@@ -1052,7 +1076,7 @@ fn context_query_edges(
 
 fn context_query_mount_reasons(
     document_by_ref_id: &HashMap<String, ContextDocument>,
-    edges: &[ContextQueryEdge],
+    _edges: &[ContextQueryEdge],
     params: &ContextQueryParams,
 ) -> HashMap<String, ContextMountReason> {
     let mut mount_reason_by_node_id = document_by_ref_id
@@ -1099,42 +1123,6 @@ fn context_query_mount_reasons(
             }
         };
         mount_reason_by_node_id.insert(seed_ref_id.clone(), mount_reason);
-    }
-
-    let mounted_thread_node_ids = mount_reason_by_node_id
-        .iter()
-        .filter(|&(node_id, mount_reason)| {
-            *mount_reason != ContextMountReason::RepoNeighbor
-                && document_by_ref_id
-                    .get(node_id)
-                    .is_some_and(context_is_thread_artifact)
-        })
-        .map(|(node_id, _)| node_id.clone())
-        .collect::<HashSet<_>>();
-
-    for edge in edges {
-        if !matches!(
-            edge.edge_type,
-            ContextEdgeType::Related | ContextEdgeType::CoveredBy | ContextEdgeType::PromotedTo
-        ) {
-            continue;
-        }
-        let from_is_repo = document_by_ref_id
-            .get(&edge.from_node_id)
-            .is_some_and(|document| document.kind == ContextKind::RepoContextFile);
-        let to_is_repo = document_by_ref_id
-            .get(&edge.to_node_id)
-            .is_some_and(|document| document.kind == ContextKind::RepoContextFile);
-        if from_is_repo && mounted_thread_node_ids.contains(&edge.to_node_id) {
-            mount_reason_by_node_id
-                .entry(edge.from_node_id.clone())
-                .or_insert(ContextMountReason::RepoNeighbor);
-        }
-        if to_is_repo && mounted_thread_node_ids.contains(&edge.from_node_id) {
-            mount_reason_by_node_id
-                .entry(edge.to_node_id.clone())
-                .or_insert(ContextMountReason::RepoNeighbor);
-        }
     }
 
     mount_reason_by_node_id
@@ -1212,6 +1200,8 @@ fn sort_context_query_documents(
         });
         let left_kind_key = context_default_sort_key(left);
         let right_kind_key = context_default_sort_key(right);
+        let left_thread_artifact_rank = context_query_thread_artifact_rank(left);
+        let right_thread_artifact_rank = context_query_thread_artifact_rank(right);
         left_mount_rank
             .cmp(&right_mount_rank)
             .then_with(|| right_query_score.cmp(&left_query_score))
@@ -1220,8 +1210,24 @@ fn sort_context_query_documents(
                 (left.kind == ContextKind::RepoContextFile)
                     .cmp(&(right.kind == ContextKind::RepoContextFile))
             })
+            .then_with(|| left_thread_artifact_rank.cmp(&right_thread_artifact_rank))
             .then_with(|| left_kind_key.cmp(&right_kind_key))
     });
+}
+
+fn context_query_thread_artifact_rank(document: &ContextDocument) -> u8 {
+    if !context_is_thread_artifact(document) {
+        return u8::MAX;
+    }
+
+    match context_thread_artifact_kind(document) {
+        ThreadArtifactKind::Plan => 0,
+        ThreadArtifactKind::FileChange => 1,
+        ThreadArtifactKind::FileRead => 2,
+        ThreadArtifactKind::Search => 3,
+        ThreadArtifactKind::ToolOutput => 4,
+        ThreadArtifactKind::GraphQuery => 5,
+    }
 }
 
 fn sort_context_query_edges(edges: &mut Vec<ContextQueryEdge>) {
@@ -2729,13 +2735,6 @@ mod tests {
             vec![
                 ContextQueryEdge {
                     from_node_id: "anchor:thread-2".to_string(),
-                    to_node_id: repo_ref_id.clone(),
-                    edge_type: ContextEdgeType::Mounted,
-                    mount_reason: Some(ContextMountReason::RepoNeighbor),
-                    reason: None,
-                },
-                ContextQueryEdge {
-                    from_node_id: "anchor:thread-2".to_string(),
                     to_node_id: local_file_ref_id.clone(),
                     edge_type: ContextEdgeType::Mounted,
                     mount_reason: Some(ContextMountReason::Local),
@@ -2780,5 +2779,70 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn build_context_query_links_graph_queries_to_discovered_nodes() {
+        let graph_query_ref_id = "ctx:thread-search:thread-1:query-1".to_string();
+        let repo_ref_id = "ctx:file:.codex/context/concepts/context-graph.md".to_string();
+
+        let response = build_context_query(
+            vec![
+                ContextDocument {
+                    ref_id: graph_query_ref_id.clone(),
+                    kind: ContextKind::ThreadSearch,
+                    title: "Context graph: retained plan output".to_string(),
+                    summary: Some("1 global context match for retained plan output".to_string()),
+                    location: Some("context/graph".to_string()),
+                    body: Some("Results: ctx:file:.codex/context/concepts/context-graph.md".into()),
+                    search_text: "context graph retained plan output".to_string(),
+                    graph: ContextDocumentGraphMetadata {
+                        source_threads: vec!["thread-1".to_string()],
+                        source_refs: vec![repo_ref_id.clone()],
+                        ..ContextDocumentGraphMetadata::default()
+                    },
+                },
+                ContextDocument {
+                    ref_id: repo_ref_id.clone(),
+                    kind: ContextKind::RepoContextFile,
+                    title: "Context graph".to_string(),
+                    summary: Some("concept · Rooted thread and repo knowledge.".to_string()),
+                    location: Some(".codex/context/concepts/context-graph.md".to_string()),
+                    body: None,
+                    search_text: "context graph rooted thread repo knowledge".to_string(),
+                    graph: ContextDocumentGraphMetadata::default(),
+                },
+            ],
+            &ContextQueryParams {
+                current_thread_id: Some("thread-1".to_string()),
+                precursor_thread_id: None,
+                precursor_kind: None,
+                actor_id: None,
+                repo_root: Some("/repo".to_string()),
+                git_branch: None,
+                goal: None,
+                query: None,
+                seed_ref_ids: Vec::new(),
+                limit: Some(10),
+            },
+        );
+
+        assert_eq!(
+            response
+                .nodes
+                .into_iter()
+                .map(|node| match node {
+                    ContextQueryNode::Thread(node) => node.node_id,
+                    ContextQueryNode::Repo(node) => node.node_id,
+                })
+                .collect::<Vec<_>>(),
+            vec![graph_query_ref_id.clone(), repo_ref_id.clone()]
+        );
+        assert!(response.edges.iter().any(|edge| {
+            edge.from_node_id == graph_query_ref_id
+                && edge.to_node_id == repo_ref_id
+                && edge.edge_type == ContextEdgeType::Related
+                && edge.reason.as_deref() == Some("query_result")
+        }));
     }
 }

@@ -2201,13 +2201,7 @@ fn together_context_local_scope_keeps_only_mounted_nodes() {
                 row.mount_reason
             ))
             .collect::<Vec<_>>(),
-        vec![
-            (local_ref_id.to_string(), Some(ContextMountReason::Local),),
-            (
-                repo_ref_id.to_string(),
-                Some(ContextMountReason::RepoNeighbor),
-            ),
-        ]
+        vec![(local_ref_id.to_string(), Some(ContextMountReason::Local),)]
     );
 }
 

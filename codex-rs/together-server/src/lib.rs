@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::UNIX_EPOCH;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -41,6 +42,8 @@ use codex_app_server_protocol::ThreadReadResponse as AppThreadReadResponse;
 use codex_app_server_protocol::ThreadSortKey as AppThreadSortKey;
 use codex_app_server_protocol::ThreadStartParams as AppThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse as AppThreadStartResponse;
+use codex_app_server_protocol::ThreadStatus;
+use codex_app_server_protocol::build_turns_from_rollout_items;
 use codex_context_graph::ContextDocument;
 use codex_context_graph::build_context_graph as shared_build_context_graph;
 use codex_context_graph::build_context_query as shared_build_context_query;
@@ -49,10 +52,13 @@ use codex_context_graph::repo_context_documents as shared_repo_context_documents
 use codex_context_graph::search_context_documents as shared_search_context_documents;
 use codex_context_graph::thread_context_document as shared_thread_context_document;
 use codex_context_graph::thread_context_documents as shared_thread_context_documents;
+use codex_core::RolloutRecorder;
 use codex_core::config::find_codex_home;
+use codex_core::find_thread_path_by_id_str;
 use codex_core::git_info::current_branch_name;
 use codex_core::git_info::get_git_repo_root;
 use codex_core::git_info::get_head_commit_hash;
+use codex_protocol::protocol::InitialHistory;
 use codex_state::StateRuntime;
 use codex_state::TogetherClientMode as StateTogetherClientMode;
 use codex_state::TogetherClientSession as StateTogetherClientSession;
@@ -1831,11 +1837,66 @@ async fn current_thread_context_documents(
             continue;
         }
 
-        let thread = match thread_read_with_turn_fallback(&mut bridge, &thread_id).await {
-            Ok(response) => response.thread,
-            Err(err) => {
-                warn!(error = ?err, thread_id, "failed to read focused thread for context");
-                continue;
+        let prefer_rollout = current_thread_id.as_deref() == Some(thread_id.as_str());
+        let thread = if prefer_rollout {
+            match load_thread_from_rollout(&thread_id, repo_root).await {
+                Ok(Some(thread)) => thread,
+                Ok(None) => match thread_read_with_turn_fallback(&mut bridge, &thread_id).await {
+                    Ok(response) => response.thread,
+                    Err(err) => {
+                        warn!(
+                            error = ?err,
+                            thread_id,
+                            "failed to read focused thread for context"
+                        );
+                        continue;
+                    }
+                },
+                Err(err) => {
+                    warn!(
+                        error = ?err,
+                        thread_id,
+                        "failed to load focused thread rollout for context; falling back to app-server bridge"
+                    );
+                    match thread_read_with_turn_fallback(&mut bridge, &thread_id).await {
+                        Ok(response) => response.thread,
+                        Err(bridge_err) => {
+                            warn!(
+                                error = ?bridge_err,
+                                thread_id,
+                                "failed to read focused thread for context after rollout fallback"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+        } else {
+            match thread_read_with_turn_fallback(&mut bridge, &thread_id).await {
+                Ok(response) => response.thread,
+                Err(err) => match load_thread_from_rollout(&thread_id, repo_root).await {
+                    Ok(Some(thread)) => {
+                        warn!(
+                            error = ?err,
+                            thread_id,
+                            "app-server bridge missed focused thread; using rollout fallback"
+                        );
+                        thread
+                    }
+                    Ok(None) => {
+                        warn!(error = ?err, thread_id, "failed to read focused thread for context");
+                        continue;
+                    }
+                    Err(fallback_err) => {
+                        warn!(
+                            error = ?err,
+                            fallback_error = ?fallback_err,
+                            thread_id,
+                            "failed to read focused thread for context"
+                        );
+                        continue;
+                    }
+                },
             }
         };
         if thread.ephemeral || repo_root.is_some_and(|root| !thread.cwd.starts_with(root)) {
@@ -1852,6 +1913,70 @@ async fn current_thread_context_documents(
 
     documents.sort_by_key(context_default_sort_key);
     documents
+}
+
+async fn load_thread_from_rollout(
+    thread_id: &str,
+    repo_root: Option<&Path>,
+) -> Result<Option<AppThread>> {
+    let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
+    load_thread_from_rollout_at(codex_home.as_path(), thread_id, repo_root).await
+}
+
+async fn load_thread_from_rollout_at(
+    codex_home: &Path,
+    thread_id: &str,
+    repo_root: Option<&Path>,
+) -> Result<Option<AppThread>> {
+    let Some(rollout_path) = find_thread_path_by_id_str(codex_home, thread_id).await? else {
+        return Ok(None);
+    };
+    let items = match RolloutRecorder::get_rollout_history(rollout_path.as_path())
+        .await
+        .with_context(|| format!("failed to load rollout `{}`", rollout_path.display()))?
+    {
+        InitialHistory::New => Vec::new(),
+        InitialHistory::Resumed(history) => history.history,
+        InitialHistory::Forked(history) => history,
+    };
+    let turns = build_turns_from_rollout_items(&items);
+    let updated_at = std::fs::metadata(&rollout_path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_else(|| Utc::now().timestamp());
+    let cwd = repo_root
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let git_info =
+        current_branch_name(cwd.as_path())
+            .await
+            .map(|branch| codex_app_server_protocol::GitInfo {
+                sha: None,
+                branch: Some(branch),
+                origin_url: None,
+            });
+
+    Ok(Some(AppThread {
+        id: thread_id.to_string(),
+        preview: String::new(),
+        ephemeral: false,
+        model_provider: "openai".to_string(),
+        created_at: updated_at,
+        updated_at,
+        status: ThreadStatus::Idle,
+        path: Some(rollout_path),
+        cwd,
+        cli_version: env!("CARGO_PKG_VERSION").to_string(),
+        source: codex_app_server_protocol::SessionSource::Cli,
+        agent_nickname: None,
+        agent_role: None,
+        git_info,
+        name: None,
+        turns,
+    }))
 }
 
 async fn build_context_bundle(
@@ -3739,6 +3864,7 @@ mod tests {
     use super::context_focus_thread_ids_for_query;
     use super::context_graph_artifact_paths;
     use super::handoff_promotion_ref_ids;
+    use super::load_thread_from_rollout_at;
     use super::plan_context_write_files;
     use super::plan_memory_promote;
     use super::recommended_handoff_ref_ids;
@@ -3758,10 +3884,18 @@ mod tests {
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::Turn;
     use codex_app_server_protocol::TurnStatus as AppTurnStatus;
+    use codex_context_graph::build_context_query;
     use codex_protocol::ThreadId;
+    use codex_together_protocol::ContextEdgeType;
     use codex_together_protocol::ContextKind;
+    use codex_together_protocol::ContextMountReason;
     use codex_together_protocol::ContextPrecursorKind;
+    use codex_together_protocol::ContextQueryEdge;
+    use codex_together_protocol::ContextQueryNode;
     use codex_together_protocol::ContextQueryParams;
+    use codex_together_protocol::ContextThreadNode;
+    use codex_together_protocol::ThreadArtifactKind;
+    use std::path::Path;
     use std::path::PathBuf;
 
     #[test]
@@ -4278,6 +4412,68 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn rollout_fallback_populates_local_context_query_for_current_thread() {
+        let codex_home = temp_test_dir("context-rollout-home");
+        let repo_root = temp_test_dir("context-rollout-repo");
+        std::fs::create_dir_all(&repo_root).expect("create repo root");
+        let thread_id = ThreadId::new().to_string();
+        write_rollout_with_web_search(codex_home.as_path(), thread_id.as_str());
+
+        let thread = load_thread_from_rollout_at(
+            codex_home.as_path(),
+            thread_id.as_str(),
+            Some(repo_root.as_path()),
+        )
+        .await
+        .expect("load rollout thread")
+        .expect("thread should exist");
+        let response = build_context_query(
+            thread_context_documents(&thread, true, Some(repo_root.as_path())),
+            &ContextQueryParams {
+                current_thread_id: Some(thread_id.clone()),
+                precursor_thread_id: None,
+                precursor_kind: None,
+                actor_id: None,
+                repo_root: Some(repo_root.display().to_string()),
+                git_branch: None,
+                goal: None,
+                query: None,
+                seed_ref_ids: Vec::new(),
+                limit: None,
+            },
+        );
+
+        assert_eq!(
+            response.nodes,
+            vec![ContextQueryNode::Thread(ContextThreadNode {
+                node_id: format!("ctx:thread-search:{thread_id}:web-1"),
+                artifact_kind: ThreadArtifactKind::Search,
+                title: "cloud ethics".to_string(),
+                summary: Some("thread search result · retained web search".to_string()),
+                location: Some("web/search".to_string()),
+                body: Some("Query: cloud ethics".to_string()),
+                origin_thread_id: thread_id.clone(),
+                source_files: Vec::new(),
+                source_refs: Vec::new(),
+                created_at: None,
+            })]
+        );
+        assert_eq!(
+            response.edges,
+            vec![ContextQueryEdge {
+                from_node_id: format!("anchor:{thread_id}"),
+                to_node_id: format!("ctx:thread-search:{thread_id}:web-1"),
+                edge_type: ContextEdgeType::Mounted,
+                mount_reason: Some(ContextMountReason::Local),
+                reason: None,
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(codex_home);
+        let _ = std::fs::remove_dir_all(repo_root);
+    }
+
     #[test]
     fn thread_summary_from_app_thread_uses_agent_nickname_and_preview() {
         let mut thread = sample_thread("thread-1", Some("planning sync"), Some("main"));
@@ -4531,5 +4727,58 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
         dir
+    }
+
+    fn write_rollout_with_web_search(codex_home: &Path, thread_id: &str) {
+        let filename_ts = "2026-03-18T12-00-00";
+        let meta_ts = "2026-03-18T12:00:00Z";
+        let dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("03")
+            .join("18");
+        std::fs::create_dir_all(&dir).expect("create sessions dir");
+
+        let session_meta = codex_protocol::protocol::SessionMetaLine {
+            meta: codex_protocol::protocol::SessionMeta {
+                id: ThreadId::from_string(thread_id).expect("valid thread id"),
+                forked_from_id: None,
+                timestamp: meta_ts.to_string(),
+                cwd: PathBuf::from("/tmp/repo"),
+                originator: "codex".to_string(),
+                cli_version: "0.0.0".to_string(),
+                source: codex_protocol::protocol::SessionSource::Cli,
+                agent_nickname: None,
+                agent_role: None,
+                model_provider: None,
+                base_instructions: None,
+                dynamic_tools: None,
+            },
+            git: None,
+        };
+        let lines = [
+            codex_protocol::protocol::RolloutLine {
+                timestamp: meta_ts.to_string(),
+                item: codex_protocol::protocol::RolloutItem::SessionMeta(session_meta),
+            },
+            codex_protocol::protocol::RolloutLine {
+                timestamp: meta_ts.to_string(),
+                item: codex_protocol::protocol::RolloutItem::EventMsg(
+                    codex_protocol::protocol::EventMsg::WebSearchEnd(
+                        codex_protocol::protocol::WebSearchEndEvent {
+                            call_id: "web-1".to_string(),
+                            query: "cloud ethics".to_string(),
+                            action: codex_protocol::models::WebSearchAction::Other,
+                        },
+                    ),
+                ),
+            },
+        ]
+        .into_iter()
+        .map(|line| serde_json::to_string(&line).expect("serialize rollout line"))
+        .collect::<Vec<_>>()
+        .join("\n");
+        let rollout_path = dir.join(format!("rollout-{filename_ts}-{thread_id}.jsonl"));
+        std::fs::write(rollout_path, format!("{lines}\n")).expect("write rollout");
     }
 }

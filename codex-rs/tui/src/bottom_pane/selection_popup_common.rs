@@ -745,11 +745,6 @@ pub(crate) fn render_rows_single_line(
         };
         let mut full_line = build_full_line(&row_without_tag, desc_col);
         let is_selected = Some(i) == state.selected_idx && !row.is_disabled;
-        if let Some(style) = row.row_style {
-            full_line.spans.iter_mut().for_each(|span| {
-                span.style = span.style.patch(style);
-            });
-        }
         if is_selected && let Some(style) = selected_row_style {
             for y in row_area.y..row_area.y.saturating_add(row_area.height) {
                 for x in row_area.x..row_area.x.saturating_add(row_area.width) {
@@ -759,6 +754,20 @@ pub(crate) fn render_rows_single_line(
                 }
             }
         }
+        if let Some(style) = row.row_style {
+            for y in row_area.y..row_area.y.saturating_add(row_area.height) {
+                for x in row_area.x..row_area.x.saturating_add(row_area.width) {
+                    if x < buf.area().width && y < buf.area().height {
+                        let cell = &mut buf[(x, y)];
+                        let patched_style = cell.style().patch(style);
+                        cell.set_style(patched_style);
+                    }
+                }
+            }
+            full_line.spans.iter_mut().for_each(|span| {
+                span.style = span.style.patch(style);
+            });
+        }
         if is_selected && selected_row_style.is_none() {
             full_line.spans.iter_mut().for_each(|span| {
                 span.style = Style::default().fg(Color::Cyan).bold();
@@ -767,6 +776,11 @@ pub(crate) fn render_rows_single_line(
         if row.is_disabled {
             full_line.spans.iter_mut().for_each(|span| {
                 span.style = span.style.dim();
+            });
+        }
+        if row.row_style.is_some() {
+            full_line.spans.iter_mut().for_each(|span| {
+                span.style = span.style.bold();
             });
         }
         let mut suffix_spans = Vec::new();

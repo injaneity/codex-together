@@ -8584,7 +8584,7 @@ impl ChatWidget {
                         selected_name_prefix_spans: Vec::new(),
                         category_tag: together_context_is_hotspot(&row.node)
                             .then_some("*".to_string()),
-                        row_style: is_marked.then_some(Style::default().fg(Color::Cyan).bold()),
+                        row_style: is_marked.then_some(Style::default().bg(Color::Cyan)),
                         description,
                         selected_description: None,
                         search_value: Some(search_value),

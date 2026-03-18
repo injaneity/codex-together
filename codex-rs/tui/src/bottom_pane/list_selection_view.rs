@@ -27,6 +27,7 @@ use super::popup_consts::MAX_POPUP_ROWS;
 use super::scroll_state::ScrollState;
 pub(crate) use super::selection_popup_common::ColumnWidthMode;
 use super::selection_popup_common::GenericDisplayRow;
+use super::selection_popup_common::SingleLineRowRenderOptions;
 use super::selection_popup_common::measure_rows_height;
 use super::selection_popup_common::measure_rows_height_stable_col_widths;
 use super::selection_popup_common::measure_rows_height_with_col_width_mode;
@@ -168,6 +169,7 @@ pub(crate) struct SelectionViewParams {
     pub single_line_rows: bool,
     pub show_entry_prefix: bool,
     pub selected_row_style: Option<Style>,
+    pub show_selected_suffix_cursor: bool,
     pub header: Box<dyn Renderable>,
     pub initial_selected_idx: Option<usize>,
 
@@ -221,6 +223,7 @@ impl Default for SelectionViewParams {
             single_line_rows: false,
             show_entry_prefix: true,
             selected_row_style: None,
+            show_selected_suffix_cursor: true,
             header: Box::new(()),
             initial_selected_idx: None,
             side_content: Box::new(()),
@@ -257,6 +260,7 @@ pub(crate) struct ListSelectionView {
     single_line_rows: bool,
     show_entry_prefix: bool,
     selected_row_style: Option<Style>,
+    show_selected_suffix_cursor: bool,
     filtered_indices: Vec<usize>,
     last_selected_actual_idx: Option<usize>,
     header: Box<dyn Renderable>,
@@ -319,6 +323,7 @@ impl ListSelectionView {
             single_line_rows: params.single_line_rows,
             show_entry_prefix: params.show_entry_prefix,
             selected_row_style: params.selected_row_style,
+            show_selected_suffix_cursor: params.show_selected_suffix_cursor,
             filtered_indices: Vec::new(),
             last_selected_actual_idx: None,
             header,
@@ -1033,7 +1038,10 @@ impl Renderable for ListSelectionView {
                     &self.state,
                     render_area.height as usize,
                     "no matches",
-                    self.selected_row_style,
+                    SingleLineRowRenderOptions {
+                        selected_row_style: self.selected_row_style,
+                        show_selected_suffix_cursor: self.show_selected_suffix_cursor,
+                    },
                 );
             } else {
                 match self.col_width_mode {

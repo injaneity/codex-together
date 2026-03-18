@@ -40,6 +40,12 @@ pub(crate) struct GenericDisplayRow {
     pub wrap_indent: Option<usize>, // optional indent for wrapped lines
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SingleLineRowRenderOptions {
+    pub selected_row_style: Option<Style>,
+    pub show_selected_suffix_cursor: bool,
+}
+
 /// Controls how selection rows choose the split between left/right name/description columns.
 ///
 /// Callers should use the same mode for both measurement and rendering, or the
@@ -674,7 +680,7 @@ pub(crate) fn render_rows_single_line(
     state: &ScrollState,
     max_results: usize,
     empty_message: &str,
-    selected_row_style: Option<Style>,
+    options: SingleLineRowRenderOptions,
 ) -> u16 {
     if rows_all.is_empty() {
         if area.height > 0 {
@@ -745,7 +751,7 @@ pub(crate) fn render_rows_single_line(
         };
         let mut full_line = build_full_line(&row_without_tag, desc_col);
         let is_selected = Some(i) == state.selected_idx && !row.is_disabled;
-        if is_selected && let Some(style) = selected_row_style {
+        if is_selected && let Some(style) = options.selected_row_style {
             for y in row_area.y..row_area.y.saturating_add(row_area.height) {
                 for x in row_area.x..row_area.x.saturating_add(row_area.width) {
                     if x < buf.area().width && y < buf.area().height {
@@ -768,7 +774,7 @@ pub(crate) fn render_rows_single_line(
                 span.style = span.style.patch(style);
             });
         }
-        if is_selected && selected_row_style.is_none() {
+        if is_selected && options.selected_row_style.is_none() {
             full_line.spans.iter_mut().for_each(|span| {
                 span.style = Style::default().fg(Color::Cyan).bold();
             });
@@ -787,7 +793,10 @@ pub(crate) fn render_rows_single_line(
         if let Some(tag) = tag {
             suffix_spans.push(if tag == "*" { tag.red() } else { tag.dim() });
         }
-        if is_selected && selected_row_style.is_some() {
+        if options.show_selected_suffix_cursor
+            && is_selected
+            && options.selected_row_style.is_some()
+        {
             if !suffix_spans.is_empty() {
                 suffix_spans.push(" ".into());
             }

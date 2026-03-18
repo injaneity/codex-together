@@ -10,6 +10,7 @@ use ratatui::widgets::WidgetRef;
 use super::popup_consts::MAX_POPUP_ROWS;
 use super::scroll_state::ScrollState;
 use super::selection_popup_common::GenericDisplayRow;
+use super::selection_popup_common::SingleLineRowRenderOptions;
 use super::selection_popup_common::render_rows_single_line;
 use crate::key_hint;
 use crate::render::Insets;
@@ -191,7 +192,7 @@ impl WidgetRef for SkillPopup {
             &self.state,
             MAX_POPUP_ROWS,
             "no matches",
-            None,
+            SingleLineRowRenderOptions::default(),
         );
         if let Some(hint_area) = hint_area {
             let hint_area = Rect {

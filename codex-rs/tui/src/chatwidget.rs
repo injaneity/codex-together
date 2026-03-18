@@ -8580,13 +8580,14 @@ impl ChatWidget {
                     SelectionItem {
                         name: together_context_row_name(&row),
                         name_prefix_spans: together_context_graph_prefix_spans(
-                            &row, mode, is_marked,
+                            &row, mode, is_marked, false,
                         ),
-                        selected_name_prefix_spans: Vec::new(),
+                        selected_name_prefix_spans: together_context_graph_prefix_spans(
+                            &row, mode, is_marked, true,
+                        ),
                         category_tag: together_context_is_hotspot(&row.node)
                             .then_some("*".to_string()),
-                        row_style: is_marked
-                            .then_some(Style::default().fg(Color::Black).bg(Color::Cyan)),
+                        row_style: None,
                         description,
                         selected_description: None,
                         search_value: Some(search_value),
@@ -8618,6 +8619,7 @@ impl ChatWidget {
             single_line_rows: true,
             show_entry_prefix: false,
             selected_row_style: Some(Style::default().bg(Color::DarkGray)),
+            show_selected_suffix_cursor: false,
             header: Box::new(header),
             initial_selected_idx,
             side_content: if show_preview {
@@ -9127,101 +9129,38 @@ fn together_context_legend_line() -> Line<'static> {
 }
 
 fn together_context_preview_lines(state: &TogetherContextViewState) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from("Overview".bold()), Line::default()];
     let Some(row) = state.rows.get(state.selected_actual_idx) else {
-        lines.push(Line::from("Move through the tree to inspect a node.".dim()));
-        return lines;
+        return vec![Line::from("Move through the tree to inspect a node.".dim())];
     };
+    vec![Line::from(together_context_preview_text(
+        row,
+        &state.query_response.anchor,
+    ))]
+}
 
-    let mut title_spans = vec![
-        together_context_marker_text(&row.node).dim(),
-        " ".into(),
-        Span::styled(
-            format!("[{}] ", together_context_tag_label(&row.node)),
-            together_context_tag_style(&row.node),
-        ),
-        together_context_display_name(row).into(),
-    ];
-    if together_context_is_hotspot(&row.node) {
-        title_spans.extend([" ".into(), "*".red()]);
-    }
-    lines.push(Line::from(title_spans));
-
-    if state
-        .selected_ref_ids
-        .contains(together_context_row_node_id(row))
-    {
-        lines.push(Line::from("Selected for handoff".cyan()));
-    }
-
-    if let Some(description) = together_context_row_description(row, &state.query_response.anchor) {
-        lines.push(Line::from(description.dim()));
-    }
-
-    if let Some(location) = together_context_node_location(&row.node) {
-        lines.push(Line::from(vec![
-            "Path: ".dim(),
-            location.to_string().into(),
-        ]));
-    }
-
-    match &row.node {
-        ContextQueryNode::Thread(node) => {
-            if !(node.source_files.is_empty()
-                || node.source_files.len() == 1
-                    && node.location.as_deref() == node.source_files.first().map(String::as_str))
-            {
-                lines.push(Line::from(vec![
-                    "Files: ".dim(),
-                    together_context_preview_list_text(&node.source_files).into(),
-                ]));
-            }
-        }
-        ContextQueryNode::Repo(node) => {
-            if !node.source_files.is_empty() {
-                lines.push(Line::from(vec![
-                    "Files: ".dim(),
-                    together_context_preview_list_text(&node.source_files).into(),
-                ]));
-            }
-            if !node.source_threads.is_empty() {
-                let threads = node
-                    .source_threads
-                    .iter()
-                    .map(|thread_id| together_context_short_hash(thread_id))
-                    .collect::<Vec<_>>();
-                lines.push(Line::from(vec![
-                    "Threads: ".dim(),
-                    together_context_preview_list_text(&threads).into(),
-                ]));
-            }
-        }
-    }
+fn together_context_preview_text(
+    row: &TogetherContextTreeRow,
+    anchor: &codex_together_protocol::ContextQueryAnchor,
+) -> String {
+    const MAX_PREVIEW_CHARS: usize = 180;
 
     let detail = match &row.node {
         ContextQueryNode::Thread(node) => node.body.as_deref().or(node.summary.as_deref()),
         ContextQueryNode::Repo(node) => node.summary.as_deref(),
     }
     .map(str::trim)
-    .filter(|detail| !detail.is_empty());
+    .filter(|detail| !detail.is_empty())
+    .map(ToOwned::to_owned)
+    .or_else(|| together_context_row_description(row, anchor))
+    .or_else(|| {
+        together_context_node_location(&row.node)
+            .map(str::trim)
+            .filter(|location| !location.is_empty())
+            .map(ToOwned::to_owned)
+    })
+    .unwrap_or_else(|| together_context_display_name(row));
 
-    if let Some(detail) = detail {
-        lines.push(Line::default());
-        lines.push(Line::from("Details".dim()));
-        lines.extend(detail.lines().map(|line| Line::from(line.to_string())));
-    }
-
-    lines
-}
-
-fn together_context_preview_list_text(values: &[String]) -> String {
-    const MAX_ITEMS: usize = 3;
-
-    let mut visible = values.iter().take(MAX_ITEMS).cloned().collect::<Vec<_>>();
-    if values.len() > visible.len() {
-        visible.push(format!("and {} more", values.len() - visible.len()));
-    }
-    visible.join(", ")
+    together_context_inline_excerpt(detail.as_str(), MAX_PREVIEW_CHARS)
 }
 
 fn together_context_rows_for_scope(
@@ -9438,27 +9377,32 @@ fn together_context_collect_tree_rows(
 fn together_context_graph_prefix_spans(
     row: &TogetherContextTreeRow,
     _mode: TogetherContextViewMode,
-    _is_marked: bool,
+    is_marked: bool,
+    is_hovered: bool,
 ) -> Vec<Span<'static>> {
+    let tree_style = together_context_tree_style(&row.node);
     let mut spans = Vec::new();
     for has_more_siblings in &row.tree_guides {
         spans.push(if *has_more_siblings {
-            "│ ".dim()
+            Span::styled("│ ", tree_style)
         } else {
-            "  ".dim()
+            "  ".into()
         });
     }
     if row.has_parent {
         spans.push(if row.is_last_sibling {
-            "╰─ ".dim()
+            Span::styled("╰─ ", tree_style)
         } else {
-            "├─ ".dim()
+            Span::styled("├─ ", tree_style)
         });
     }
-    spans.push(match &row.node {
-        ContextQueryNode::Thread(_) => "◯ ".dim(),
-        ContextQueryNode::Repo(_) => "⏣ ".dim(),
-    });
+    spans.extend(together_context_selection_prefix_spans(
+        is_marked, is_hovered,
+    ));
+    spans.push(Span::styled(
+        format!("{} ", together_context_marker_text(&row.node)),
+        tree_style,
+    ));
     let tag_label = together_context_tag_label(&row.node);
     spans.push(Span::styled(
         format!("[{tag_label}] "),
@@ -9569,8 +9513,36 @@ fn together_context_tag_style(node: &ContextQueryNode) -> Style {
     match together_context_tag(node) {
         TogetherContextTag::File => Style::default().fg(Color::Green),
         TogetherContextTag::Insight => Style::default().fg(Color::Magenta),
-        TogetherContextTag::Rules => Style::default().bold(),
+        TogetherContextTag::Rules => Style::default().fg(Color::Red),
     }
+}
+
+fn together_context_tree_style(node: &ContextQueryNode) -> Style {
+    match together_context_tag(node) {
+        TogetherContextTag::File => Style::default().fg(Color::Green),
+        TogetherContextTag::Insight => Style::default().fg(Color::Magenta),
+        TogetherContextTag::Rules => Style::default().fg(Color::Red),
+    }
+}
+
+fn together_context_selection_prefix_spans(
+    is_marked: bool,
+    is_hovered: bool,
+) -> Vec<Span<'static>> {
+    vec![
+        if is_marked {
+            Span::styled("*", Style::default().fg(Color::Yellow).bold())
+        } else {
+            " ".into()
+        },
+        " ".into(),
+        if is_hovered {
+            "<".cyan().bold()
+        } else {
+            " ".into()
+        },
+        " ".into(),
+    ]
 }
 
 fn together_context_tag(node: &ContextQueryNode) -> TogetherContextTag {

@@ -33,12 +33,17 @@ use codex_app_server_protocol::JSONRPCNotification as AppJsonRpcNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxMode as AppServerSandboxMode;
-use codex_app_server_protocol::ThreadReadParams;
-use codex_app_server_protocol::ThreadReadResponse;
-use codex_app_server_protocol::ThreadStartParams;
-use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::Thread as AppThread;
+use codex_app_server_protocol::ThreadListParams as AppThreadListParams;
+use codex_app_server_protocol::ThreadListResponse as AppThreadListResponse;
+use codex_app_server_protocol::ThreadReadParams as AppThreadReadParams;
+use codex_app_server_protocol::ThreadReadResponse as AppThreadReadResponse;
+use codex_app_server_protocol::ThreadSortKey as AppThreadSortKey;
+use codex_app_server_protocol::ThreadStartParams as AppThreadStartParams;
+use codex_app_server_protocol::ThreadStartResponse as AppThreadStartResponse;
 use codex_context_graph::ContextDocument;
 use codex_context_graph::build_context_graph as shared_build_context_graph;
+use codex_context_graph::build_context_query as shared_build_context_query;
 use codex_context_graph::context_thread_id_from_ref_id as shared_context_thread_id_from_ref_id;
 use codex_context_graph::repo_context_documents as shared_repo_context_documents;
 use codex_context_graph::search_context_documents as shared_search_context_documents;
@@ -59,6 +64,7 @@ use codex_together_protocol::ContextGraphResponse;
 use codex_together_protocol::ContextKind;
 use codex_together_protocol::ContextPreviewParams;
 use codex_together_protocol::ContextPreviewResponse;
+use codex_together_protocol::ContextQueryParams;
 use codex_together_protocol::ContextRef;
 use codex_together_protocol::ContextResolveBundleParams;
 use codex_together_protocol::ContextResolveBundleResponse;
@@ -81,6 +87,7 @@ use codex_together_protocol::JsonRpcRequest;
 use codex_together_protocol::JsonRpcResponse;
 use codex_together_protocol::METHOD_CONTEXT_GRAPH;
 use codex_together_protocol::METHOD_CONTEXT_PREVIEW;
+use codex_together_protocol::METHOD_CONTEXT_QUERY;
 use codex_together_protocol::METHOD_CONTEXT_RESOLVE_BUNDLE;
 use codex_together_protocol::METHOD_CONTEXT_SEARCH;
 use codex_together_protocol::METHOD_CONTEXT_WRITE_COMMIT;
@@ -92,10 +99,20 @@ use codex_together_protocol::METHOD_HOST_STATUS;
 use codex_together_protocol::METHOD_HOST_STOP;
 use codex_together_protocol::METHOD_INITIALIZE;
 use codex_together_protocol::METHOD_INITIALIZED;
+use codex_together_protocol::METHOD_MEMORY_PROMOTE;
 use codex_together_protocol::METHOD_SESSION_JOIN;
 use codex_together_protocol::METHOD_SESSION_LEAVE;
+use codex_together_protocol::METHOD_THREAD_LIST;
+use codex_together_protocol::METHOD_THREAD_READ;
 use codex_together_protocol::METHOD_TOGETHER_AUTH;
+use codex_together_protocol::MemoryPromoteParams;
+use codex_together_protocol::MemoryPromoteResponse;
 use codex_together_protocol::NOTIFY_HOST_STOPPED;
+use codex_together_protocol::ThreadListParams;
+use codex_together_protocol::ThreadListResponse;
+use codex_together_protocol::ThreadReadParams;
+use codex_together_protocol::ThreadReadResponse;
+use codex_together_protocol::ThreadSummary;
 use codex_together_protocol::TogetherAuthRequest;
 use codex_together_protocol::TogetherAuthResponse;
 use codex_together_protocol::TogetherJoinRequest;
@@ -393,8 +410,12 @@ async fn handle_request(
         METHOD_SESSION_LEAVE => together_leave(state, connection_id, ctx, req).await,
         METHOD_CONTEXT_SEARCH => context_search(state, ctx, req).await,
         METHOD_CONTEXT_GRAPH => context_graph(state, ctx, req).await,
+        METHOD_CONTEXT_QUERY => context_query(state, ctx, req).await,
         METHOD_CONTEXT_PREVIEW => context_preview(state, ctx, req).await,
         METHOD_CONTEXT_RESOLVE_BUNDLE => context_resolve_bundle(state, ctx, req).await,
+        METHOD_MEMORY_PROMOTE => memory_promote(state, ctx, req).await,
+        METHOD_THREAD_READ => thread_read(state, ctx, req).await,
+        METHOD_THREAD_LIST => thread_list(state, ctx, req).await,
         METHOD_HANDOFF_PLAN => handoff_plan(state, ctx, req).await,
         METHOD_HANDOFF_COMMIT => handoff_commit(state, req).await,
         METHOD_CONTEXT_WRITE_PLAN => context_write_plan(state, ctx, req).await,
@@ -702,6 +723,21 @@ async fn context_graph(
     .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
 }
 
+async fn context_query(
+    state: &AppState,
+    _ctx: &ConnectionContext,
+    req: JsonRpcRequest,
+) -> JsonRpcResponse {
+    let payload: ContextQueryParams = match serde_json::from_value(req.params) {
+        Ok(p) => p,
+        Err(_) => return rpc_error(req.id, -32602, "invalid params"),
+    };
+
+    let documents = context_documents(state, context_focus_thread_ids_for_query(&payload)).await;
+    JsonRpcResponse::ok(req.id, shared_build_context_query(documents, &payload))
+        .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
+}
+
 async fn context_preview(
     state: &AppState,
     _ctx: &ConnectionContext,
@@ -735,6 +771,155 @@ async fn context_resolve_bundle(
     let response = build_context_bundle(state, payload.thread_id, payload.context_refs).await;
     JsonRpcResponse::ok(req.id, response)
         .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
+}
+
+async fn memory_promote(
+    state: &AppState,
+    _ctx: &ConnectionContext,
+    req: JsonRpcRequest,
+) -> JsonRpcResponse {
+    let payload: MemoryPromoteParams = match serde_json::from_value(req.params) {
+        Ok(p) => p,
+        Err(_) => return rpc_error(req.id, -32602, "invalid params"),
+    };
+    if payload.selected_node_ids.is_empty() {
+        return rpc_error(req.id, -32602, "selectedNodeIds is required");
+    }
+
+    let repo_root = match resolve_context_root() {
+        Ok(path) => path,
+        Err(err) => {
+            return rpc_error(
+                req.id,
+                -32603,
+                format!("failed to resolve collaboration context root: {err}"),
+            );
+        }
+    };
+
+    let documents = context_documents(
+        state,
+        context_focus_thread_ids_for_memory_promote(
+            payload.current_thread_id.as_deref(),
+            &payload.selected_node_ids,
+        ),
+    )
+    .await;
+    let plan = plan_memory_promote(&documents, &payload.selected_node_ids);
+    if plan.promotable_node_ids.is_empty() && plan.already_covered_node_ids.is_empty() {
+        return rpc_error(req.id, -32602, "no thread nodes matched selectedNodeIds");
+    }
+
+    let branch = current_branch_name(repo_root.as_path())
+        .await
+        .unwrap_or_default();
+    let files = plan_context_write_files(
+        repo_root.as_path(),
+        documents,
+        &plan.promotable_node_ids,
+        non_empty_string(branch),
+    )
+    .into_iter()
+    .map(|file| PendingContextWriteFile {
+        relative_path: file.relative_path,
+        content: file.content,
+    })
+    .collect::<Vec<_>>();
+    let created = match write_pending_context_files(repo_root.as_path(), files) {
+        Ok(written_files) => written_files
+            .into_iter()
+            .map(|path| format!("ctx:file:{path}"))
+            .collect(),
+        Err(err) => return rpc_error(req.id, -32603, err.to_string()),
+    };
+
+    JsonRpcResponse::ok(
+        req.id,
+        MemoryPromoteResponse {
+            created,
+            already_covered: plan.already_covered_node_ids,
+            proposal_required: Vec::new(),
+        },
+    )
+    .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
+}
+
+async fn thread_read(
+    state: &AppState,
+    _ctx: &ConnectionContext,
+    req: JsonRpcRequest,
+) -> JsonRpcResponse {
+    let payload: ThreadReadParams = match serde_json::from_value(req.params) {
+        Ok(p) => p,
+        Err(_) => return rpc_error(req.id, -32602, "invalid params"),
+    };
+
+    let thread = {
+        let mut bridge = state.app_server.lock().await;
+        match bridge.thread_read(payload.thread_id, false).await {
+            Ok(response) => response.thread,
+            Err(err) => return app_server_error_response(req.id, err),
+        }
+    };
+
+    JsonRpcResponse::ok(
+        req.id,
+        ThreadReadResponse {
+            thread: thread_summary_from_app_thread(thread),
+        },
+    )
+    .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
+}
+
+async fn thread_list(
+    state: &AppState,
+    _ctx: &ConnectionContext,
+    req: JsonRpcRequest,
+) -> JsonRpcResponse {
+    let payload: ThreadListParams = match serde_json::from_value(req.params) {
+        Ok(p) => p,
+        Err(_) => return rpc_error(req.id, -32602, "invalid params"),
+    };
+
+    let response = {
+        let mut bridge = state.app_server.lock().await;
+        match bridge
+            .thread_list(payload.query.clone(), payload.cursor.clone(), payload.limit)
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => return app_server_error_response(req.id, err),
+        }
+    };
+
+    let repo_root_filter = payload.repo_root.as_deref().map(Path::new);
+    let data = response
+        .data
+        .into_iter()
+        .filter_map(|thread| {
+            let summary = thread_summary_from_app_thread(thread);
+            if repo_root_filter.is_some_and(|expected_repo_root| {
+                summary
+                    .repo_root
+                    .as_deref()
+                    .map(Path::new)
+                    .filter(|actual_repo_root| *actual_repo_root == expected_repo_root)
+                    .is_none()
+            }) {
+                return None;
+            }
+            Some(summary)
+        })
+        .collect();
+
+    JsonRpcResponse::ok(
+        req.id,
+        ThreadListResponse {
+            data,
+            next_cursor: response.next_cursor,
+        },
+    )
+    .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
 }
 
 async fn context_write_plan(
@@ -1303,6 +1488,39 @@ fn context_focus_thread_ids_for_handoff(
             .any(|thread_id| thread_id == source_thread_id)
     {
         thread_ids.insert(0, source_thread_id.to_string());
+    }
+    thread_ids
+}
+
+fn context_focus_thread_ids_for_query(params: &ContextQueryParams) -> Vec<String> {
+    let mut thread_ids = context_focus_thread_ids(params.current_thread_id.as_deref());
+    if let Some(precursor_thread_id) = params
+        .precursor_thread_id
+        .as_deref()
+        .filter(|thread_id| !thread_id.is_empty())
+        && !thread_ids
+            .iter()
+            .any(|thread_id| thread_id == precursor_thread_id)
+    {
+        thread_ids.push(precursor_thread_id.to_string());
+    }
+    for thread_id in context_focus_thread_ids_for_ref_ids(&params.seed_ref_ids) {
+        if !thread_ids.iter().any(|existing| existing == &thread_id) {
+            thread_ids.push(thread_id);
+        }
+    }
+    thread_ids
+}
+
+fn context_focus_thread_ids_for_memory_promote(
+    current_thread_id: Option<&str>,
+    selected_node_ids: &[String],
+) -> Vec<String> {
+    let mut thread_ids = context_focus_thread_ids(current_thread_id);
+    for thread_id in context_focus_thread_ids_for_ref_ids(selected_node_ids) {
+        if !thread_ids.iter().any(|existing| existing == &thread_id) {
+            thread_ids.push(thread_id);
+        }
     }
     thread_ids
 }
@@ -2371,6 +2589,52 @@ fn context_document_is_persisted(
         .any(|path| coverage.source_file_paths.contains(path))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct MemoryPromotePlan {
+    promotable_node_ids: Vec<String>,
+    already_covered_node_ids: Vec<String>,
+}
+
+fn plan_memory_promote(
+    documents: &[ContextDocument],
+    selected_node_ids: &[String],
+) -> MemoryPromotePlan {
+    let coverage = persisted_context_coverage(documents);
+    let documents_by_ref_id = documents
+        .iter()
+        .map(|document| (document.ref_id.as_str(), document))
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::new();
+    let mut promotable_node_ids = Vec::new();
+    let mut already_covered_node_ids = Vec::new();
+
+    for node_id in selected_node_ids {
+        if !seen.insert(node_id.as_str()) {
+            continue;
+        }
+        let Some(document) = documents_by_ref_id.get(node_id.as_str()).copied() else {
+            continue;
+        };
+        if matches!(
+            document.kind,
+            ContextKind::ThreadInsight
+                | ContextKind::ThreadFile
+                | ContextKind::ThreadSearch
+                | ContextKind::ThreadTool
+        ) && !context_document_is_persisted(document, &coverage)
+        {
+            promotable_node_ids.push(node_id.clone());
+        } else {
+            already_covered_node_ids.push(node_id.clone());
+        }
+    }
+
+    MemoryPromotePlan {
+        promotable_node_ids,
+        already_covered_node_ids,
+    }
+}
+
 fn recommended_handoff_ref_ids(
     documents: &[ContextDocument],
     source_thread_id: &str,
@@ -2587,7 +2851,7 @@ async fn source_thread_context_entry(
 async fn thread_read_with_turn_fallback(
     bridge: &mut AppServerBridge,
     thread_id: &str,
-) -> Result<ThreadReadResponse, AppServerError> {
+) -> Result<AppThreadReadResponse, AppServerError> {
     match bridge.thread_read(thread_id.to_string(), true).await {
         Ok(response) => Ok(response),
         Err(err) if app_server_thread_not_loaded(&err) => {
@@ -2603,6 +2867,23 @@ async fn source_thread_cwd(
 ) -> Result<String, AppServerError> {
     let thread_read = bridge.thread_read(thread_id.to_string(), false).await?;
     Ok(thread_read.thread.cwd.display().to_string())
+}
+
+fn thread_summary_from_app_thread(thread: AppThread) -> ThreadSummary {
+    let repo_root = get_git_repo_root(&thread.cwd).unwrap_or_else(|| thread.cwd.clone());
+    ThreadSummary {
+        thread_id: thread.id,
+        actor_id: thread.agent_nickname,
+        title: thread.name.and_then(non_empty_string),
+        preview: non_empty_string(thread.preview),
+        repo_root: Some(repo_root.display().to_string()),
+        cwd: Some(thread.cwd.display().to_string()),
+        git_branch: thread.git_info.and_then(|git_info| git_info.branch),
+        goal: None,
+        precursor_thread_id: None,
+        precursor_kind: None,
+        updated_at: Some(thread.updated_at),
+    }
 }
 
 fn plan_context_write_files(
@@ -3127,10 +3408,10 @@ impl AppServerBridge {
         &mut self,
         thread_id: String,
         include_turns: bool,
-    ) -> Result<ThreadReadResponse, AppServerError> {
+    ) -> Result<AppThreadReadResponse, AppServerError> {
         self.request_with_retry(
             "thread/read",
-            serde_json::to_value(ThreadReadParams {
+            serde_json::to_value(AppThreadReadParams {
                 thread_id,
                 include_turns,
             })
@@ -3143,18 +3424,45 @@ impl AppServerBridge {
         .await
     }
 
+    async fn thread_list(
+        &mut self,
+        query: Option<String>,
+        cursor: Option<String>,
+        limit: Option<u32>,
+    ) -> Result<AppThreadListResponse, AppServerError> {
+        self.request_with_retry(
+            "thread/list",
+            serde_json::to_value(AppThreadListParams {
+                cursor,
+                limit,
+                sort_key: Some(AppThreadSortKey::UpdatedAt),
+                model_providers: None,
+                source_kinds: None,
+                archived: Some(false),
+                cwd: None,
+                search_term: query,
+            })
+            .map_err(|err| {
+                AppServerError::Decode(anyhow::anyhow!(
+                    "failed to serialize thread/list params: {err}"
+                ))
+            })?,
+        )
+        .await
+    }
+
     async fn thread_start(
         &mut self,
         cwd: Option<String>,
         model: Option<String>,
         approval_policy: Option<codex_protocol::protocol::AskForApproval>,
         sandbox: Option<codex_protocol::protocol::SandboxPolicy>,
-    ) -> Result<ThreadStartResponse, AppServerError> {
+    ) -> Result<AppThreadStartResponse, AppServerError> {
         let approval_policy = approval_policy.map(Into::into);
         let sandbox = sandbox.and_then(thread_start_sandbox_mode_from_policy);
         self.request_with_retry(
             "thread/start",
-            serde_json::to_value(ThreadStartParams {
+            serde_json::to_value(AppThreadStartParams {
                 model,
                 model_provider: None,
                 cwd,
@@ -3426,10 +3734,13 @@ fn is_pid_running(_pid: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::MemoryPromotePlan;
     use super::build_context_graph;
+    use super::context_focus_thread_ids_for_query;
     use super::context_graph_artifact_paths;
     use super::handoff_promotion_ref_ids;
     use super::plan_context_write_files;
+    use super::plan_memory_promote;
     use super::recommended_handoff_ref_ids;
     use super::render_context_bundle;
     use super::repo_context_documents;
@@ -3437,6 +3748,7 @@ mod tests {
     use super::search_context_documents;
     use super::thread_context_document;
     use super::thread_context_documents;
+    use super::thread_summary_from_app_thread;
     use codex_app_server_protocol::CommandAction;
     use codex_app_server_protocol::CommandExecutionStatus;
     use codex_app_server_protocol::GitInfo;
@@ -3448,6 +3760,8 @@ mod tests {
     use codex_app_server_protocol::TurnStatus as AppTurnStatus;
     use codex_protocol::ThreadId;
     use codex_together_protocol::ContextKind;
+    use codex_together_protocol::ContextPrecursorKind;
+    use codex_together_protocol::ContextQueryParams;
     use std::path::PathBuf;
 
     #[test]
@@ -3876,6 +4190,112 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn plan_memory_promote_returns_only_unpersisted_thread_nodes() {
+        let temp_root = temp_test_dir("memory-promote");
+        let context_dir = temp_root.join(".codex").join("context");
+        std::fs::create_dir_all(&context_dir).expect("create context dir");
+        std::fs::write(
+            context_dir.join("overview.md"),
+            "---\ntitle: Planning Overview\nkind: concept\nsource_threads:\n  - \"thread-1\"\nsource_refs:\n  - \"ctx:thread-insight:thread-1:plan-1\"\n---\n# Planning Overview\n\nPersisted already.\n",
+        )
+        .expect("write repo context");
+
+        let mut thread = sample_thread("thread-1", Some("planning sync"), Some("main"));
+        thread.turns = vec![Turn {
+            id: "turn-1".to_string(),
+            items: vec![
+                ThreadItem::Plan {
+                    id: "plan-1".to_string(),
+                    text: "Persisted already.".to_string(),
+                },
+                ThreadItem::Plan {
+                    id: "plan-2".to_string(),
+                    text: "Promote this remaining insight.".to_string(),
+                },
+            ],
+            status: AppTurnStatus::Completed,
+            error: None,
+        }];
+
+        let mut documents = repo_context_documents(&temp_root);
+        documents.extend(thread_context_documents(
+            &thread,
+            true,
+            Some(temp_root.as_path()),
+        ));
+
+        let plan = plan_memory_promote(
+            &documents,
+            &[
+                "ctx:file:.codex/context/overview.md".to_string(),
+                "ctx:thread-insight:thread-1:plan-1".to_string(),
+                "ctx:thread-insight:thread-1:plan-2".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            plan,
+            MemoryPromotePlan {
+                promotable_node_ids: vec!["ctx:thread-insight:thread-1:plan-2".to_string()],
+                already_covered_node_ids: vec![
+                    "ctx:file:.codex/context/overview.md".to_string(),
+                    "ctx:thread-insight:thread-1:plan-1".to_string(),
+                ],
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn context_query_focus_thread_ids_include_precursor_and_seed_threads() {
+        let thread_ids = context_focus_thread_ids_for_query(&ContextQueryParams {
+            current_thread_id: Some("thread-current".to_string()),
+            precursor_thread_id: Some("thread-prev".to_string()),
+            precursor_kind: Some(ContextPrecursorKind::Handoff),
+            actor_id: None,
+            repo_root: None,
+            git_branch: None,
+            goal: None,
+            query: None,
+            seed_ref_ids: vec![
+                "ctx:thread-insight:thread-prev:plan-1".to_string(),
+                "ctx:thread-insight:thread-other:plan-2".to_string(),
+            ],
+            limit: None,
+        });
+
+        assert_eq!(
+            thread_ids,
+            vec![
+                "thread-current".to_string(),
+                "thread-prev".to_string(),
+                "thread-other".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn thread_summary_from_app_thread_uses_agent_nickname_and_preview() {
+        let mut thread = sample_thread("thread-1", Some("planning sync"), Some("main"));
+        thread.name = Some("Context thread".to_string());
+
+        let summary = thread_summary_from_app_thread(thread);
+
+        assert_eq!(summary.thread_id, "thread-1".to_string());
+        assert_eq!(summary.actor_id, Some("lobster-worker".to_string()));
+        assert_eq!(summary.title, Some("Context thread".to_string()));
+        assert_eq!(summary.preview, Some("planning sync".to_string()));
+        assert_eq!(summary.repo_root, Some("/tmp/repo".to_string()));
+        assert_eq!(summary.cwd, Some("/tmp/repo".to_string()));
+        assert_eq!(summary.git_branch, Some("main".to_string()));
+        assert_eq!(summary.goal, None);
+        assert_eq!(summary.precursor_thread_id, None);
+        assert_eq!(summary.precursor_kind, None);
+        assert_eq!(summary.updated_at, Some(1_741_422_760));
     }
 
     #[test]

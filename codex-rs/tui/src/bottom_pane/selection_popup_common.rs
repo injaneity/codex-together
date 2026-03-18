@@ -797,14 +797,7 @@ pub(crate) fn render_rows_single_line(
             if !suffix_spans.is_empty() {
                 suffix_spans.push(" ".into());
             }
-            suffix_spans.push(if row.row_style.is_some() {
-                Span::styled(
-                    "<",
-                    Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
-                )
-            } else {
-                "<".cyan().bold()
-            });
+            suffix_spans.push("<".cyan().bold());
         }
         let suffix_width = Line::from(suffix_spans.clone()).width();
         let content_width = if suffix_width > 0 && area.width as usize > suffix_width + 1 {

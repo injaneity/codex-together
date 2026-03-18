@@ -9532,7 +9532,7 @@ fn together_context_selection_prefix_spans(
     _is_marked: bool,
     _is_hovered: bool,
 ) -> Vec<Span<'static>> {
-    vec!["   ".into()]
+    Vec::new()
 }
 
 fn together_context_tag(node: &ContextQueryNode) -> TogetherContextTag {

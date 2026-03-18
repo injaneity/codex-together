@@ -13,7 +13,6 @@ use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ExternalEditorState;
 use crate::chatwidget::commit_together_handoff_plan;
-use crate::chatwidget::fetch_together_context_graph;
 use crate::chatwidget::plan_together_context_handoff;
 use crate::chatwidget::search_together_context;
 use crate::chatwidget::together_handoff_draft;
@@ -920,32 +919,8 @@ impl App {
         }
     }
 
-    async fn toggle_together_context_scope(&mut self) {
-        let Some(request) = self.chat_widget.together_context_toggle_request() else {
-            return;
-        };
-        let current_thread_id = matches!(
-            request.next_scope,
-            crate::chatwidget::TogetherContextScope::LocalThread
-        )
-        .then(|| {
-            self.chat_widget
-                .thread_id()
-                .map(|thread_id| thread_id.to_string())
-        })
-        .flatten();
-        match fetch_together_context_graph(request.query.clone(), current_thread_id).await {
-            Ok(graph) => self.chat_widget.show_together_context_view_with_selection(
-                request.query,
-                graph,
-                request.next_scope,
-                request.selected_ref_ids,
-                request.handoff_goal,
-            ),
-            Err(err) => self
-                .chat_widget
-                .add_error_message(format!("Failed to refresh context graph: {err}")),
-        }
+    fn toggle_together_context_scope(&mut self) {
+        self.chat_widget.toggle_together_context_scope();
     }
 
     fn start_together_composer_context_search(&self, query: String) {
@@ -3297,14 +3272,14 @@ impl App {
             }
             AppEvent::OpenTogetherContextView {
                 query,
-                graph,
+                query_response,
                 scope,
                 selected_ref_ids,
                 handoff_goal,
             } => {
                 self.chat_widget.show_together_context_view_with_selection(
                     query,
-                    graph,
+                    query_response,
                     scope,
                     selected_ref_ids.into_iter().collect(),
                     handoff_goal,
@@ -3315,7 +3290,7 @@ impl App {
                     .toggle_together_context_selection(actual_idx);
             }
             AppEvent::ToggleTogetherContextScope => {
-                self.toggle_together_context_scope().await;
+                self.toggle_together_context_scope();
             }
             AppEvent::PlanTogetherContextHandoff { actual_idx } => {
                 self.plan_together_context_handoff(tui, actual_idx).await;

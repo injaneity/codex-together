@@ -98,12 +98,20 @@ use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::TextElement;
 use codex_protocol::user_input::UserInput;
 use codex_together_protocol::ConnectedMember;
-use codex_together_protocol::ContextGraphEdge;
-use codex_together_protocol::ContextGraphResponse;
+use codex_together_protocol::ContextEdgeType;
 use codex_together_protocol::ContextKind;
+use codex_together_protocol::ContextMountReason;
+use codex_together_protocol::ContextPrecursorKind;
+use codex_together_protocol::ContextQueryAnchor;
+use codex_together_protocol::ContextQueryEdge;
+use codex_together_protocol::ContextQueryNode;
+use codex_together_protocol::ContextQueryResponse;
 use codex_together_protocol::ContextRef;
-use codex_together_protocol::ContextSearchResult;
+use codex_together_protocol::ContextRepoNode;
 use codex_together_protocol::ContextStaleState;
+use codex_together_protocol::ContextThreadNode;
+use codex_together_protocol::RepoMemoryKind;
+use codex_together_protocol::ThreadArtifactKind;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_approval_presets::builtin_approval_presets;
 use crossterm::event::KeyCode;
@@ -1805,6 +1813,105 @@ fn assert_no_submit_op(op_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Op>) {
     }
 }
 
+fn context_anchor_id(current_thread_id: Option<&str>) -> String {
+    current_thread_id
+        .map(|thread_id| format!("anchor:{thread_id}"))
+        .unwrap_or_else(|| "anchor:workspace".to_string())
+}
+
+fn rooted_context_query(
+    current_thread_id: Option<&str>,
+    precursor_thread_id: Option<&str>,
+    precursor_kind: Option<ContextPrecursorKind>,
+    nodes: Vec<ContextQueryNode>,
+    edges: Vec<ContextQueryEdge>,
+) -> ContextQueryResponse {
+    ContextQueryResponse {
+        anchor: ContextQueryAnchor {
+            anchor_id: context_anchor_id(current_thread_id),
+            current_thread_id: current_thread_id.map(str::to_string),
+            precursor_thread_id: precursor_thread_id.map(str::to_string),
+            precursor_kind,
+            actor_id: None,
+            repo_root: None,
+            git_branch: None,
+            goal: None,
+        },
+        nodes,
+        edges,
+    }
+}
+
+fn thread_context_node(
+    node_id: &str,
+    artifact_kind: ThreadArtifactKind,
+    title: &str,
+    summary: Option<&str>,
+    location: Option<&str>,
+    body: Option<&str>,
+    origin_thread_id: &str,
+) -> ContextQueryNode {
+    ContextQueryNode::Thread(ContextThreadNode {
+        node_id: node_id.to_string(),
+        artifact_kind,
+        title: title.to_string(),
+        summary: summary.map(str::to_string),
+        location: location.map(str::to_string),
+        body: body.map(str::to_string),
+        origin_thread_id: origin_thread_id.to_string(),
+        source_files: Vec::new(),
+        source_refs: Vec::new(),
+        created_at: None,
+    })
+}
+
+fn repo_context_node(
+    node_id: &str,
+    repo_kind: RepoMemoryKind,
+    title: &str,
+    summary: Option<&str>,
+    path: &str,
+    source_threads: Vec<&str>,
+    source_metadata: (Vec<&str>, Vec<&str>),
+) -> ContextQueryNode {
+    let (source_refs, source_files) = source_metadata;
+    ContextQueryNode::Repo(ContextRepoNode {
+        node_id: node_id.to_string(),
+        repo_kind,
+        title: title.to_string(),
+        summary: summary.map(str::to_string),
+        path: path.to_string(),
+        source_threads: source_threads.into_iter().map(str::to_string).collect(),
+        source_refs: source_refs.into_iter().map(str::to_string).collect(),
+        source_files: source_files.into_iter().map(str::to_string).collect(),
+        last_validated_at: None,
+    })
+}
+
+fn mounted_edge(
+    anchor_id: &str,
+    to_node_id: &str,
+    mount_reason: ContextMountReason,
+) -> ContextQueryEdge {
+    ContextQueryEdge {
+        from_node_id: anchor_id.to_string(),
+        to_node_id: to_node_id.to_string(),
+        edge_type: ContextEdgeType::Mounted,
+        mount_reason: Some(mount_reason),
+        reason: None,
+    }
+}
+
+fn related_edge(from_node_id: &str, to_node_id: &str, reason: &str) -> ContextQueryEdge {
+    ContextQueryEdge {
+        from_node_id: from_node_id.to_string(),
+        to_node_id: to_node_id.to_string(),
+        edge_type: ContextEdgeType::Related,
+        mount_reason: None,
+        reason: Some(reason.to_string()),
+    }
+}
+
 #[tokio::test]
 async fn together_context_view_snapshot() {
     use ratatui::Terminal;
@@ -1812,65 +1919,56 @@ async fn together_context_view_snapshot() {
 
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
     let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
+    let prior_thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df7";
     chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
+
+    let anchor_id = context_anchor_id(Some(thread_id));
+    let local_ref_id = format!("ctx:thread-file:{thread_id}:chatwidget");
+    let handoff_ref_id = format!("ctx:thread-insight:{prior_thread_id}:plan-1");
+    let repo_ref_id = "ctx:file:.codex/context/playbooks/handoff-selection-flow.md";
 
     chat.show_together_context_view(
         None,
-        ContextGraphResponse {
-            nodes: vec![
-                ContextSearchResult {
-                    ref_id: format!("ctx:thread:{thread_id}"),
-                    kind: ContextKind::SharedThread,
-                    title: "🦞 lobster-worker · Current Thread".to_string(),
-                    summary: Some(
-                        "current thread · branch=rewrite-codex-2gether-v2"
-                            .to_string(),
-                    ),
-                    location: Some(format!("thread/{thread_id}")),
-                    body: Some(
-                        format!(
-                            "Thread: {thread_id}\nCwd: /tmp/repo\nUpdated at: 1741422760\nAgent role: research\nAgent: lobster-worker\nGit branch: rewrite-codex-2gether-v2"
-                        ),
-                    ),
-                },
-                ContextSearchResult {
-                    ref_id: format!("ctx:thread-insight:{thread_id}:plan-1"),
-                    kind: ContextKind::ThreadInsight,
-                    title: "Capture branch state".to_string(),
-                    summary: Some("thread insight · retained plan output".to_string()),
-                    location: Some("insight/plan-1".to_string()),
-                    body: Some("Capture branch state".to_string()),
-                },
-                ContextSearchResult {
-                    ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-                    kind: ContextKind::RepoContextFile,
-                    title: "Summarize this branch in one sentence.".to_string(),
-                    summary: Some("concept · Branch summary for demo flow.".to_string()),
-                    location: Some(".codex/context/overview.md".to_string()),
-                    body: Some(
-                        "# Summarize this branch in one sentence.\n\nThis branch is simplifying /context so the active thread stays at the root and linked persistent notes read like summary context instead of extra graph rows."
-                            .to_string(),
-                    ),
-                },
+        rooted_context_query(
+            Some(thread_id),
+            Some(prior_thread_id),
+            Some(ContextPrecursorKind::Handoff),
+            vec![
+                thread_context_node(
+                    &local_ref_id,
+                    ThreadArtifactKind::FileChange,
+                    "tui/src/chatwidget.rs",
+                    Some("linked file · updated in thread"),
+                    Some("tui/src/chatwidget.rs"),
+                    Some("Adjusted the /context selection view."),
+                    thread_id,
+                ),
+                thread_context_node(
+                    &handoff_ref_id,
+                    ThreadArtifactKind::Plan,
+                    "Simplify /context selection flow",
+                    Some("thread insight · retained plan output"),
+                    Some("insight/plan-1"),
+                    Some("Only show one-line nodes and let Enter toggle selection."),
+                    prior_thread_id,
+                ),
+                repo_context_node(
+                    repo_ref_id,
+                    RepoMemoryKind::Playbook,
+                    "Handoff selection flow",
+                    Some("playbook · one-line context selection"),
+                    ".codex/context/playbooks/handoff-selection-flow.md",
+                    vec![prior_thread_id],
+                    (vec![handoff_ref_id.as_str()], vec!["tui/src/chatwidget.rs"]),
+                ),
             ],
-            edges: vec![
-                ContextGraphEdge {
-                    from_ref_id: format!("ctx:thread:{thread_id}"),
-                    to_ref_id: format!("ctx:thread-insight:{thread_id}:plan-1"),
-                    label: "insight".to_string(),
-                },
-                ContextGraphEdge {
-                    from_ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-                    to_ref_id: format!("ctx:thread:{thread_id}"),
-                    label: "source".to_string(),
-                },
-                ContextGraphEdge {
-                    from_ref_id: format!("ctx:thread:{thread_id}"),
-                    to_ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-                    label: "branch".to_string(),
-                },
+            vec![
+                mounted_edge(&anchor_id, &local_ref_id, ContextMountReason::Local),
+                mounted_edge(&anchor_id, &handoff_ref_id, ContextMountReason::HandoffSeed),
+                mounted_edge(&anchor_id, repo_ref_id, ContextMountReason::RepoNeighbor),
+                related_edge(repo_ref_id, &local_ref_id, "same_file"),
             ],
-        },
+        ),
         TogetherContextScope::LocalThread,
     );
 
@@ -1888,64 +1986,68 @@ async fn together_context_global_view_snapshot() {
 
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
     let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
+    let prior_thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df7";
+    let older_thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df6";
     chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
+
+    let anchor_id = context_anchor_id(Some(thread_id));
+    let local_ref_id = format!("ctx:thread-file:{thread_id}:chatwidget");
+    let handoff_ref_id = format!("ctx:thread-insight:{prior_thread_id}:plan-1");
+    let search_ref_id = format!("ctx:thread-search:{older_thread_id}:search-1");
+    let repo_ref_id = "ctx:file:.codex/context/playbooks/handoff-selection-flow.md";
 
     chat.show_together_context_view(
         None,
-        ContextGraphResponse {
-            nodes: vec![
-                ContextSearchResult {
-                    ref_id: format!("ctx:thread:{thread_id}"),
-                    kind: ContextKind::SharedThread,
-                    title: "🦞 lobster-worker · Current Thread".to_string(),
-                    summary: Some(
-                        "current thread · branch=rewrite-codex-2gether-v2".to_string(),
-                    ),
-                    location: Some(format!("thread/{thread_id}")),
-                    body: Some(
-                        format!(
-                            "Thread: {thread_id}\nCwd: /tmp/repo\nUpdated at: 1741422760\nAgent role: research\nAgent: lobster-worker\nGit branch: rewrite-codex-2gether-v2"
-                        ),
-                    ),
-                },
-                ContextSearchResult {
-                    ref_id: format!("ctx:thread-insight:{thread_id}:plan-1"),
-                    kind: ContextKind::ThreadInsight,
-                    title: "Capture branch state".to_string(),
-                    summary: Some("thread insight · retained plan output".to_string()),
-                    location: Some("insight/plan-1".to_string()),
-                    body: Some("Capture branch state".to_string()),
-                },
-                ContextSearchResult {
-                    ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-                    kind: ContextKind::RepoContextFile,
-                    title: "Summarize this branch in one sentence.".to_string(),
-                    summary: Some("concept · Branch summary for demo flow.".to_string()),
-                    location: Some(".codex/context/overview.md".to_string()),
-                    body: Some(
-                        "# Summarize this branch in one sentence.\n\nThis branch is simplifying /context so the active thread stays at the root and linked persistent notes read like summary context instead of extra graph rows."
-                            .to_string(),
-                    ),
-                },
+        rooted_context_query(
+            Some(thread_id),
+            Some(prior_thread_id),
+            Some(ContextPrecursorKind::Handoff),
+            vec![
+                thread_context_node(
+                    &local_ref_id,
+                    ThreadArtifactKind::FileChange,
+                    "tui/src/chatwidget.rs",
+                    Some("linked file · updated in thread"),
+                    Some("tui/src/chatwidget.rs"),
+                    Some("Adjusted the /context selection view."),
+                    thread_id,
+                ),
+                thread_context_node(
+                    &handoff_ref_id,
+                    ThreadArtifactKind::Plan,
+                    "Simplify /context selection flow",
+                    Some("thread insight · retained plan output"),
+                    Some("insight/plan-1"),
+                    Some("Only show one-line nodes and let Enter toggle selection."),
+                    prior_thread_id,
+                ),
+                thread_context_node(
+                    &search_ref_id,
+                    ThreadArtifactKind::Search,
+                    "promotion scoring heuristics",
+                    Some("thread search · prior exploration"),
+                    Some("search/promotion"),
+                    Some("promotion scoring heuristics"),
+                    older_thread_id,
+                ),
+                repo_context_node(
+                    repo_ref_id,
+                    RepoMemoryKind::Playbook,
+                    "Handoff selection flow",
+                    Some("playbook · one-line context selection"),
+                    ".codex/context/playbooks/handoff-selection-flow.md",
+                    vec![prior_thread_id],
+                    (vec![handoff_ref_id.as_str()], vec!["tui/src/chatwidget.rs"]),
+                ),
             ],
-            edges: vec![
-                ContextGraphEdge {
-                    from_ref_id: format!("ctx:thread:{thread_id}"),
-                    to_ref_id: format!("ctx:thread-insight:{thread_id}:plan-1"),
-                    label: "insight".to_string(),
-                },
-                ContextGraphEdge {
-                    from_ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-                    to_ref_id: format!("ctx:thread:{thread_id}"),
-                    label: "source".to_string(),
-                },
-                ContextGraphEdge {
-                    from_ref_id: format!("ctx:thread:{thread_id}"),
-                    to_ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-                    label: "branch".to_string(),
-                },
+            vec![
+                mounted_edge(&anchor_id, &local_ref_id, ContextMountReason::Local),
+                mounted_edge(&anchor_id, &handoff_ref_id, ContextMountReason::HandoffSeed),
+                mounted_edge(&anchor_id, repo_ref_id, ContextMountReason::RepoNeighbor),
+                related_edge(repo_ref_id, &local_ref_id, "same_file"),
+                related_edge(&handoff_ref_id, &search_ref_id, "same_topic"),
             ],
-        },
+        ),
         TogetherContextScope::Global,
     );
 
@@ -1967,30 +2069,32 @@ async fn together_context_local_view_without_anchor_snapshot() {
 
     chat.show_together_context_view(
         None,
-        ContextGraphResponse {
-            nodes: vec![
-                ContextSearchResult {
-                    ref_id: format!("ctx:thread-insight:{thread_id}:plan-1"),
-                    kind: ContextKind::ThreadInsight,
-                    title: "Capture branch state".to_string(),
-                    summary: Some("thread insight · retained plan output".to_string()),
-                    location: Some("insight/plan-1".to_string()),
-                    body: Some("Capture branch state".to_string()),
-                },
-                ContextSearchResult {
-                    ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-                    kind: ContextKind::RepoContextFile,
-                    title: "Summarize this branch in one sentence.".to_string(),
-                    summary: Some("concept · Branch summary for demo flow.".to_string()),
-                    location: Some(".codex/context/overview.md".to_string()),
-                    body: Some(
-                        "# Summarize this branch in one sentence.\n\nThis branch is simplifying /context so the active thread stays at the root and linked persistent notes read like summary context instead of extra graph rows."
-                            .to_string(),
-                    ),
-                },
+        rooted_context_query(
+            None,
+            None,
+            None,
+            vec![
+                thread_context_node(
+                    &format!("ctx:thread-insight:{thread_id}:plan-1"),
+                    ThreadArtifactKind::Plan,
+                    "Capture branch state",
+                    Some("thread insight · retained plan output"),
+                    Some("insight/plan-1"),
+                    Some("Capture branch state"),
+                    thread_id,
+                ),
+                repo_context_node(
+                    "ctx:file:.codex/context/overview.md",
+                    RepoMemoryKind::Concept,
+                    "Summarize this branch in one sentence.",
+                    Some("concept · Branch summary for demo flow."),
+                    ".codex/context/overview.md",
+                    vec![thread_id],
+                    (vec![], vec!["tui/src/chatwidget.rs"]),
+                ),
             ],
-            edges: Vec::new(),
-        },
+            Vec::new(),
+        ),
         TogetherContextScope::LocalThread,
     );
 
@@ -2015,41 +2119,21 @@ async fn together_context_local_view_without_artifacts_snapshot() {
 
     chat.show_together_context_view(
         None,
-        ContextGraphResponse {
-            nodes: vec![
-                ContextSearchResult {
-                    ref_id: format!("ctx:thread:{thread_id}"),
-                    kind: ContextKind::SharedThread,
-                    title: "🦞 lobster-worker · Current Thread".to_string(),
-                    summary: Some("current thread".to_string()),
-                    location: Some(format!("thread/{thread_id}")),
-                    body: Some(format!("Thread: {thread_id}\nAgent: lobster-worker")),
-                },
-                ContextSearchResult {
-                    ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-                    kind: ContextKind::RepoContextFile,
-                    title: "Summarize this branch in one sentence.".to_string(),
-                    summary: Some("concept · Branch summary for demo flow.".to_string()),
-                    location: Some(".codex/context/overview.md".to_string()),
-                    body: Some(
-                        "# Summarize this branch in one sentence.\n\nThis branch is simplifying /context."
-                            .to_string(),
-                    ),
-                },
-            ],
-            edges: vec![
-                ContextGraphEdge {
-                    from_ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-                    to_ref_id: format!("ctx:thread:{thread_id}"),
-                    label: "source".to_string(),
-                },
-                ContextGraphEdge {
-                    from_ref_id: format!("ctx:thread:{thread_id}"),
-                    to_ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-                    label: "branch".to_string(),
-                },
-            ],
-        },
+        rooted_context_query(
+            Some(thread_id),
+            None,
+            None,
+            vec![repo_context_node(
+                "ctx:file:.codex/context/overview.md",
+                RepoMemoryKind::Concept,
+                "Summarize this branch in one sentence.",
+                Some("concept · Branch summary for demo flow."),
+                ".codex/context/overview.md",
+                vec![thread_id],
+                (vec![], vec!["tui/src/chatwidget.rs"]),
+            )],
+            Vec::new(),
+        ),
         TogetherContextScope::LocalThread,
     );
 
@@ -2064,221 +2148,176 @@ async fn together_context_local_view_without_artifacts_snapshot() {
 }
 
 #[test]
-fn together_context_local_scope_prefers_thread_artifacts_over_thread_summary() {
-    let rows = together_context_tree_rows_for_scope(
+fn together_context_local_scope_keeps_only_mounted_nodes() {
+    let anchor_id = context_anchor_id(Some("thread-1"));
+    let local_ref_id = "ctx:thread-insight:thread-1:plan-1";
+    let prior_ref_id = "ctx:thread-search:thread-0:search-1";
+    let repo_ref_id = "ctx:file:.codex/context/overview.md";
+    let response = rooted_context_query(
+        Some("thread-1"),
+        Some("thread-0"),
+        Some(ContextPrecursorKind::Fork),
         vec![
-            ContextSearchResult {
-                ref_id: "ctx:thread-insight:thread-1:plan-1".to_string(),
-                kind: ContextKind::ThreadInsight,
-                title: "Capture the branch state.".to_string(),
-                summary: Some("insight".to_string()),
-                location: Some("insight/plan-1".to_string()),
-                body: None,
-            },
-            ContextSearchResult {
-                ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-                kind: ContextKind::RepoContextFile,
-                title: "Planning Overview".to_string(),
-                summary: Some("plan".to_string()),
-                location: Some(".codex/context/overview.md".to_string()),
-                body: None,
-            },
-            ContextSearchResult {
-                ref_id: "ctx:thread:thread-1".to_string(),
-                kind: ContextKind::SharedThread,
-                title: "planning sync".to_string(),
-                summary: Some("thread".to_string()),
-                location: Some("thread/thread-1".to_string()),
-                body: None,
-            },
+            thread_context_node(
+                local_ref_id,
+                ThreadArtifactKind::Plan,
+                "Capture the branch state.",
+                Some("insight"),
+                Some("insight/plan-1"),
+                None,
+                "thread-1",
+            ),
+            thread_context_node(
+                prior_ref_id,
+                ThreadArtifactKind::Search,
+                "Search prior commits",
+                Some("search"),
+                Some("search/prior"),
+                None,
+                "thread-0",
+            ),
+            repo_context_node(
+                repo_ref_id,
+                RepoMemoryKind::Concept,
+                "Planning Overview",
+                Some("plan"),
+                ".codex/context/overview.md",
+                vec!["thread-1"],
+                (vec![], vec![]),
+            ),
         ],
-        &[
-            ContextGraphEdge {
-                from_ref_id: "ctx:thread:thread-1".to_string(),
-                to_ref_id: "ctx:thread-insight:thread-1:plan-1".to_string(),
-                label: "insight".to_string(),
-            },
-            ContextGraphEdge {
-                from_ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-                to_ref_id: "ctx:thread:thread-1".to_string(),
-                label: "source".to_string(),
-            },
-            ContextGraphEdge {
-                from_ref_id: "ctx:thread:thread-1".to_string(),
-                to_ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-                label: "branch".to_string(),
-            },
+        vec![
+            mounted_edge(&anchor_id, local_ref_id, ContextMountReason::Local),
+            mounted_edge(&anchor_id, repo_ref_id, ContextMountReason::RepoNeighbor),
         ],
-        Some("ctx:thread:thread-1"),
-        TogetherContextScope::LocalThread,
     );
 
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].result.ref_id, "ctx:thread-insight:thread-1:plan-1");
-}
+    let rows = together_context_rows_for_scope(&response, TogetherContextScope::LocalThread);
 
-#[test]
-fn together_context_local_scope_prefers_thread_artifacts_when_anchor_missing() {
-    let rows = together_context_tree_rows_for_scope(
-        vec![
-            ContextSearchResult {
-                ref_id: "ctx:thread-insight:thread-1:plan-1".to_string(),
-                kind: ContextKind::ThreadInsight,
-                title: "Capture the branch state.".to_string(),
-                summary: Some("insight".to_string()),
-                location: Some("insight/plan-1".to_string()),
-                body: None,
-            },
-            ContextSearchResult {
-                ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-                kind: ContextKind::RepoContextFile,
-                title: "Planning Overview".to_string(),
-                summary: Some("plan".to_string()),
-                location: Some(".codex/context/overview.md".to_string()),
-                body: None,
-            },
-        ],
-        &[],
-        Some("ctx:thread:thread-1"),
-        TogetherContextScope::LocalThread,
-    );
-
-    assert_eq!(rows.len(), 1);
     assert_eq!(
         rows.iter()
-            .map(|row| row.result.ref_id.as_str())
+            .map(|row| (
+                together_context_row_node_id(row).to_string(),
+                row.mount_reason
+            ))
             .collect::<Vec<_>>(),
-        vec!["ctx:thread-insight:thread-1:plan-1"]
+        vec![
+            (local_ref_id.to_string(), Some(ContextMountReason::Local),),
+            (
+                repo_ref_id.to_string(),
+                Some(ContextMountReason::RepoNeighbor),
+            ),
+        ]
     );
 }
 
 #[test]
-fn together_context_local_scope_is_empty_when_no_thread_artifacts_exist() {
-    let rows = together_context_tree_rows_for_scope(
-        vec![ContextSearchResult {
-            ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-            kind: ContextKind::RepoContextFile,
-            title: "Planning Overview".to_string(),
-            summary: Some("plan".to_string()),
-            location: Some(".codex/context/overview.md".to_string()),
-            body: None,
-        }],
-        &[],
-        Some("ctx:thread:thread-1"),
-        TogetherContextScope::LocalThread,
+fn together_context_local_scope_is_empty_when_anchor_missing() {
+    let response = rooted_context_query(
+        None,
+        None,
+        None,
+        vec![thread_context_node(
+            "ctx:thread-insight:thread-1:plan-1",
+            ThreadArtifactKind::Plan,
+            "Capture the branch state.",
+            Some("insight"),
+            Some("insight/plan-1"),
+            None,
+            "thread-1",
+        )],
+        Vec::new(),
     );
+
+    let rows = together_context_rows_for_scope(&response, TogetherContextScope::LocalThread);
 
     assert!(rows.is_empty());
 }
 
 #[test]
-fn together_context_global_scope_keeps_linked_repo_note_row() {
-    let rows = together_context_tree_rows_for_scope(
-        vec![
-            ContextSearchResult {
-                ref_id: "ctx:thread-insight:thread-1:plan-1".to_string(),
-                kind: ContextKind::ThreadInsight,
-                title: "Capture the branch state.".to_string(),
-                summary: Some("insight".to_string()),
-                location: Some("insight/plan-1".to_string()),
-                body: None,
-            },
-            ContextSearchResult {
-                ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-                kind: ContextKind::RepoContextFile,
-                title: "Planning Overview".to_string(),
-                summary: Some("plan".to_string()),
-                location: Some(".codex/context/overview.md".to_string()),
-                body: None,
-            },
-            ContextSearchResult {
-                ref_id: "ctx:thread:thread-1".to_string(),
-                kind: ContextKind::SharedThread,
-                title: "planning sync".to_string(),
-                summary: Some("thread".to_string()),
-                location: Some("thread/thread-1".to_string()),
-                body: None,
-            },
-        ],
-        &[
-            ContextGraphEdge {
-                from_ref_id: "ctx:thread:thread-1".to_string(),
-                to_ref_id: "ctx:thread-insight:thread-1:plan-1".to_string(),
-                label: "insight".to_string(),
-            },
-            ContextGraphEdge {
-                from_ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-                to_ref_id: "ctx:thread:thread-1".to_string(),
-                label: "source".to_string(),
-            },
-            ContextGraphEdge {
-                from_ref_id: "ctx:thread:thread-1".to_string(),
-                to_ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-                label: "branch".to_string(),
-            },
-        ],
-        Some("ctx:thread:thread-1"),
-        TogetherContextScope::Global,
+fn together_context_local_scope_is_empty_when_no_mounted_nodes_exist() {
+    let response = rooted_context_query(
+        Some("thread-1"),
+        None,
+        None,
+        vec![repo_context_node(
+            "ctx:file:.codex/context/overview.md",
+            RepoMemoryKind::Concept,
+            "Planning Overview",
+            Some("plan"),
+            ".codex/context/overview.md",
+            vec!["thread-1"],
+            (vec![], vec![]),
+        )],
+        Vec::new(),
     );
 
-    assert_eq!(rows.len(), 3);
-    assert_eq!(rows[1].result.ref_id, "ctx:thread-insight:thread-1:plan-1");
-    assert_eq!(rows[2].result.ref_id, "ctx:file:.codex/context/overview.md");
+    let rows = together_context_rows_for_scope(&response, TogetherContextScope::LocalThread);
+
+    assert!(rows.is_empty());
 }
 
 #[test]
-fn together_context_global_scope_orders_derived_repo_note_under_artifact() {
-    let rows = together_context_tree_rows_for_scope(
+fn together_context_global_scope_keeps_all_nodes_in_response_order() {
+    let anchor_id = context_anchor_id(Some("thread-1"));
+    let local_ref_id = "ctx:thread-insight:thread-1:plan-1";
+    let prior_ref_id = "ctx:thread-search:thread-0:search-1";
+    let repo_ref_id = "ctx:file:.codex/context/overview.md";
+    let response = rooted_context_query(
+        Some("thread-1"),
+        Some("thread-0"),
+        Some(ContextPrecursorKind::Fork),
         vec![
-            ContextSearchResult {
-                ref_id: "ctx:thread-insight:thread-1:plan-1".to_string(),
-                kind: ContextKind::ThreadInsight,
-                title: "Capture the branch state.".to_string(),
-                summary: Some("insight".to_string()),
-                location: Some("insight/plan-1".to_string()),
-                body: None,
-            },
-            ContextSearchResult {
-                ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-                kind: ContextKind::RepoContextFile,
-                title: "Planning Overview".to_string(),
-                summary: Some("plan".to_string()),
-                location: Some(".codex/context/overview.md".to_string()),
-                body: None,
-            },
-            ContextSearchResult {
-                ref_id: "ctx:thread:thread-1".to_string(),
-                kind: ContextKind::SharedThread,
-                title: "planning sync".to_string(),
-                summary: Some("thread".to_string()),
-                location: Some("thread/thread-1".to_string()),
-                body: None,
-            },
+            thread_context_node(
+                local_ref_id,
+                ThreadArtifactKind::Plan,
+                "Capture the branch state.",
+                Some("insight"),
+                Some("insight/plan-1"),
+                None,
+                "thread-1",
+            ),
+            thread_context_node(
+                prior_ref_id,
+                ThreadArtifactKind::Search,
+                "Search prior commits",
+                Some("search"),
+                Some("search/prior"),
+                None,
+                "thread-0",
+            ),
+            repo_context_node(
+                repo_ref_id,
+                RepoMemoryKind::Concept,
+                "Planning Overview",
+                Some("plan"),
+                ".codex/context/overview.md",
+                vec!["thread-1"],
+                (vec![], vec![]),
+            ),
         ],
-        &[
-            ContextGraphEdge {
-                from_ref_id: "ctx:thread:thread-1".to_string(),
-                to_ref_id: "ctx:thread-insight:thread-1:plan-1".to_string(),
-                label: "insight".to_string(),
-            },
-            ContextGraphEdge {
-                from_ref_id: "ctx:thread-insight:thread-1:plan-1".to_string(),
-                to_ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-                label: "derived".to_string(),
-            },
+        vec![
+            mounted_edge(&anchor_id, local_ref_id, ContextMountReason::Local),
+            mounted_edge(&anchor_id, repo_ref_id, ContextMountReason::RepoNeighbor),
         ],
-        Some("ctx:thread:thread-1"),
-        TogetherContextScope::Global,
     );
+
+    let rows = together_context_rows_for_scope(&response, TogetherContextScope::Global);
 
     assert_eq!(
         rows.iter()
-            .map(|row| row.result.ref_id.as_str())
+            .map(|row| (
+                together_context_row_node_id(row).to_string(),
+                row.mount_reason
+            ))
             .collect::<Vec<_>>(),
         vec![
-            "ctx:thread:thread-1",
-            "ctx:thread-insight:thread-1:plan-1",
-            "ctx:file:.codex/context/overview.md",
+            (local_ref_id.to_string(), Some(ContextMountReason::Local),),
+            (prior_ref_id.to_string(), None),
+            (
+                repo_ref_id.to_string(),
+                Some(ContextMountReason::RepoNeighbor),
+            ),
         ]
     );
 }
@@ -2286,23 +2325,30 @@ fn together_context_global_scope_orders_derived_repo_note_under_artifact() {
 #[tokio::test]
 async fn together_context_view_emits_selection_scope_and_handoff_events() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
-    chat.thread_id = Some(
-        ThreadId::from_string("019cf3a8-0cf0-7eb1-b748-738284242df8").expect("valid thread id"),
-    );
+    let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
+    chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
 
     chat.show_together_context_view(
         Some("planning".to_string()),
-        ContextGraphResponse {
-            nodes: vec![ContextSearchResult {
-                ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-                kind: ContextKind::RepoContextFile,
-                title: "Planning Overview".to_string(),
-                summary: Some("plan".to_string()),
-                location: Some(".codex/context/overview.md".to_string()),
-                body: Some("# Planning Overview".to_string()),
-            }],
-            edges: Vec::new(),
-        },
+        rooted_context_query(
+            Some(thread_id),
+            None,
+            None,
+            vec![repo_context_node(
+                "ctx:file:.codex/context/overview.md",
+                RepoMemoryKind::Concept,
+                "Planning Overview",
+                Some("plan"),
+                ".codex/context/overview.md",
+                vec![thread_id],
+                (vec![], vec![]),
+            )],
+            vec![mounted_edge(
+                &context_anchor_id(Some(thread_id)),
+                "ctx:file:.codex/context/overview.md",
+                ContextMountReason::RepoNeighbor,
+            )],
+        ),
         TogetherContextScope::Global,
     );
 
@@ -2328,30 +2374,42 @@ async fn together_context_view_emits_selection_scope_and_handoff_events() {
 #[tokio::test]
 async fn together_context_action_ref_ids_returns_all_selected_refs() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let thread_id = "thread-1";
+    let anchor_id = context_anchor_id(Some(thread_id));
+    let repo_ref_id = "ctx:file:.codex/context/overview.md";
+    let thread_ref_id = "ctx:thread-insight:thread-1:plan-1";
 
     chat.show_together_context_view(
         Some("planning".to_string()),
-        ContextGraphResponse {
-            nodes: vec![
-                ContextSearchResult {
-                    ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-                    kind: ContextKind::RepoContextFile,
-                    title: "Planning Overview".to_string(),
-                    summary: Some("plan".to_string()),
-                    location: Some(".codex/context/overview.md".to_string()),
-                    body: Some("# Planning Overview".to_string()),
-                },
-                ContextSearchResult {
-                    ref_id: "ctx:thread:thread-1".to_string(),
-                    kind: ContextKind::SharedThread,
-                    title: "planning sync".to_string(),
-                    summary: Some("owner=owner@example.com".to_string()),
-                    location: Some("thread/thread-1".to_string()),
-                    body: Some("Thread: thread-1".to_string()),
-                },
+        rooted_context_query(
+            Some(thread_id),
+            None,
+            None,
+            vec![
+                repo_context_node(
+                    repo_ref_id,
+                    RepoMemoryKind::Concept,
+                    "Planning Overview",
+                    Some("plan"),
+                    ".codex/context/overview.md",
+                    vec![thread_id],
+                    (vec![], vec![]),
+                ),
+                thread_context_node(
+                    thread_ref_id,
+                    ThreadArtifactKind::Plan,
+                    "planning sync",
+                    Some("owner=owner@example.com"),
+                    Some("insight/plan-1"),
+                    Some("Thread: thread-1"),
+                    thread_id,
+                ),
             ],
-            edges: Vec::new(),
-        },
+            vec![
+                mounted_edge(&anchor_id, repo_ref_id, ContextMountReason::RepoNeighbor),
+                mounted_edge(&anchor_id, thread_ref_id, ContextMountReason::Local),
+            ],
+        ),
         TogetherContextScope::Global,
     );
 
@@ -2362,53 +2420,66 @@ async fn together_context_action_ref_ids_returns_all_selected_refs() {
     selected_ref_ids.sort();
     assert_eq!(
         selected_ref_ids,
-        vec![
-            "ctx:file:.codex/context/overview.md".to_string(),
-            "ctx:thread:thread-1".to_string(),
-        ]
+        vec![repo_ref_id.to_string(), thread_ref_id.to_string()]
     );
 }
 
 #[tokio::test]
-async fn together_context_source_thread_id_prefers_selected_shared_thread() {
+async fn together_context_source_thread_id_prefers_current_anchor_thread() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let current_thread_id = "thread-1";
+    let prior_thread_id = "thread-0";
+    let anchor_id = context_anchor_id(Some(current_thread_id));
+    let thread_ref_id = "ctx:thread-insight:thread-0:plan-1";
 
     chat.show_together_context_view(
         Some("planning".to_string()),
-        ContextGraphResponse {
-            nodes: vec![
-                ContextSearchResult {
-                    ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-                    kind: ContextKind::RepoContextFile,
-                    title: "Planning Overview".to_string(),
-                    summary: Some("plan".to_string()),
-                    location: Some(".codex/context/overview.md".to_string()),
-                    body: Some("# Planning Overview".to_string()),
-                },
-                ContextSearchResult {
-                    ref_id: "ctx:thread:thread-1".to_string(),
-                    kind: ContextKind::SharedThread,
-                    title: "planning sync".to_string(),
-                    summary: Some("owner=owner@example.com".to_string()),
-                    location: Some("thread/thread-1".to_string()),
-                    body: Some("Thread: thread-1".to_string()),
-                },
+        rooted_context_query(
+            Some(current_thread_id),
+            Some(prior_thread_id),
+            Some(ContextPrecursorKind::Handoff),
+            vec![
+                repo_context_node(
+                    "ctx:file:.codex/context/overview.md",
+                    RepoMemoryKind::Concept,
+                    "Planning Overview",
+                    Some("plan"),
+                    ".codex/context/overview.md",
+                    vec![current_thread_id],
+                    (vec![], vec![]),
+                ),
+                thread_context_node(
+                    thread_ref_id,
+                    ThreadArtifactKind::Plan,
+                    "planning sync",
+                    Some("owner=owner@example.com"),
+                    Some("insight/plan-1"),
+                    Some("Thread: thread-0"),
+                    prior_thread_id,
+                ),
             ],
-            edges: Vec::new(),
-        },
+            vec![
+                mounted_edge(
+                    &anchor_id,
+                    "ctx:file:.codex/context/overview.md",
+                    ContextMountReason::RepoNeighbor,
+                ),
+                mounted_edge(&anchor_id, thread_ref_id, ContextMountReason::HandoffSeed),
+            ],
+        ),
         TogetherContextScope::Global,
     );
 
     assert_eq!(
         chat.together_context_source_thread_id(1).as_deref(),
-        Some("thread-1")
+        Some(current_thread_id)
     );
 
     chat.toggle_together_context_selection(1);
 
     assert_eq!(
         chat.together_context_source_thread_id(0).as_deref(),
-        Some("thread-1")
+        Some(current_thread_id)
     );
 }
 

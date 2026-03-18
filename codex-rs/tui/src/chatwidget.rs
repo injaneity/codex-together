@@ -8544,6 +8544,7 @@ impl ChatWidget {
         let header = together_context_header(mode, query, handoff_goal, target_display_name);
         let footer_hint = Some(together_context_commands_line(mode));
         let footer_right = Some(together_context_legend_line());
+        let show_preview = matches!(mode, TogetherContextViewMode::Handoff);
         let items = if rows.is_empty() {
             vec![together_context_empty_state_item(has_thread_context)]
         } else {
@@ -8584,7 +8585,8 @@ impl ChatWidget {
                         selected_name_prefix_spans: Vec::new(),
                         category_tag: together_context_is_hotspot(&row.node)
                             .then_some("*".to_string()),
-                        row_style: is_marked.then_some(Style::default().bg(Color::Cyan)),
+                        row_style: is_marked
+                            .then_some(Style::default().fg(Color::Black).bg(Color::Cyan)),
                         description,
                         selected_description: None,
                         search_value: Some(search_value),
@@ -8618,9 +8620,24 @@ impl ChatWidget {
             selected_row_style: Some(Style::default().bg(Color::DarkGray)),
             header: Box::new(header),
             initial_selected_idx,
-            side_content: Box::new(()),
-            side_content_width: SideContentWidth::Fixed(0),
-            side_content_min_width: 0,
+            side_content: if show_preview {
+                Box::new(TogetherContextPreviewRenderable {
+                    state: state.clone(),
+                })
+            } else {
+                Box::new(())
+            },
+            side_content_width: if show_preview {
+                SideContentWidth::Fixed(38)
+            } else {
+                SideContentWidth::Fixed(0)
+            },
+            side_content_min_width: if show_preview { 30 } else { 0 },
+            stacked_side_content: show_preview.then(|| {
+                Box::new(TogetherContextPreviewRenderable {
+                    state: state.clone(),
+                }) as Box<dyn Renderable>
+            }),
             on_selection_changed: Some(Box::new(move |idx, _tx| {
                 if let Ok(mut state) = state.lock() {
                     state.selected_actual_idx = idx;
@@ -8966,6 +8983,34 @@ impl Default for TogetherContextViewState {
 }
 
 #[derive(Debug, Clone)]
+struct TogetherContextPreviewRenderable {
+    state: Arc<Mutex<TogetherContextViewState>>,
+}
+
+impl Renderable for TogetherContextPreviewRenderable {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        if area.is_empty() {
+            return;
+        }
+        let state = lock_together_context_view_state(&self.state).clone();
+        Paragraph::new(together_context_preview_lines(&state))
+            .wrap(Wrap { trim: false })
+            .render(area, buf);
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        if width == 0 {
+            return 0;
+        }
+        let state = lock_together_context_view_state(&self.state).clone();
+        Paragraph::new(together_context_preview_lines(&state))
+            .wrap(Wrap { trim: false })
+            .line_count(width)
+            .min(usize::from(u16::MAX)) as u16
+    }
+}
+
+#[derive(Debug, Clone)]
 struct TogetherContextTreeRow {
     node: ContextQueryNode,
     mount_reason: Option<ContextMountReason>,
@@ -9079,6 +9124,104 @@ fn together_context_legend_line() -> Line<'static> {
         "*".red(),
         " hotspot".dim(),
     ])
+}
+
+fn together_context_preview_lines(state: &TogetherContextViewState) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from("Overview".bold()), Line::default()];
+    let Some(row) = state.rows.get(state.selected_actual_idx) else {
+        lines.push(Line::from("Move through the tree to inspect a node.".dim()));
+        return lines;
+    };
+
+    let mut title_spans = vec![
+        together_context_marker_text(&row.node).dim(),
+        " ".into(),
+        Span::styled(
+            format!("[{}] ", together_context_tag_label(&row.node)),
+            together_context_tag_style(&row.node),
+        ),
+        together_context_display_name(row).into(),
+    ];
+    if together_context_is_hotspot(&row.node) {
+        title_spans.extend([" ".into(), "*".red()]);
+    }
+    lines.push(Line::from(title_spans));
+
+    if state
+        .selected_ref_ids
+        .contains(together_context_row_node_id(row))
+    {
+        lines.push(Line::from("Selected for handoff".cyan()));
+    }
+
+    if let Some(description) = together_context_row_description(row, &state.query_response.anchor) {
+        lines.push(Line::from(description.dim()));
+    }
+
+    if let Some(location) = together_context_node_location(&row.node) {
+        lines.push(Line::from(vec![
+            "Path: ".dim(),
+            location.to_string().into(),
+        ]));
+    }
+
+    match &row.node {
+        ContextQueryNode::Thread(node) => {
+            if !(node.source_files.is_empty()
+                || node.source_files.len() == 1
+                    && node.location.as_deref() == node.source_files.first().map(String::as_str))
+            {
+                lines.push(Line::from(vec![
+                    "Files: ".dim(),
+                    together_context_preview_list_text(&node.source_files).into(),
+                ]));
+            }
+        }
+        ContextQueryNode::Repo(node) => {
+            if !node.source_files.is_empty() {
+                lines.push(Line::from(vec![
+                    "Files: ".dim(),
+                    together_context_preview_list_text(&node.source_files).into(),
+                ]));
+            }
+            if !node.source_threads.is_empty() {
+                let threads = node
+                    .source_threads
+                    .iter()
+                    .map(|thread_id| together_context_short_hash(thread_id))
+                    .collect::<Vec<_>>();
+                lines.push(Line::from(vec![
+                    "Threads: ".dim(),
+                    together_context_preview_list_text(&threads).into(),
+                ]));
+            }
+        }
+    }
+
+    let detail = match &row.node {
+        ContextQueryNode::Thread(node) => node.body.as_deref().or(node.summary.as_deref()),
+        ContextQueryNode::Repo(node) => node.summary.as_deref(),
+    }
+    .map(str::trim)
+    .filter(|detail| !detail.is_empty());
+
+    if let Some(detail) = detail {
+        lines.push(Line::default());
+        lines.push(Line::from("Details".dim()));
+        lines.extend(detail.lines().map(|line| Line::from(line.to_string())));
+    }
+
+    lines
+}
+
+fn together_context_preview_list_text(values: &[String]) -> String {
+    const MAX_ITEMS: usize = 3;
+
+    let mut visible = values.iter().take(MAX_ITEMS).cloned().collect::<Vec<_>>();
+    if values.len() > visible.len() {
+        visible.push(format!("and {} more", values.len() - visible.len()));
+    }
+    visible.join(", ")
 }
 
 fn together_context_rows_for_scope(

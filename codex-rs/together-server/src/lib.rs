@@ -68,6 +68,7 @@ use codex_together_protocol::ContextGraphEdge;
 use codex_together_protocol::ContextGraphParams;
 use codex_together_protocol::ContextGraphResponse;
 use codex_together_protocol::ContextKind;
+use codex_together_protocol::ContextPrecursorKind;
 use codex_together_protocol::ContextPreviewParams;
 use codex_together_protocol::ContextPreviewResponse;
 use codex_together_protocol::ContextQueryParams;
@@ -173,6 +174,7 @@ struct ServerState {
     hosted: Option<HostedServer>,
     handoff_plans: HashMap<String, PendingHandoffPlan>,
     context_write_plans: HashMap<String, PendingContextWritePlan>,
+    thread_context_mounts: HashMap<String, ThreadContextMount>,
     connections: HashMap<Uuid, ConnectionEntry>,
 }
 
@@ -184,7 +186,17 @@ struct ConnectionEntry {
 #[derive(Debug, Clone)]
 struct PendingHandoffPlan {
     source_thread_id: String,
+    goal: Option<String>,
+    selected_ref_ids: Vec<String>,
     promotion_files: Vec<PendingContextWriteFile>,
+}
+
+#[derive(Debug, Clone)]
+struct ThreadContextMount {
+    precursor_thread_id: String,
+    precursor_kind: ContextPrecursorKind,
+    goal: Option<String>,
+    seed_ref_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -264,6 +276,7 @@ pub async fn run_main(listen: &str) -> Result<()> {
             hosted: None,
             handoff_plans: HashMap::new(),
             context_write_plans: HashMap::new(),
+            thread_context_mounts: HashMap::new(),
             connections: HashMap::new(),
         })),
         app_server: Arc::new(Mutex::new(app_server)),
@@ -739,9 +752,20 @@ async fn context_query(
         Err(_) => return rpc_error(req.id, -32602, "invalid params"),
     };
 
-    let documents = context_documents(state, context_focus_thread_ids_for_query(&payload)).await;
-    JsonRpcResponse::ok(req.id, shared_build_context_query(documents, &payload))
-        .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
+    let effective_payload = {
+        let guard = state.inner.lock().await;
+        apply_thread_context_mount_to_query_params(&payload, &guard.thread_context_mounts)
+    };
+    let documents = context_documents(
+        state,
+        context_focus_thread_ids_for_query(&effective_payload),
+    )
+    .await;
+    JsonRpcResponse::ok(
+        req.id,
+        shared_build_context_query(documents, &effective_payload),
+    )
+    .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
 }
 
 async fn context_preview(
@@ -859,22 +883,23 @@ async fn thread_read(
         Ok(p) => p,
         Err(_) => return rpc_error(req.id, -32602, "invalid params"),
     };
+    let thread_id = payload.thread_id.clone();
 
     let thread = {
         let mut bridge = state.app_server.lock().await;
-        match bridge.thread_read(payload.thread_id, false).await {
+        match bridge.thread_read(thread_id.clone(), false).await {
             Ok(response) => response.thread,
             Err(err) => return app_server_error_response(req.id, err),
         }
     };
 
-    JsonRpcResponse::ok(
-        req.id,
-        ThreadReadResponse {
-            thread: thread_summary_from_app_thread(thread),
-        },
-    )
-    .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
+    let thread = {
+        let guard = state.inner.lock().await;
+        thread_summary_from_app_thread(thread, guard.thread_context_mounts.get(&thread_id))
+    };
+
+    JsonRpcResponse::ok(req.id, ThreadReadResponse { thread })
+        .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
 }
 
 async fn thread_list(
@@ -899,24 +924,31 @@ async fn thread_list(
     };
 
     let repo_root_filter = payload.repo_root.as_deref().map(Path::new);
-    let data = response
-        .data
-        .into_iter()
-        .filter_map(|thread| {
-            let summary = thread_summary_from_app_thread(thread);
-            if repo_root_filter.is_some_and(|expected_repo_root| {
-                summary
-                    .repo_root
-                    .as_deref()
-                    .map(Path::new)
-                    .filter(|actual_repo_root| *actual_repo_root == expected_repo_root)
-                    .is_none()
-            }) {
-                return None;
-            }
-            Some(summary)
-        })
-        .collect();
+    let data = {
+        let guard = state.inner.lock().await;
+        response
+            .data
+            .into_iter()
+            .filter_map(|thread| {
+                let thread_id = thread.id.clone();
+                let summary = thread_summary_from_app_thread(
+                    thread,
+                    guard.thread_context_mounts.get(&thread_id),
+                );
+                if repo_root_filter.is_some_and(|expected_repo_root| {
+                    summary
+                        .repo_root
+                        .as_deref()
+                        .map(Path::new)
+                        .filter(|actual_repo_root| *actual_repo_root == expected_repo_root)
+                        .is_none()
+                }) {
+                    return None;
+                }
+                Some(summary)
+            })
+            .collect()
+    };
 
     JsonRpcResponse::ok(
         req.id,
@@ -1097,8 +1129,13 @@ async fn handoff_plan(
         }
     };
 
-    let selected_ref_ids =
-        recommended_handoff_ref_ids(&documents, &source_thread_id, &payload.selected_ref_ids);
+    let goal = payload.goal.filter(|value| !value.trim().is_empty());
+    let selected_ref_ids = recommended_handoff_ref_ids(
+        &documents,
+        &source_thread_id,
+        &payload.selected_ref_ids,
+        goal.as_deref(),
+    );
     let mut kept_entries = vec![source_entry];
     kept_entries.extend(selected_context_entries(&documents, &selected_ref_ids));
     dedupe_context_entries(&mut kept_entries);
@@ -1113,7 +1150,6 @@ async fn handoff_plan(
     } else {
         Default::default()
     };
-    let goal = payload.goal.filter(|value| !value.trim().is_empty());
 
     if !payload.preview_only {
         let promotion_files = plan_handoff_promotion_files(&documents, &selected_ref_ids).await;
@@ -1122,6 +1158,8 @@ async fn handoff_plan(
             plan_id.clone(),
             PendingHandoffPlan {
                 source_thread_id: source_thread_id.clone(),
+                goal: goal.clone(),
+                selected_ref_ids: selected_ref_ids.clone(),
                 promotion_files,
             },
         );
@@ -1191,6 +1229,15 @@ async fn handoff_commit(state: &AppState, req: JsonRpcRequest) -> JsonRpcRespons
 
     {
         let mut guard = state.inner.lock().await;
+        guard.thread_context_mounts.insert(
+            started.thread.id.clone(),
+            ThreadContextMount {
+                precursor_thread_id: pending.source_thread_id.clone(),
+                precursor_kind: ContextPrecursorKind::Handoff,
+                goal: pending.goal.clone(),
+                seed_ref_ids: pending.selected_ref_ids.clone(),
+            },
+        );
         guard.handoff_plans.remove(&payload.plan_id);
     }
 
@@ -2764,11 +2811,16 @@ fn recommended_handoff_ref_ids(
     documents: &[ContextDocument],
     source_thread_id: &str,
     selected_ref_ids: &[String],
+    goal: Option<&str>,
 ) -> Vec<String> {
     const HANDOFF_RECOMMENDATION_LIMIT: usize = 4;
 
     let all_edges = context_graph_edges(documents);
     let coverage = persisted_context_coverage(documents);
+    let goal_query = goal
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
     let available_ref_ids = documents
         .iter()
         .map(|document| document.ref_id.clone())
@@ -2804,16 +2856,20 @@ fn recommended_handoff_ref_ids(
         .filter(|document| !context_document_is_persisted(document, &coverage))
         .collect::<Vec<_>>();
     recommended_documents.sort_by(|left, right| {
-        hotspot_scores
-            .get(&right.ref_id)
-            .copied()
-            .unwrap_or_default()
-            .cmp(
-                &hotspot_scores
-                    .get(&left.ref_id)
+        handoff_goal_match_score(right, goal_query.as_deref())
+            .cmp(&handoff_goal_match_score(left, goal_query.as_deref()))
+            .then_with(|| {
+                hotspot_scores
+                    .get(&right.ref_id)
                     .copied()
-                    .unwrap_or_default(),
-            )
+                    .unwrap_or_default()
+                    .cmp(
+                        &hotspot_scores
+                            .get(&left.ref_id)
+                            .copied()
+                            .unwrap_or_default(),
+                    )
+            })
             .then_with(|| context_default_sort_key(left).cmp(&context_default_sort_key(right)))
     });
 
@@ -2855,6 +2911,37 @@ fn recommended_handoff_ref_ids(
     }
 
     deduped_selected_ref_ids
+}
+
+fn handoff_goal_match_score(document: &ContextDocument, goal_query: Option<&str>) -> usize {
+    let Some(goal_query) = goal_query else {
+        return 0;
+    };
+    let tokens = goal_query.split_whitespace().collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return 0;
+    }
+
+    let mut haystack = vec![document.title.to_ascii_lowercase()];
+    if let Some(summary) = &document.summary {
+        haystack.push(summary.to_ascii_lowercase());
+    }
+    if let Some(location) = &document.location {
+        haystack.push(location.to_ascii_lowercase());
+    }
+    if let Some(body) = &document.body {
+        haystack.push(body.to_ascii_lowercase());
+    }
+    let joined = haystack.join("\n");
+    let token_matches = tokens
+        .iter()
+        .filter(|token| joined.contains(**token))
+        .count();
+    if token_matches == 0 {
+        return 0;
+    }
+    let exact_match_bonus = usize::from(joined.contains(goal_query)) * 10;
+    exact_match_bonus + token_matches
 }
 
 fn handoff_promotion_ref_ids(
@@ -2994,7 +3081,46 @@ async fn source_thread_cwd(
     Ok(thread_read.thread.cwd.display().to_string())
 }
 
-fn thread_summary_from_app_thread(thread: AppThread) -> ThreadSummary {
+fn apply_thread_context_mount_to_query_params(
+    payload: &ContextQueryParams,
+    thread_context_mounts: &HashMap<String, ThreadContextMount>,
+) -> ContextQueryParams {
+    let Some(current_thread_id) = payload.current_thread_id.as_deref() else {
+        return payload.clone();
+    };
+    let Some(mount) = thread_context_mounts.get(current_thread_id) else {
+        return payload.clone();
+    };
+
+    let mut effective_payload = payload.clone();
+    if effective_payload.precursor_thread_id.is_none() {
+        effective_payload.precursor_thread_id = Some(mount.precursor_thread_id.clone());
+    }
+    if effective_payload.precursor_kind.is_none() {
+        effective_payload.precursor_kind = Some(mount.precursor_kind);
+    }
+    if effective_payload.goal.is_none() {
+        effective_payload.goal = mount.goal.clone();
+    }
+    let mut seen = effective_payload
+        .seed_ref_ids
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    effective_payload.seed_ref_ids.extend(
+        mount
+            .seed_ref_ids
+            .iter()
+            .filter(|ref_id| seen.insert((*ref_id).clone()))
+            .cloned(),
+    );
+    effective_payload
+}
+
+fn thread_summary_from_app_thread(
+    thread: AppThread,
+    thread_context_mount: Option<&ThreadContextMount>,
+) -> ThreadSummary {
     let repo_root = get_git_repo_root(&thread.cwd).unwrap_or_else(|| thread.cwd.clone());
     ThreadSummary {
         thread_id: thread.id,
@@ -3004,9 +3130,9 @@ fn thread_summary_from_app_thread(thread: AppThread) -> ThreadSummary {
         repo_root: Some(repo_root.display().to_string()),
         cwd: Some(thread.cwd.display().to_string()),
         git_branch: thread.git_info.and_then(|git_info| git_info.branch),
-        goal: None,
-        precursor_thread_id: None,
-        precursor_kind: None,
+        goal: thread_context_mount.and_then(|mount| mount.goal.clone()),
+        precursor_thread_id: thread_context_mount.map(|mount| mount.precursor_thread_id.clone()),
+        precursor_kind: thread_context_mount.map(|mount| mount.precursor_kind),
         updated_at: Some(thread.updated_at),
     }
 }
@@ -3861,6 +3987,8 @@ fn is_pid_running(_pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::MemoryPromotePlan;
+    use super::ThreadContextMount;
+    use super::apply_thread_context_mount_to_query_params;
     use super::build_context_graph;
     use super::context_focus_thread_ids_for_query;
     use super::context_graph_artifact_paths;
@@ -3896,6 +4024,7 @@ mod tests {
     use codex_together_protocol::ContextQueryParams;
     use codex_together_protocol::ContextThreadNode;
     use codex_together_protocol::ThreadArtifactKind;
+    use std::collections::HashMap;
     use std::path::Path;
     use std::path::PathBuf;
 
@@ -4262,6 +4391,7 @@ mod tests {
             &documents,
             "thread-1",
             &["ctx:file:.codex/context/overview.md".to_string()],
+            None,
         );
 
         assert_eq!(
@@ -4480,7 +4610,7 @@ mod tests {
         let mut thread = sample_thread("thread-1", Some("planning sync"), Some("main"));
         thread.name = Some("Context thread".to_string());
 
-        let summary = thread_summary_from_app_thread(thread);
+        let summary = thread_summary_from_app_thread(thread, None);
 
         assert_eq!(summary.thread_id, "thread-1".to_string());
         assert_eq!(summary.actor_id, Some("lobster-worker".to_string()));
@@ -4493,6 +4623,77 @@ mod tests {
         assert_eq!(summary.precursor_thread_id, None);
         assert_eq!(summary.precursor_kind, None);
         assert_eq!(summary.updated_at, Some(1_741_422_760));
+    }
+
+    #[test]
+    fn thread_summary_from_app_thread_includes_handoff_metadata() {
+        let thread = sample_thread("thread-2", Some("handoff target"), Some("main"));
+        let summary = thread_summary_from_app_thread(
+            thread,
+            Some(&ThreadContextMount {
+                precursor_thread_id: "thread-1".to_string(),
+                precursor_kind: ContextPrecursorKind::Handoff,
+                goal: Some("Investigate the mounted context.".to_string()),
+                seed_ref_ids: vec!["ctx:thread-insight:thread-1:plan-1".to_string()],
+            }),
+        );
+
+        assert_eq!(
+            summary.goal,
+            Some("Investigate the mounted context.".to_string())
+        );
+        assert_eq!(summary.precursor_thread_id, Some("thread-1".to_string()));
+        assert_eq!(summary.precursor_kind, Some(ContextPrecursorKind::Handoff));
+    }
+
+    #[test]
+    fn apply_thread_context_mount_to_query_params_merges_handoff_seed_refs() {
+        let payload = ContextQueryParams {
+            current_thread_id: Some("thread-current".to_string()),
+            precursor_thread_id: None,
+            precursor_kind: None,
+            actor_id: None,
+            repo_root: None,
+            git_branch: None,
+            goal: None,
+            query: Some("handoff".to_string()),
+            seed_ref_ids: vec!["ctx:thread-insight:thread-current:plan-1".to_string()],
+            limit: None,
+        };
+        let merged = apply_thread_context_mount_to_query_params(
+            &payload,
+            &HashMap::from([(
+                "thread-current".to_string(),
+                ThreadContextMount {
+                    precursor_thread_id: "thread-prev".to_string(),
+                    precursor_kind: ContextPrecursorKind::Handoff,
+                    goal: Some("Follow up on the previous thread.".to_string()),
+                    seed_ref_ids: vec![
+                        "ctx:thread-insight:thread-prev:plan-1".to_string(),
+                        "ctx:thread-insight:thread-current:plan-1".to_string(),
+                    ],
+                },
+            )]),
+        );
+
+        assert_eq!(
+            merged,
+            ContextQueryParams {
+                current_thread_id: Some("thread-current".to_string()),
+                precursor_thread_id: Some("thread-prev".to_string()),
+                precursor_kind: Some(ContextPrecursorKind::Handoff),
+                actor_id: None,
+                repo_root: None,
+                git_branch: None,
+                goal: Some("Follow up on the previous thread.".to_string()),
+                query: Some("handoff".to_string()),
+                seed_ref_ids: vec![
+                    "ctx:thread-insight:thread-current:plan-1".to_string(),
+                    "ctx:thread-insight:thread-prev:plan-1".to_string(),
+                ],
+                limit: None,
+            }
+        );
     }
 
     #[test]

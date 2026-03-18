@@ -9043,7 +9043,12 @@ fn together_context_origin_thread_label(
 fn together_context_kind_label(node: &ContextQueryNode) -> &'static str {
     match node {
         ContextQueryNode::Thread(node) => match node.artifact_kind {
-            codex_together_protocol::ThreadArtifactKind::Plan => "plan",
+            codex_together_protocol::ThreadArtifactKind::Plan => node
+                .summary
+                .as_deref()
+                .filter(|summary| summary.contains("retained plan output"))
+                .map(|_| "plan")
+                .unwrap_or("insight"),
             codex_together_protocol::ThreadArtifactKind::FileRead => "read",
             codex_together_protocol::ThreadArtifactKind::FileChange => "change",
             codex_together_protocol::ThreadArtifactKind::Search => "search",

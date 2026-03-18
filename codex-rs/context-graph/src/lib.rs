@@ -2195,6 +2195,91 @@ fn thread_artifact_documents(thread: &Thread, repo_root: Option<&Path>) -> Vec<C
         }
     }
 
+    if documents_by_ref_id.is_empty()
+        && let Some((id, body, summary)) = thread.turns.iter().rev().find_map(|turn| {
+            turn.items.iter().rev().find_map(|item| match item {
+                ThreadItem::AgentMessage { id, text, .. } => {
+                    non_empty_string(text.clone()).map(|body| {
+                        (
+                            id.clone(),
+                            body,
+                            "thread insight · recent assistant output".to_string(),
+                        )
+                    })
+                }
+                ThreadItem::UserMessage { id, content } => {
+                    let body = content
+                        .iter()
+                        .filter_map(|input| match input {
+                            codex_app_server_protocol::UserInput::Text { text, .. } => {
+                                non_empty_string(text.clone())
+                            }
+                            codex_app_server_protocol::UserInput::Image { .. }
+                            | codex_app_server_protocol::UserInput::LocalImage { .. }
+                            | codex_app_server_protocol::UserInput::Skill { .. }
+                            | codex_app_server_protocol::UserInput::Mention { .. } => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    non_empty_string(body).map(|body| {
+                        (
+                            id.clone(),
+                            body,
+                            "thread insight · recent user message".to_string(),
+                        )
+                    })
+                }
+                ThreadItem::Plan { .. }
+                | ThreadItem::Reasoning { .. }
+                | ThreadItem::CommandExecution { .. }
+                | ThreadItem::FileChange { .. }
+                | ThreadItem::McpToolCall { .. }
+                | ThreadItem::DynamicToolCall { .. }
+                | ThreadItem::ImageView { .. }
+                | ThreadItem::WebSearch { .. }
+                | ThreadItem::ContextGraphQuery { .. }
+                | ThreadItem::CollabAgentToolCall { .. }
+                | ThreadItem::EnteredReviewMode { .. }
+                | ThreadItem::ExitedReviewMode { .. }
+                | ThreadItem::ContextCompaction { .. } => None,
+            })
+        })
+    {
+        let title = body
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(|line| single_line_excerpt(line, 80))
+            .unwrap_or_else(|| "Recent thread insight".to_string());
+        let location = Some(format!("message/{id}"));
+        let body = Some(truncate_context_body(body.as_str()));
+        let search_text = format!(
+            "{}\n{}\n{}\n{}",
+            title,
+            summary,
+            location.clone().unwrap_or_default(),
+            body.clone().unwrap_or_default()
+        )
+        .to_ascii_lowercase();
+        documents_by_ref_id.insert(
+            format!("ctx:thread-insight:{}:{id}", thread.id),
+            ContextDocument {
+                ref_id: format!("ctx:thread-insight:{}:{id}", thread.id),
+                kind: ContextKind::ThreadInsight,
+                title,
+                summary: Some(summary),
+                location,
+                body,
+                search_text,
+                graph: ContextDocumentGraphMetadata {
+                    branches: branches.clone(),
+                    source_threads: vec![thread.id.clone()],
+                    ..ContextDocumentGraphMetadata::default()
+                },
+            },
+        );
+    }
+
     let mut documents = documents_by_ref_id.into_values().collect::<Vec<_>>();
     documents.sort_by_key(context_default_sort_key);
     documents
@@ -2498,6 +2583,55 @@ mod tests {
                 && document.title == "Context graph: context graph"
                 && document.graph.source_refs == vec!["ctx:file:.codex/context/a.md".to_string()]
         }));
+    }
+
+    #[test]
+    fn thread_context_documents_synthesize_recent_message_insight_without_artifacts() {
+        let documents = thread_context_documents(
+            &sample_thread(vec![
+                ThreadItem::UserMessage {
+                    id: "user-1".to_string(),
+                    content: vec![codex_app_server_protocol::UserInput::Text {
+                        text: "Inspect /context behavior".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                },
+                ThreadItem::AgentMessage {
+                    id: "assistant-1".to_string(),
+                    text: "Explained why /context looked empty after a prose-only turn."
+                        .to_string(),
+                    phase: None,
+                },
+            ]),
+            true,
+            Some(Path::new("/repo")),
+        );
+
+        assert!(
+            documents
+                .iter()
+                .any(|document| document.kind == ContextKind::SharedThread)
+        );
+        assert_eq!(
+            documents
+                .into_iter()
+                .find(|document| document.kind == ContextKind::ThreadInsight),
+            Some(ContextDocument {
+                ref_id: "ctx:thread-insight:thread-1:assistant-1".to_string(),
+                kind: ContextKind::ThreadInsight,
+                title: "Explained why /context looked empty after a prose-only turn.".to_string(),
+                summary: Some("thread insight · recent assistant output".to_string()),
+                location: Some("message/assistant-1".to_string()),
+                body: Some("Explained why /context looked empty after a prose-only turn.".to_string()),
+                search_text: "explained why /context looked empty after a prose-only turn.\nthread insight · recent assistant output\nmessage/assistant-1\nexplained why /context looked empty after a prose-only turn.".to_string(),
+                graph: ContextDocumentGraphMetadata {
+                    branches: vec!["main".to_string()],
+                    source_threads: vec!["thread-1".to_string()],
+                    source_files: Vec::new(),
+                    source_refs: Vec::new(),
+                },
+            })
+        );
     }
 
     #[test]

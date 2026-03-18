@@ -2059,6 +2059,49 @@ async fn together_context_global_view_snapshot() {
 }
 
 #[tokio::test]
+async fn together_context_message_insight_snapshot() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
+    chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
+
+    let anchor_id = context_anchor_id(Some(thread_id));
+    let insight_ref_id = format!("ctx:thread-insight:{thread_id}:assistant-1");
+
+    chat.show_together_context_view(
+        None,
+        rooted_context_query(
+            Some(thread_id),
+            None,
+            None,
+            vec![thread_context_node(
+                &insight_ref_id,
+                ThreadArtifactKind::Plan,
+                "Explained why /context looked empty after a prose-only turn.",
+                Some("thread insight · recent assistant output"),
+                Some("message/assistant-1"),
+                Some("Explained why /context looked empty after a prose-only turn."),
+                thread_id,
+            )],
+            vec![mounted_edge(
+                &anchor_id,
+                &insight_ref_id,
+                ContextMountReason::Local,
+            )],
+        ),
+        TogetherContextScope::LocalThread,
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw context view");
+    assert_snapshot!("together_context_message_insight", terminal.backend());
+}
+
+#[tokio::test]
 async fn together_context_local_view_without_anchor_snapshot() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;

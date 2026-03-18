@@ -17,10 +17,8 @@ use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_together_protocol::ContextGraphResponse;
-use codex_together_protocol::ContextRef;
 use codex_together_protocol::ContextResolveBundleResponse;
 use codex_together_protocol::ContextSearchResult;
-use codex_together_protocol::HandoffPlanResponse;
 use codex_utils_approval_presets::ApprovalPreset;
 
 use crate::bottom_pane::ApprovalRequest;
@@ -443,46 +441,21 @@ pub(crate) enum AppEvent {
         query: Option<String>,
         graph: ContextGraphResponse,
         scope: crate::chatwidget::TogetherContextScope,
+        selected_ref_ids: Vec<String>,
+        handoff_goal: Option<String>,
     },
 
-    /// Toggle whether the selected collaboration context row is marked.
-    ToggleTogetherContextMark {
+    /// Toggle whether the selected collaboration context row is selected.
+    ToggleTogetherContextSelection {
         actual_idx: usize,
     },
 
     /// Toggle between local-thread and global collaboration context scopes.
     ToggleTogetherContextScope,
 
-    /// Attach the current or marked collaboration context rows into the composer.
-    AttachTogetherContextSelection {
-        actual_idx: usize,
-    },
-
-    /// Plan a fresh-thread handoff from the current or marked context rows.
+    /// Plan and commit a fresh-thread handoff from the selected context rows.
     PlanTogetherContextHandoff {
         actual_idx: usize,
-    },
-
-    /// Plan durable repo context writes from the current or marked context rows.
-    PlanTogetherContextWrite {
-        actual_idx: usize,
-    },
-
-    /// Open the handoff review popup for a planned fresh-thread handoff.
-    OpenTogetherHandoffReview {
-        plan: HandoffPlanResponse,
-    },
-
-    /// Commit a previously planned handoff and open the new writable thread.
-    CommitTogetherHandoff {
-        plan_id: String,
-        draft_text: String,
-        context_refs: Vec<ContextRef>,
-    },
-
-    /// Commit a previously planned repo-context write.
-    CommitTogetherContextWrite {
-        plan_id: String,
     },
 
     /// Submit a user message with an explicit collaboration mask.

@@ -161,6 +161,7 @@ struct ConnectionEntry {
 #[derive(Debug, Clone)]
 struct PendingHandoffPlan {
     source_thread_id: String,
+    promotion_files: Vec<PendingContextWriteFile>,
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +192,13 @@ struct RepoContextMetadata {
     source_threads: Vec<String>,
     source_files: Vec<String>,
     source_refs: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct PersistedContextCoverage {
+    source_thread_ids: HashSet<String>,
+    source_file_paths: HashSet<String>,
+    source_ref_ids: HashSet<String>,
 }
 
 #[derive(Debug, Default)]
@@ -831,30 +839,31 @@ async fn context_write_commit(state: &AppState, req: JsonRpcRequest) -> JsonRpcR
         }
     };
 
-    let mut written_files = Vec::with_capacity(pending.files.len());
-    for file in pending.files {
-        let path = repo_root.join(&file.relative_path);
-        if let Some(parent) = path.parent()
-            && let Err(err) = std::fs::create_dir_all(parent)
-        {
-            return rpc_error(
-                req.id,
-                -32603,
-                format!("failed to create {}: {err}", parent.display()),
-            );
-        }
-        if let Err(err) = std::fs::write(&path, file.content) {
-            return rpc_error(
-                req.id,
-                -32603,
-                format!("failed to write {}: {err}", path.display()),
-            );
-        }
-        written_files.push(file.relative_path);
-    }
+    let written_files = match write_pending_context_files(repo_root.as_path(), pending.files) {
+        Ok(files) => files,
+        Err(err) => return rpc_error(req.id, -32603, err.to_string()),
+    };
 
     JsonRpcResponse::ok(req.id, ContextWriteCommitResponse { written_files })
         .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
+}
+
+fn write_pending_context_files(
+    repo_root: &Path,
+    files: Vec<PendingContextWriteFile>,
+) -> Result<Vec<String>> {
+    let mut written_files = Vec::with_capacity(files.len());
+    for file in files {
+        let path = repo_root.join(&file.relative_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        std::fs::write(&path, file.content)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        written_files.push(file.relative_path);
+    }
+    Ok(written_files)
 }
 
 async fn handoff_plan(
@@ -897,11 +906,10 @@ async fn handoff_plan(
         }
     };
 
+    let selected_ref_ids =
+        recommended_handoff_ref_ids(&documents, &source_thread_id, &payload.selected_ref_ids);
     let mut kept_entries = vec![source_entry];
-    kept_entries.extend(selected_context_entries(
-        &documents,
-        &payload.selected_ref_ids,
-    ));
+    kept_entries.extend(selected_context_entries(&documents, &selected_ref_ids));
     dedupe_context_entries(&mut kept_entries);
 
     let kept_refs = kept_entries
@@ -909,15 +917,21 @@ async fn handoff_plan(
         .map(|entry| entry.context_ref.clone())
         .collect::<Vec<_>>();
     let token_estimate = estimate_context_bundle_tokens(&documents, &kept_entries);
-    let plan_id = Uuid::new_v4().to_string();
+    let plan_id = if !payload.preview_only {
+        Uuid::new_v4().to_string()
+    } else {
+        Default::default()
+    };
     let goal = payload.goal.filter(|value| !value.trim().is_empty());
 
-    {
+    if !payload.preview_only {
+        let promotion_files = plan_handoff_promotion_files(&documents, &selected_ref_ids).await;
         let mut guard = state.inner.lock().await;
         guard.handoff_plans.insert(
             plan_id.clone(),
             PendingHandoffPlan {
                 source_thread_id: source_thread_id.clone(),
+                promotion_files,
             },
         );
     }
@@ -928,7 +942,7 @@ async fn handoff_plan(
             plan_id,
             source_thread_id,
             goal,
-            selected_node_ids: kept_refs.iter().map(|entry| entry.ref_id.clone()).collect(),
+            selected_node_ids: selected_ref_ids,
             kept_refs,
             dropped_refs: Vec::new(),
             token_estimate,
@@ -959,6 +973,17 @@ async fn handoff_commit(state: &AppState, req: JsonRpcRequest) -> JsonRpcRespons
             Err(err) => return app_server_error_response(req.id, err),
         },
     };
+    let repo_root = get_git_repo_root(Path::new(&cwd)).unwrap_or_else(|| PathBuf::from(&cwd));
+    if let Err(err) =
+        write_pending_context_files(repo_root.as_path(), pending.promotion_files.clone())
+        && !pending.promotion_files.is_empty()
+    {
+        warn!(
+            error = %err,
+            source_thread_id = %pending.source_thread_id,
+            "failed to write handoff promotion files"
+        );
+    }
 
     let started = match bridge
         .thread_start(
@@ -2303,6 +2328,192 @@ fn context_hotspot_reason(
     }
 }
 
+fn persisted_context_coverage(documents: &[ContextDocument]) -> PersistedContextCoverage {
+    let mut coverage = PersistedContextCoverage::default();
+    for document in documents {
+        if document.kind != ContextKind::RepoContextFile {
+            continue;
+        }
+        coverage
+            .source_thread_ids
+            .extend(document.graph.source_threads.iter().cloned());
+        coverage
+            .source_file_paths
+            .extend(document.graph.source_files.iter().cloned());
+        coverage
+            .source_ref_ids
+            .extend(document.graph.source_refs.iter().cloned());
+    }
+    coverage
+}
+
+fn context_document_is_persisted(
+    document: &ContextDocument,
+    coverage: &PersistedContextCoverage,
+) -> bool {
+    if document.kind == ContextKind::RepoContextFile
+        || coverage.source_ref_ids.contains(&document.ref_id)
+    {
+        return true;
+    }
+
+    if document.kind == ContextKind::SharedThread
+        && context_thread_id_from_ref_id(&document.ref_id)
+            .is_some_and(|thread_id| coverage.source_thread_ids.contains(&thread_id))
+    {
+        return true;
+    }
+
+    document
+        .graph
+        .source_files
+        .iter()
+        .any(|path| coverage.source_file_paths.contains(path))
+}
+
+fn recommended_handoff_ref_ids(
+    documents: &[ContextDocument],
+    source_thread_id: &str,
+    selected_ref_ids: &[String],
+) -> Vec<String> {
+    const HANDOFF_RECOMMENDATION_LIMIT: usize = 4;
+
+    let all_edges = context_graph_edges(documents);
+    let coverage = persisted_context_coverage(documents);
+    let available_ref_ids = documents
+        .iter()
+        .map(|document| document.ref_id.clone())
+        .collect::<HashSet<_>>();
+    let mut deduped_selected_ref_ids = Vec::new();
+    let mut selected_ref_ids_set = HashSet::new();
+    for ref_id in selected_ref_ids {
+        if available_ref_ids.contains(ref_id) && selected_ref_ids_set.insert(ref_id.clone()) {
+            deduped_selected_ref_ids.push(ref_id.clone());
+        }
+    }
+
+    let hotspot_scores = context_hotspot_scores(documents, &all_edges, &selected_ref_ids_set);
+    let mut recommended_documents = documents
+        .iter()
+        .filter(|document| {
+            matches!(
+                document.kind,
+                ContextKind::ThreadInsight
+                    | ContextKind::ThreadFile
+                    | ContextKind::ThreadSearch
+                    | ContextKind::ThreadTool
+            )
+        })
+        .filter(|document| {
+            document
+                .graph
+                .source_threads
+                .iter()
+                .any(|thread_id| thread_id == source_thread_id)
+        })
+        .filter(|document| !selected_ref_ids_set.contains(&document.ref_id))
+        .filter(|document| !context_document_is_persisted(document, &coverage))
+        .collect::<Vec<_>>();
+    recommended_documents.sort_by(|left, right| {
+        hotspot_scores
+            .get(&right.ref_id)
+            .copied()
+            .unwrap_or_default()
+            .cmp(
+                &hotspot_scores
+                    .get(&left.ref_id)
+                    .copied()
+                    .unwrap_or_default(),
+            )
+            .then_with(|| context_default_sort_key(left).cmp(&context_default_sort_key(right)))
+    });
+
+    deduped_selected_ref_ids.extend(
+        recommended_documents
+            .into_iter()
+            .take(HANDOFF_RECOMMENDATION_LIMIT)
+            .map(|document| document.ref_id.clone()),
+    );
+
+    if deduped_selected_ref_ids.is_empty()
+        && let Some(fallback) = documents
+            .iter()
+            .filter(|document| {
+                !matches!(document.kind, ContextKind::SharedThread)
+                    && document
+                        .graph
+                        .source_threads
+                        .iter()
+                        .any(|thread_id| thread_id == source_thread_id)
+            })
+            .max_by(|left, right| {
+                hotspot_scores
+                    .get(&left.ref_id)
+                    .copied()
+                    .unwrap_or_default()
+                    .cmp(
+                        &hotspot_scores
+                            .get(&right.ref_id)
+                            .copied()
+                            .unwrap_or_default(),
+                    )
+                    .then_with(|| {
+                        context_default_sort_key(right).cmp(&context_default_sort_key(left))
+                    })
+            })
+    {
+        deduped_selected_ref_ids.push(fallback.ref_id.clone());
+    }
+
+    deduped_selected_ref_ids
+}
+
+fn handoff_promotion_ref_ids(
+    documents: &[ContextDocument],
+    selected_ref_ids: &[String],
+) -> Vec<String> {
+    const HANDOFF_PROMOTION_LIMIT: usize = 4;
+
+    let all_edges = context_graph_edges(documents);
+    let selected_ref_ids_set = selected_ref_ids.iter().cloned().collect::<HashSet<_>>();
+    let hotspot_scores = context_hotspot_scores(documents, &all_edges, &selected_ref_ids_set);
+    let coverage = persisted_context_coverage(documents);
+    let documents_by_ref_id = documents
+        .iter()
+        .map(|document| (document.ref_id.as_str(), document))
+        .collect::<HashMap<_, _>>();
+    let mut promotion_candidates = selected_ref_ids
+        .iter()
+        .filter_map(|ref_id| documents_by_ref_id.get(ref_id.as_str()).copied())
+        .filter(|document| {
+            !matches!(
+                document.kind,
+                ContextKind::SharedThread | ContextKind::RepoContextFile
+            )
+        })
+        .filter(|document| !context_document_is_persisted(document, &coverage))
+        .collect::<Vec<_>>();
+    promotion_candidates.sort_by(|left, right| {
+        hotspot_scores
+            .get(&right.ref_id)
+            .copied()
+            .unwrap_or_default()
+            .cmp(
+                &hotspot_scores
+                    .get(&left.ref_id)
+                    .copied()
+                    .unwrap_or_default(),
+            )
+            .then_with(|| context_default_sort_key(left).cmp(&context_default_sort_key(right)))
+    });
+    promotion_candidates.dedup_by(|left, right| left.ref_id == right.ref_id);
+    promotion_candidates
+        .into_iter()
+        .take(HANDOFF_PROMOTION_LIMIT)
+        .map(|document| document.ref_id.clone())
+        .collect()
+}
+
 fn context_graph_kind_directory(kind: ContextKind) -> &'static str {
     match kind {
         ContextKind::SharedThread => "threads",
@@ -2413,6 +2624,39 @@ fn plan_context_write_files(
             plan_context_write_file(repo_root, document, branch.clone(), &mut used_paths)
         })
         .collect()
+}
+
+async fn plan_handoff_promotion_files(
+    documents: &[ContextDocument],
+    selected_ref_ids: &[String],
+) -> Vec<PendingContextWriteFile> {
+    let promotion_ref_ids = handoff_promotion_ref_ids(documents, selected_ref_ids);
+    if promotion_ref_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let repo_root = match resolve_context_root() {
+        Ok(path) => path,
+        Err(err) => {
+            warn!(error = %err, "failed to resolve collaboration context root for handoff promotion");
+            return Vec::new();
+        }
+    };
+    let branch = current_branch_name(repo_root.as_path())
+        .await
+        .unwrap_or_default();
+    plan_context_write_files(
+        repo_root.as_path(),
+        documents.to_vec(),
+        &promotion_ref_ids,
+        non_empty_string(branch),
+    )
+    .into_iter()
+    .map(|file| PendingContextWriteFile {
+        relative_path: file.relative_path,
+        content: file.content,
+    })
+    .collect()
 }
 
 fn plan_context_write_file(
@@ -3184,7 +3428,9 @@ fn is_pid_running(_pid: u32) -> bool {
 mod tests {
     use super::build_context_graph;
     use super::context_graph_artifact_paths;
+    use super::handoff_promotion_ref_ids;
     use super::plan_context_write_files;
+    use super::recommended_handoff_ref_ids;
     use super::render_context_bundle;
     use super::repo_context_documents;
     use super::resolved_entry_from_document;
@@ -3526,6 +3772,110 @@ mod tests {
                 .content
                 .contains("- ref: ctx:thread-insight:thread-1:plan-1")
         );
+    }
+
+    #[test]
+    fn recommended_handoff_ref_ids_preserves_selected_and_adds_unpersisted_artifacts() {
+        let temp_root = temp_test_dir("handoff-recommendations");
+        let context_dir = temp_root.join(".codex").join("context");
+        std::fs::create_dir_all(&context_dir).expect("create context dir");
+        std::fs::write(
+            context_dir.join("overview.md"),
+            "---\ntitle: Planning Overview\nkind: concept\nsource_threads:\n  - \"thread-1\"\nsource_refs:\n  - \"ctx:thread-insight:thread-1:plan-1\"\n---\n# Planning Overview\n\nPersisted already.\n",
+        )
+        .expect("write repo context");
+
+        let mut thread = sample_thread("thread-1", Some("planning sync"), Some("main"));
+        thread.turns = vec![Turn {
+            id: "turn-1".to_string(),
+            items: vec![
+                ThreadItem::Plan {
+                    id: "plan-1".to_string(),
+                    text: "Persisted already.".to_string(),
+                },
+                ThreadItem::Plan {
+                    id: "plan-2".to_string(),
+                    text: "Capture the simplified handoff selection flow.".to_string(),
+                },
+            ],
+            status: AppTurnStatus::Completed,
+            error: None,
+        }];
+
+        let mut documents = repo_context_documents(&temp_root);
+        documents.extend(thread_context_documents(
+            &thread,
+            true,
+            Some(temp_root.as_path()),
+        ));
+
+        let recommended_ref_ids = recommended_handoff_ref_ids(
+            &documents,
+            "thread-1",
+            &["ctx:file:.codex/context/overview.md".to_string()],
+        );
+
+        assert_eq!(
+            recommended_ref_ids,
+            vec![
+                "ctx:file:.codex/context/overview.md".to_string(),
+                "ctx:thread-insight:thread-1:plan-2".to_string(),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn handoff_promotion_ref_ids_skip_repo_notes_and_persisted_artifacts() {
+        let temp_root = temp_test_dir("handoff-promotion");
+        let context_dir = temp_root.join(".codex").join("context");
+        std::fs::create_dir_all(&context_dir).expect("create context dir");
+        std::fs::write(
+            context_dir.join("overview.md"),
+            "---\ntitle: Planning Overview\nkind: concept\nsource_threads:\n  - \"thread-1\"\nsource_refs:\n  - \"ctx:thread-insight:thread-1:plan-1\"\n---\n# Planning Overview\n\nPersisted already.\n",
+        )
+        .expect("write repo context");
+
+        let mut thread = sample_thread("thread-1", Some("planning sync"), Some("main"));
+        thread.turns = vec![Turn {
+            id: "turn-1".to_string(),
+            items: vec![
+                ThreadItem::Plan {
+                    id: "plan-1".to_string(),
+                    text: "Persisted already.".to_string(),
+                },
+                ThreadItem::Plan {
+                    id: "plan-2".to_string(),
+                    text: "Promote the remaining handoff guidance.".to_string(),
+                },
+            ],
+            status: AppTurnStatus::Completed,
+            error: None,
+        }];
+
+        let mut documents = repo_context_documents(&temp_root);
+        documents.extend(thread_context_documents(
+            &thread,
+            true,
+            Some(temp_root.as_path()),
+        ));
+
+        let promotion_ref_ids = handoff_promotion_ref_ids(
+            &documents,
+            &[
+                "ctx:file:.codex/context/overview.md".to_string(),
+                "ctx:thread-insight:thread-1:plan-1".to_string(),
+                "ctx:thread-insight:thread-1:plan-2".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            promotion_ref_ids,
+            vec!["ctx:thread-insight:thread-1:plan-2".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(temp_root);
     }
 
     #[test]

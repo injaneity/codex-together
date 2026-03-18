@@ -171,8 +171,6 @@ const PLAN_MODE_REASONING_SCOPE_PLAN_ONLY: &str = "Apply to Plan mode override";
 const PLAN_MODE_REASONING_SCOPE_ALL_MODES: &str = "Apply to global default and Plan mode override";
 const CONNECTORS_SELECTION_VIEW_ID: &str = "connectors-selection";
 const TOGETHER_CONTEXT_SELECTION_VIEW_ID: &str = "together-context-selection";
-const TOGETHER_HANDOFF_SELECTION_VIEW_ID: &str = "together-handoff-selection";
-const TOGETHER_CONTEXT_WRITE_SELECTION_VIEW_ID: &str = "together-context-write-selection";
 
 /// Choose the keybinding used to edit the most-recently queued message.
 ///
@@ -306,10 +304,6 @@ use codex_together_protocol::ContextResolveBundleResponse;
 use codex_together_protocol::ContextSearchParams;
 use codex_together_protocol::ContextSearchResponse;
 use codex_together_protocol::ContextSearchResult;
-use codex_together_protocol::ContextWriteCommitParams;
-use codex_together_protocol::ContextWriteCommitResponse;
-use codex_together_protocol::ContextWritePlanParams;
-use codex_together_protocol::ContextWritePlanResponse;
 use codex_together_protocol::HandoffCommitParams;
 use codex_together_protocol::HandoffCommitResponse;
 use codex_together_protocol::HandoffPlanParams;
@@ -320,8 +314,6 @@ use codex_together_protocol::JsonRpcResponse as TogetherJsonRpcResponse;
 use codex_together_protocol::METHOD_CONTEXT_GRAPH;
 use codex_together_protocol::METHOD_CONTEXT_RESOLVE_BUNDLE;
 use codex_together_protocol::METHOD_CONTEXT_SEARCH;
-use codex_together_protocol::METHOD_CONTEXT_WRITE_COMMIT;
-use codex_together_protocol::METHOD_CONTEXT_WRITE_PLAN;
 use codex_together_protocol::METHOD_HANDOFF_COMMIT;
 use codex_together_protocol::METHOD_HANDOFF_PLAN;
 use codex_together_protocol::METHOD_HOST_START;
@@ -347,7 +339,6 @@ use futures::StreamExt;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use strum::IntoEnumIterator;
-use textwrap::wrap;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 use url::Url;
@@ -3829,9 +3820,15 @@ impl ChatWidget {
             SlashCommand::Exit => {
                 if let Some(cmd) = together_exit_command() {
                     let current_thread_id = self.thread_id.map(|id| id.to_string());
+                    let current_selected_ref_ids = self.together_context_selected_ref_ids();
                     let tx = self.app_event_tx.clone();
                     tokio::spawn(async move {
-                        let _ = execute_together_command(cmd.to_string(), current_thread_id).await;
+                        let _ = execute_together_command(
+                            cmd.to_string(),
+                            current_thread_id,
+                            current_selected_ref_ids,
+                        )
+                        .await;
                         tx.send(AppEvent::Exit(ExitMode::ShutdownFirst));
                     });
                 } else {
@@ -8213,21 +8210,23 @@ impl ChatWidget {
         self.bottom_pane.show_view(Box::new(view));
     }
 
+    #[cfg(test)]
     pub(crate) fn show_together_context_view(
         &mut self,
         query: Option<String>,
         graph: ContextGraphResponse,
         scope: TogetherContextScope,
     ) {
-        self.show_together_context_view_with_marks(query, graph, scope, HashSet::new());
+        self.show_together_context_view_with_selection(query, graph, scope, HashSet::new(), None);
     }
 
-    pub(crate) fn show_together_context_view_with_marks(
+    pub(crate) fn show_together_context_view_with_selection(
         &mut self,
         query: Option<String>,
         graph: ContextGraphResponse,
         scope: TogetherContextScope,
-        marked_ref_ids: HashSet<String>,
+        selected_ref_ids: HashSet<String>,
+        handoff_goal: Option<String>,
     ) {
         if graph.nodes.is_empty() {
             let scope = query.unwrap_or_else(|| "current repo".to_string());
@@ -8256,7 +8255,8 @@ impl ChatWidget {
             edges,
             current_thread_ref_id,
             selected_actual_idx: 0,
-            marked_ref_ids,
+            selected_ref_ids,
+            handoff_goal,
         }));
         self.together_context_view_state = Some(Arc::clone(&state));
         let params = self.together_context_view_params(
@@ -8290,11 +8290,7 @@ impl ChatWidget {
             .on_together_context_search_result(query, results);
     }
 
-    pub(crate) fn insert_together_context_binding(&mut self, context_ref: ContextRef) {
-        self.bottom_pane.insert_context_binding(context_ref);
-    }
-
-    pub(crate) fn toggle_together_context_mark(&mut self, actual_idx: usize) {
+    pub(crate) fn toggle_together_context_selection(&mut self, actual_idx: usize) {
         let Some(state) = self.together_context_view_state.as_ref() else {
             return;
         };
@@ -8306,8 +8302,8 @@ impl ChatWidget {
         else {
             return;
         };
-        if !state.marked_ref_ids.insert(ref_id.clone()) {
-            state.marked_ref_ids.remove(&ref_id);
+        if !state.selected_ref_ids.insert(ref_id.clone()) {
+            state.selected_ref_ids.remove(&ref_id);
         }
         drop(state);
         self.refresh_together_context_view();
@@ -8319,34 +8315,42 @@ impl ChatWidget {
         Some(TogetherContextToggleRequest {
             query: state.query.clone(),
             next_scope: state.scope.toggled(state.current_thread_ref_id.is_some()),
-            marked_ref_ids: state.marked_ref_ids.clone(),
+            selected_ref_ids: state.selected_ref_ids.clone(),
+            handoff_goal: state.handoff_goal.clone(),
         })
     }
 
-    pub(crate) fn together_context_action_ref_ids(&self, actual_idx: usize) -> Vec<String> {
+    pub(crate) fn together_context_action_ref_ids(&self, _actual_idx: usize) -> Vec<String> {
         let Some(state) = self.together_context_view_state.as_ref() else {
             return Vec::new();
         };
         let state = lock_together_context_view_state(state);
-        if state.marked_ref_ids.is_empty() {
-            return state
-                .results
-                .get(actual_idx)
-                .map(|result| vec![result.ref_id.clone()])
-                .unwrap_or_default();
-        }
         state
             .results
             .iter()
-            .filter(|result| state.marked_ref_ids.contains(&result.ref_id))
+            .filter(|result| state.selected_ref_ids.contains(&result.ref_id))
             .map(|result| result.ref_id.clone())
             .collect()
+    }
+
+    pub(crate) fn together_context_selected_ref_ids(&self) -> Vec<String> {
+        let Some(state) = self.together_context_view_state.as_ref() else {
+            return Vec::new();
+        };
+        let state = lock_together_context_view_state(state);
+        state.selected_ref_ids.iter().cloned().collect()
+    }
+
+    pub(crate) fn together_context_handoff_goal(&self) -> Option<String> {
+        let state = self.together_context_view_state.as_ref()?;
+        let state = lock_together_context_view_state(state);
+        state.handoff_goal.clone()
     }
 
     pub(crate) fn together_context_source_thread_id(&self, actual_idx: usize) -> Option<String> {
         let state = self.together_context_view_state.as_ref()?;
         let state = lock_together_context_view_state(state);
-        let results = if state.marked_ref_ids.is_empty() {
+        let results = if state.selected_ref_ids.is_empty() {
             state
                 .results
                 .get(actual_idx)
@@ -8357,7 +8361,7 @@ impl ChatWidget {
             state
                 .results
                 .iter()
-                .filter(|result| state.marked_ref_ids.contains(&result.ref_id))
+                .filter(|result| state.selected_ref_ids.contains(&result.ref_id))
                 .cloned()
                 .collect::<Vec<_>>()
         };
@@ -8365,33 +8369,6 @@ impl ChatWidget {
         results
             .into_iter()
             .find_map(|result| together_context_source_thread_id_for_result(&result))
-    }
-
-    pub(crate) fn attach_together_context_selection(&mut self, actual_idx: usize) {
-        let Some(state) = self.together_context_view_state.as_ref() else {
-            return;
-        };
-        let state = lock_together_context_view_state(state);
-        let results = if state.marked_ref_ids.is_empty() {
-            state
-                .results
-                .get(actual_idx)
-                .cloned()
-                .into_iter()
-                .collect::<Vec<_>>()
-        } else {
-            state
-                .results
-                .iter()
-                .filter(|result| state.marked_ref_ids.contains(&result.ref_id))
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        drop(state);
-
-        for result in results {
-            self.insert_together_context_binding(together_context_ref(&result));
-        }
     }
 
     pub(crate) fn set_composer_text_with_context_bindings(
@@ -8461,94 +8438,6 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    pub(crate) fn show_together_handoff_review(&mut self, plan: HandoffPlanResponse) {
-        let kept_count = plan.kept_refs.len();
-        let title = match kept_count {
-            0 => "Empty handoff plan".to_string(),
-            1 => "Handoff includes 1 context item".to_string(),
-            _ => format!("Handoff includes {kept_count} context items"),
-        };
-        let draft = together_handoff_draft(&plan);
-        let plan_id = plan.plan_id.clone();
-        let context_refs = plan.kept_refs.clone();
-
-        self.bottom_pane.show_selection_view(SelectionViewParams {
-            view_id: Some(TOGETHER_HANDOFF_SELECTION_VIEW_ID),
-            title: Some("Handoff".to_string()),
-            subtitle: Some(title),
-            footer_hint: Some("Enter create · Esc cancel".into()),
-            items: vec![
-                SelectionItem {
-                    name: "Create fresh thread".to_string(),
-                    description: Some(
-                        "Start a new writable thread from this handoff bundle".to_string(),
-                    ),
-                    actions: vec![Box::new(move |tx: &AppEventSender| {
-                        tx.send(AppEvent::CommitTogetherHandoff {
-                            plan_id: plan_id.clone(),
-                            draft_text: draft.clone(),
-                            context_refs: context_refs.clone(),
-                        });
-                    })],
-                    dismiss_on_select: true,
-                    ..Default::default()
-                },
-                SelectionItem {
-                    name: "Cancel".to_string(),
-                    description: Some("Keep the current thread unchanged".to_string()),
-                    dismiss_on_select: true,
-                    ..Default::default()
-                },
-            ],
-            side_content: Box::new(TogetherHandoffPreviewRenderable { plan }),
-            side_content_width: SideContentWidth::Half,
-            side_content_min_width: 32,
-            ..Default::default()
-        });
-    }
-
-    pub(crate) fn show_together_context_write_review(&mut self, plan: ContextWritePlanResponse) {
-        let file_count = plan.files.len();
-        let subtitle = match file_count {
-            0 => "No repo-context files to write".to_string(),
-            1 => "Review 1 repo-context file".to_string(),
-            _ => format!("Review {file_count} repo-context files"),
-        };
-        let plan_id = plan.plan_id.clone();
-
-        self.bottom_pane.show_selection_view(SelectionViewParams {
-            view_id: Some(TOGETHER_CONTEXT_WRITE_SELECTION_VIEW_ID),
-            title: Some("Write Repo Context".to_string()),
-            subtitle: Some(subtitle),
-            footer_hint: Some("Enter write · Esc cancel".into()),
-            items: vec![
-                SelectionItem {
-                    name: "Write tracked files".to_string(),
-                    description: Some(
-                        "Create or update tracked Markdown under .codex/context".to_string(),
-                    ),
-                    actions: vec![Box::new(move |tx: &AppEventSender| {
-                        tx.send(AppEvent::CommitTogetherContextWrite {
-                            plan_id: plan_id.clone(),
-                        });
-                    })],
-                    dismiss_on_select: true,
-                    ..Default::default()
-                },
-                SelectionItem {
-                    name: "Cancel".to_string(),
-                    description: Some("Leave the working tree unchanged".to_string()),
-                    dismiss_on_select: true,
-                    ..Default::default()
-                },
-            ],
-            side_content: Box::new(TogetherContextWritePreviewRenderable { plan }),
-            side_content_width: SideContentWidth::Half,
-            side_content_min_width: 32,
-            ..Default::default()
-        });
-    }
-
     fn together_context_view_params(
         &self,
         query: Option<String>,
@@ -8557,15 +8446,15 @@ impl ChatWidget {
         state: Arc<Mutex<TogetherContextViewState>>,
         initial_selected_idx: Option<usize>,
     ) -> SelectionViewParams {
-        let (scope, marked_ref_ids, has_thread_context) = {
+        let (scope, selected_ref_ids, has_thread_context) = {
             let state = lock_together_context_view_state(&state);
             (
                 state.scope,
-                state.marked_ref_ids.clone(),
+                state.selected_ref_ids.clone(),
                 state.current_thread_ref_id.is_some(),
             )
         };
-        let header = together_context_header(scope, has_thread_context, query.as_deref());
+        let header = together_context_header(scope, has_thread_context, query);
         let author_by_ref_id = tree_rows
             .iter()
             .map(|row| {
@@ -8577,10 +8466,7 @@ impl ChatWidget {
             .collect::<HashMap<_, _>>();
         let footer_note = Some(together_context_status_line(has_thread_context));
         let items = if tree_rows.is_empty() {
-            vec![together_context_empty_state_item(
-                scope,
-                has_thread_context,
-            )]
+            vec![together_context_empty_state_item(scope, has_thread_context)]
         } else {
             tree_rows
                 .into_iter()
@@ -8624,15 +8510,15 @@ impl ChatWidget {
                         name: together_context_row_name(result, author.as_str()),
                         name_prefix_spans: together_context_graph_prefix_spans(
                             &row,
-                            marked_ref_ids.contains(&result.ref_id),
+                            selected_ref_ids.contains(&result.ref_id),
                         ),
                         description: Some(description),
                         selected_description: None,
                         search_value: Some(search_value),
                         actions: vec![Box::new(move |tx: &AppEventSender| {
-                            tx.send(AppEvent::AttachTogetherContextSelection { actual_idx });
+                            tx.send(AppEvent::ToggleTogetherContextSelection { actual_idx });
                         })],
-                        dismiss_on_select: true,
+                        dismiss_on_select: false,
                         ..Default::default()
                     }
                 })
@@ -8651,6 +8537,7 @@ impl ChatWidget {
                 together_context_search_placeholder(scope, has_thread_context).to_string(),
             ),
             col_width_mode: ColumnWidthMode::AutoAllRows,
+            single_line_rows: true,
             header: Box::new(header),
             initial_selected_idx,
             side_content: Box::new(()),
@@ -8663,20 +8550,12 @@ impl ChatWidget {
             })),
             on_char_key: Some(Box::new(
                 move |pressed, actual_idx, tx: &AppEventSender| match pressed {
-                    ' ' => {
-                        tx.send(AppEvent::ToggleTogetherContextMark { actual_idx });
-                        true
-                    }
-                    'T' if has_thread_context => {
+                    't' | 'T' if has_thread_context => {
                         tx.send(AppEvent::ToggleTogetherContextScope);
                         true
                     }
-                    'H' => {
+                    'h' | 'H' => {
                         tx.send(AppEvent::PlanTogetherContextHandoff { actual_idx });
-                        true
-                    }
-                    'W' => {
-                        tx.send(AppEvent::PlanTogetherContextWrite { actual_idx });
                         true
                     }
                     _ => false,
@@ -8697,9 +8576,16 @@ impl ChatWidget {
         }
 
         let current_thread_id = self.thread_id.map(|id| id.to_string());
+        let current_selected_ref_ids = self.together_context_selected_ref_ids();
         let tx = self.app_event_tx.clone();
         tokio::spawn(async move {
-            match execute_together_command(trimmed, current_thread_id.clone()).await {
+            match execute_together_command(
+                trimmed,
+                current_thread_id.clone(),
+                current_selected_ref_ids,
+            )
+            .await
+            {
                 Ok(output) => {
                     tx.send(AppEvent::InsertHistoryCell(Box::new(
                         history_cell::new_info_event(output.message, output.hint),
@@ -8710,15 +8596,16 @@ impl ChatWidget {
                                 query,
                                 graph,
                                 scope,
+                                selected_ref_ids,
+                                handoff_goal,
                             } => {
                                 tx.send(AppEvent::OpenTogetherContextView {
                                     query,
                                     graph,
                                     scope,
+                                    selected_ref_ids,
+                                    handoff_goal,
                                 });
-                            }
-                            TogetherCommandFollowUp::OpenHandoffReview { plan } => {
-                                tx.send(AppEvent::OpenTogetherHandoffReview { plan });
                             }
                         }
                     }
@@ -8848,9 +8735,8 @@ enum TogetherCommandFollowUp {
         query: Option<String>,
         graph: ContextGraphResponse,
         scope: TogetherContextScope,
-    },
-    OpenHandoffReview {
-        plan: HandoffPlanResponse,
+        selected_ref_ids: Vec<String>,
+        handoff_goal: Option<String>,
     },
 }
 
@@ -8884,7 +8770,8 @@ impl TogetherContextScope {
 pub(crate) struct TogetherContextToggleRequest {
     pub(crate) query: Option<String>,
     pub(crate) next_scope: TogetherContextScope,
-    pub(crate) marked_ref_ids: HashSet<String>,
+    pub(crate) selected_ref_ids: HashSet<String>,
+    pub(crate) handoff_goal: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -8896,7 +8783,8 @@ struct TogetherContextViewState {
     edges: Vec<ContextGraphEdge>,
     current_thread_ref_id: Option<String>,
     selected_actual_idx: usize,
-    marked_ref_ids: HashSet<String>,
+    selected_ref_ids: HashSet<String>,
+    handoff_goal: Option<String>,
 }
 
 impl Default for TogetherContextViewState {
@@ -8909,7 +8797,8 @@ impl Default for TogetherContextViewState {
             edges: Vec::new(),
             current_thread_ref_id: None,
             selected_actual_idx: 0,
-            marked_ref_ids: HashSet::new(),
+            selected_ref_ids: HashSet::new(),
+            handoff_goal: None,
         }
     }
 }
@@ -8961,16 +8850,20 @@ fn lock_together_context_view_state(
 fn together_context_header(
     scope: TogetherContextScope,
     has_thread_context: bool,
-    query: Option<&str>,
-) -> ColumnRenderable {
+    query: Option<String>,
+) -> ColumnRenderable<'static> {
     let mut header = ColumnRenderable::new();
     header.push(Line::from("Context".bold()));
-    header.push(together_context_scope_selector_line(scope, has_thread_context));
-    header.push(Line::from(
-        together_context_scope_description(scope, has_thread_context).dim(),
+    header.push(together_context_scope_selector_line(
+        scope,
+        has_thread_context,
     ));
-    if let Some(query) = query.map(str::trim).filter(|query| !query.is_empty()) {
-        header.push(Line::from(format!("Query: {query}").dim()));
+    if let Some(query) = query
+        .as_deref()
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+    {
+        header.push(Line::from(format!("Filter: {query}").dim()));
     }
     header
 }
@@ -8995,6 +8888,7 @@ fn together_context_scope_selector_line(
 }
 
 fn together_context_scope_selector(label: &str, is_active: bool) -> Vec<Span<'static>> {
+    let label = label.to_string();
     vec![
         "[".dim(),
         if is_active {
@@ -9004,26 +8898,6 @@ fn together_context_scope_selector(label: &str, is_active: bool) -> Vec<Span<'st
         },
         "]".dim(),
     ]
-}
-
-fn together_context_scope_description(
-    scope: TogetherContextScope,
-    has_thread_context: bool,
-) -> &'static str {
-    match (scope, has_thread_context) {
-        (TogetherContextScope::LocalThread, true) => {
-            "Retained thread artifacts only. Press T to switch to the broader graph."
-        }
-        (TogetherContextScope::LocalThread, false) => {
-            "No active thread is available for local artifact discovery."
-        }
-        (TogetherContextScope::Global, true) => {
-            "Persistent notes and linked thread context across the broader graph."
-        }
-        (TogetherContextScope::Global, false) => {
-            "Persistent notes and linked thread context across the broader graph."
-        }
-    }
 }
 
 fn together_context_search_placeholder(
@@ -9043,8 +8917,9 @@ fn together_context_empty_state_item(
 ) -> SelectionItem {
     let (name, description) = match (scope, has_thread_context) {
         (TogetherContextScope::LocalThread, true) => (
-            "No retained local artifacts".to_string(),
-            "Local scope only shows retained plans, file reads, searches, tool output, and graph queries from this thread. Press T for the global graph.".to_string(),
+            "No local context in this thread".to_string(),
+            "Local scope only shows context from this thread. Press t for the global graph."
+                .to_string(),
         ),
         (TogetherContextScope::LocalThread, false) => (
             "No active thread context".to_string(),
@@ -9067,23 +8942,14 @@ fn together_context_empty_state_item(
 }
 
 fn together_context_status_line(has_thread_context: bool) -> Line<'static> {
-    let mut spans = vec![
-        "enter".green(),
-        " attach".dim(),
-        " | ".dim(),
-        "space".green(),
-        " mark".dim(),
-    ];
+    let mut spans = vec!["enter".green(), " select".dim()];
     if has_thread_context {
-        spans.extend([" | ".dim(), "T".green(), " scope".dim()]);
+        spans.extend([" | ".dim(), "t".green(), " scope".dim()]);
     }
     spans.extend([
         " | ".dim(),
-        "H".green(),
+        "h".green(),
         " handoff".dim(),
-        " | ".dim(),
-        "W".green(),
-        " write".dim(),
         " | ".dim(),
         "esc".green(),
         " close".dim(),
@@ -9129,9 +8995,9 @@ fn together_context_local_thread_tree_rows(
                     | ContextKind::ThreadTool
             ) && together_context_source_thread_id_for_result(result).as_deref()
                 == Some(current_thread_id)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     if !thread_local_results.is_empty() {
         let thread_local_ref_ids = thread_local_results
             .iter()
@@ -9356,7 +9222,11 @@ fn together_context_graph_prefix_spans(
         ContextKind::ThreadSearch | ContextKind::ThreadTool => Color::Magenta,
         ContextKind::RepoContextFile => Color::LightYellow,
     };
-    let mut spans = vec![if is_marked { "[x] ".green() } else { "[ ] ".dim() }];
+    let mut spans = vec![if is_marked {
+        "[x] ".green()
+    } else {
+        "[ ] ".dim()
+    }];
     for ancestor_is_last in &row.graph_path.ancestor_last_flags {
         spans.push(if *ancestor_is_last {
             "  ".into()
@@ -9481,13 +9351,13 @@ fn together_context_row_description(
         parts.push(together_context_inline_excerpt(author, 24));
     }
     if let Some(location) = &row.result.location {
-        parts.push(location.clone());
+        parts.push(together_context_inline_excerpt(location, 40));
     }
     if !row.relation_labels.is_empty() {
         parts.push(format!("via {}", row.relation_labels.join(",")));
     }
     if let Some(summary) = &row.result.summary {
-        let summary = together_context_inline_excerpt(summary, 80);
+        let summary = together_context_inline_excerpt(summary, 56);
         if !summary.is_empty() && summary != display_name {
             parts.push(summary);
         }
@@ -9587,112 +9457,7 @@ fn together_context_child_sort_key(
     )
 }
 
-struct TogetherContextWritePreviewRenderable {
-    plan: ContextWritePlanResponse,
-}
-
-impl Renderable for TogetherContextWritePreviewRenderable {
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        let lines = together_context_write_preview_lines(&self.plan, area.width);
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .render(area, buf);
-    }
-
-    fn desired_height(&self, width: u16) -> u16 {
-        together_context_write_preview_lines(&self.plan, width).len() as u16
-    }
-}
-
-fn together_context_write_preview_lines(
-    plan: &ContextWritePlanResponse,
-    width: u16,
-) -> Vec<Line<'static>> {
-    let wrap_width = width.max(1) as usize;
-    let mut lines = vec!["Review tracked Markdown edits".bold().into()];
-
-    for file in &plan.files {
-        lines.push(Line::default());
-        lines.push(
-            format!(
-                "{} · {} · {}",
-                file.path,
-                file.kind,
-                if file.exists { "update" } else { "create" }
-            )
-            .cyan()
-            .into(),
-        );
-        for raw_line in file.content.lines() {
-            if raw_line.is_empty() {
-                lines.push(Line::default());
-                continue;
-            }
-            for line in wrap(raw_line, wrap_width) {
-                lines.push(Line::from(line.into_owned()));
-            }
-        }
-    }
-
-    lines
-}
-
-struct TogetherHandoffPreviewRenderable {
-    plan: HandoffPlanResponse,
-}
-
-impl Renderable for TogetherHandoffPreviewRenderable {
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        let lines = together_handoff_preview_lines(&self.plan, area.width);
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .render(area, buf);
-    }
-
-    fn desired_height(&self, width: u16) -> u16 {
-        together_handoff_preview_lines(&self.plan, width).len() as u16
-    }
-}
-
-fn together_handoff_preview_lines(plan: &HandoffPlanResponse, width: u16) -> Vec<Line<'static>> {
-    let wrap_width = width.max(1) as usize;
-    let mut lines = vec!["Create fresh thread from selected context".bold().into()];
-
-    if let Some(goal) = &plan.goal {
-        lines.push(Line::default());
-        lines.push("Goal".cyan().into());
-        for line in wrap(goal, wrap_width) {
-            lines.push(Line::from(line.into_owned()));
-        }
-    }
-
-    lines.push(Line::default());
-    lines.push(
-        format!("Source thread: {}", plan.source_thread_id)
-            .dim()
-            .into(),
-    );
-    lines.push(
-        format!("Estimated tokens: {}", plan.token_estimate)
-            .dim()
-            .into(),
-    );
-
-    if !plan.kept_refs.is_empty() {
-        lines.push(Line::default());
-        lines.push("Included".cyan().into());
-        for context_ref in &plan.kept_refs {
-            let line = format!("[ctx: {}]", context_ref.display_label);
-            for wrapped in wrap(line.as_str(), wrap_width) {
-                lines.push(Line::from(wrapped.into_owned()));
-            }
-        }
-    }
-
-    lines
-}
-
-fn together_handoff_draft(plan: &HandoffPlanResponse) -> String {
+pub(crate) fn together_handoff_draft(plan: &HandoffPlanResponse) -> String {
     let mut parts = Vec::new();
     if let Some(goal) = &plan.goal {
         parts.push(goal.trim().to_string());
@@ -9704,22 +9469,6 @@ fn together_handoff_draft(plan: &HandoffPlanResponse) -> String {
         parts.extend(plan.kept_refs.iter().map(together_context_token));
     }
     parts.join("\n")
-}
-
-fn together_context_ref(result: &ContextSearchResult) -> ContextRef {
-    let source_thread_id = together_context_source_thread_id_for_result(result);
-    let repo_context_id = (result.kind == codex_together_protocol::ContextKind::RepoContextFile)
-        .then(|| result.location.clone())
-        .flatten();
-    ContextRef {
-        ref_id: result.ref_id.clone(),
-        kind: result.kind,
-        display_label: result.title.clone(),
-        source_thread_id,
-        repo_context_id,
-        git_branch: None,
-        stale_state: None,
-    }
 }
 
 fn together_context_token(context_ref: &ContextRef) -> String {
@@ -9979,6 +9728,7 @@ impl TogetherRpcClient {
 async fn execute_together_command(
     args: String,
     current_thread_id: Option<String>,
+    current_selected_ref_ids: Vec<String>,
 ) -> anyhow::Result<TogetherCommandOutput> {
     let argv = shlex::split(&args).ok_or_else(|| {
         anyhow::anyhow!("invalid shell-like quoting in together command: `{args}`")
@@ -10271,6 +10021,8 @@ async fn execute_together_command(
                     query,
                     graph: response,
                     scope: TogetherContextScope::default_for(current_thread_id.as_deref()),
+                    selected_ref_ids: current_selected_ref_ids,
+                    handoff_goal: None,
                 }),
             })
         }
@@ -10290,28 +10042,37 @@ async fn execute_together_command(
                     METHOD_HANDOFF_PLAN,
                     HandoffPlanParams {
                         source_thread_id: Some(source_thread_id),
-                        selected_ref_ids: Vec::new(),
+                        selected_ref_ids: current_selected_ref_ids,
                         goal,
+                        preview_only: true,
                     },
                 )
                 .await?;
+            let graph =
+                fetch_together_context_graph(None, Some(plan.source_thread_id.clone())).await?;
 
             let hint = Some(match &plan.goal {
                 Some(goal) => format!(
-                    "Goal: {goal}\nPrepared {} context item(s) from thread {}.",
-                    plan.kept_refs.len(),
+                    "Goal: {goal}\nRecommended {} context item(s) from thread {}.",
+                    plan.selected_node_ids.len(),
                     plan.source_thread_id
                 ),
                 None => format!(
-                    "Prepared {} context item(s) from thread {}.",
-                    plan.kept_refs.len(),
+                    "Recommended {} context item(s) from thread {}.",
+                    plan.selected_node_ids.len(),
                     plan.source_thread_id
                 ),
             });
             Ok(TogetherCommandOutput {
-                message: "Prepared handoff review.".to_string(),
+                message: "Opened handoff selection.".to_string(),
                 hint,
-                follow_up: Some(TogetherCommandFollowUp::OpenHandoffReview { plan }),
+                follow_up: Some(TogetherCommandFollowUp::OpenContextView {
+                    query: None,
+                    graph,
+                    scope: TogetherContextScope::default_for(Some(plan.source_thread_id.as_str())),
+                    selected_ref_ids: plan.selected_node_ids,
+                    handoff_goal: plan.goal,
+                }),
             })
         }
         "status" => {
@@ -10394,6 +10155,8 @@ pub(crate) async fn fetch_together_context_graph(
 pub(crate) async fn plan_together_context_handoff(
     source_thread_id: Option<String>,
     selected_ref_ids: Vec<String>,
+    goal: Option<String>,
+    preview_only: bool,
 ) -> anyhow::Result<HandoffPlanResponse> {
     let endpoint = current_together_endpoint();
     let mut client = connect_and_auth(&endpoint).await?;
@@ -10403,37 +10166,9 @@ pub(crate) async fn plan_together_context_handoff(
             HandoffPlanParams {
                 source_thread_id,
                 selected_ref_ids,
-                goal: None,
+                goal,
+                preview_only,
             },
-        )
-        .await
-}
-
-pub(crate) async fn plan_together_context_write(
-    selected_ref_ids: Vec<String>,
-) -> anyhow::Result<ContextWritePlanResponse> {
-    let endpoint = current_together_endpoint();
-    let mut client = connect_and_auth(&endpoint).await?;
-    client
-        .call(
-            METHOD_CONTEXT_WRITE_PLAN,
-            ContextWritePlanParams {
-                selected_ref_ids,
-                branch: None,
-            },
-        )
-        .await
-}
-
-pub(crate) async fn commit_together_context_write_plan(
-    plan_id: String,
-) -> anyhow::Result<ContextWriteCommitResponse> {
-    let endpoint = current_together_endpoint();
-    let mut client = connect_and_auth(&endpoint).await?;
-    client
-        .call(
-            METHOD_CONTEXT_WRITE_COMMIT,
-            ContextWriteCommitParams { plan_id },
         )
         .await
 }

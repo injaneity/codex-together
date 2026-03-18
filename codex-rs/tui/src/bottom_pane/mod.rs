@@ -614,11 +614,6 @@ impl BottomPane {
         self.request_redraw();
     }
 
-    pub(crate) fn insert_context_binding(&mut self, context_ref: ContextRef) {
-        self.composer.insert_context_binding(context_ref);
-        self.request_redraw();
-    }
-
     #[cfg(test)]
     pub(crate) fn composer_local_image_paths(&self) -> Vec<PathBuf> {
         self.composer.local_image_paths()

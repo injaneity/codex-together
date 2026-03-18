@@ -12,12 +12,11 @@ use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ExternalEditorState;
-use crate::chatwidget::commit_together_context_write_plan;
 use crate::chatwidget::commit_together_handoff_plan;
 use crate::chatwidget::fetch_together_context_graph;
 use crate::chatwidget::plan_together_context_handoff;
-use crate::chatwidget::plan_together_context_write;
 use crate::chatwidget::search_together_context;
+use crate::chatwidget::together_handoff_draft;
 use crate::cwd_prompt::CwdPromptAction;
 use crate::diff_render::DiffSummary;
 use crate::exec_command::strip_bash_lc_and_escape;
@@ -880,7 +879,7 @@ impl App {
         }
     }
 
-    async fn plan_together_context_handoff(&mut self, actual_idx: usize) {
+    async fn plan_together_context_handoff(&mut self, tui: &mut tui::Tui, actual_idx: usize) {
         let source_thread_id = self
             .chat_widget
             .together_context_source_thread_id(actual_idx)
@@ -901,44 +900,23 @@ impl App {
             return;
         }
 
-        match plan_together_context_handoff(Some(source_thread_id), selected_ref_ids).await {
-            Ok(plan) => self.chat_widget.show_together_handoff_review(plan),
-            Err(err) => self
-                .chat_widget
-                .add_error_message(format!("Failed to prepare handoff: {err}")),
-        }
-    }
-
-    async fn plan_together_context_write(&mut self, actual_idx: usize) {
-        let selected_ref_ids = self.chat_widget.together_context_action_ref_ids(actual_idx);
-        if selected_ref_ids.is_empty() {
-            self.chat_widget
-                .add_error_message("No collaboration context is selected.".to_string());
-            return;
-        }
-
-        match plan_together_context_write(selected_ref_ids).await {
-            Ok(plan) => self.chat_widget.show_together_context_write_review(plan),
-            Err(err) => self
-                .chat_widget
-                .add_error_message(format!("Failed to prepare repo-context write: {err}")),
-        }
-    }
-
-    async fn commit_together_context_write(&mut self, plan_id: String) {
-        match commit_together_context_write_plan(plan_id).await {
-            Ok(response) => {
-                let count = response.written_files.len();
-                let paths = response.written_files.join("\n");
-                let title = match count {
-                    1 => "Wrote 1 repo-context file.".to_string(),
-                    _ => format!("Wrote {count} repo-context files."),
-                };
-                self.chat_widget.add_info_message(title, Some(paths));
+        match plan_together_context_handoff(
+            Some(source_thread_id),
+            selected_ref_ids,
+            self.chat_widget.together_context_handoff_goal(),
+            false,
+        )
+        .await
+        {
+            Ok(plan) => {
+                let draft_text = together_handoff_draft(&plan);
+                let context_refs = plan.kept_refs.clone();
+                self.commit_together_handoff(tui, plan.plan_id, draft_text, context_refs)
+                    .await;
             }
             Err(err) => self
                 .chat_widget
-                .add_error_message(format!("Failed to write repo context: {err}")),
+                .add_error_message(format!("Failed to prepare handoff: {err}")),
         }
     }
 
@@ -957,11 +935,12 @@ impl App {
         })
         .flatten();
         match fetch_together_context_graph(request.query.clone(), current_thread_id).await {
-            Ok(graph) => self.chat_widget.show_together_context_view_with_marks(
+            Ok(graph) => self.chat_widget.show_together_context_view_with_selection(
                 request.query,
                 graph,
                 request.next_scope,
-                request.marked_ref_ids,
+                request.selected_ref_ids,
+                request.handoff_goal,
             ),
             Err(err) => self
                 .chat_widget
@@ -3320,39 +3299,26 @@ impl App {
                 query,
                 graph,
                 scope,
+                selected_ref_ids,
+                handoff_goal,
             } => {
-                self.chat_widget
-                    .show_together_context_view(query, graph, scope);
+                self.chat_widget.show_together_context_view_with_selection(
+                    query,
+                    graph,
+                    scope,
+                    selected_ref_ids.into_iter().collect(),
+                    handoff_goal,
+                );
             }
-            AppEvent::ToggleTogetherContextMark { actual_idx } => {
-                self.chat_widget.toggle_together_context_mark(actual_idx);
+            AppEvent::ToggleTogetherContextSelection { actual_idx } => {
+                self.chat_widget
+                    .toggle_together_context_selection(actual_idx);
             }
             AppEvent::ToggleTogetherContextScope => {
                 self.toggle_together_context_scope().await;
             }
-            AppEvent::AttachTogetherContextSelection { actual_idx } => {
-                self.chat_widget
-                    .attach_together_context_selection(actual_idx);
-            }
             AppEvent::PlanTogetherContextHandoff { actual_idx } => {
-                self.plan_together_context_handoff(actual_idx).await;
-            }
-            AppEvent::PlanTogetherContextWrite { actual_idx } => {
-                self.plan_together_context_write(actual_idx).await;
-            }
-            AppEvent::OpenTogetherHandoffReview { plan } => {
-                self.chat_widget.show_together_handoff_review(plan);
-            }
-            AppEvent::CommitTogetherHandoff {
-                plan_id,
-                draft_text,
-                context_refs,
-            } => {
-                self.commit_together_handoff(tui, plan_id, draft_text, context_refs)
-                    .await;
-            }
-            AppEvent::CommitTogetherContextWrite { plan_id } => {
-                self.commit_together_context_write(plan_id).await;
+                self.plan_together_context_handoff(tui, actual_idx).await;
             }
             AppEvent::SubmitUserMessageWithMode {
                 text,

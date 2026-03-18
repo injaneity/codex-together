@@ -2348,23 +2348,6 @@ impl ChatComposer {
         self.textarea.set_cursor(new_cursor);
     }
 
-    pub(crate) fn insert_context_binding(&mut self, context_ref: ContextRef) {
-        let insert_text = context_binding_text(&context_ref);
-        let needs_leading_space = self
-            .textarea
-            .text()
-            .get(..self.textarea.cursor())
-            .and_then(|prefix| prefix.chars().next_back())
-            .is_some_and(|ch| !ch.is_whitespace());
-        if needs_leading_space {
-            self.textarea.insert_str(" ");
-        }
-        let id = self.textarea.insert_element(&insert_text);
-        self.context_bindings.insert(id, context_ref);
-        self.textarea.insert_str(" ");
-        self.sync_popups();
-    }
-
     fn mention_name_from_insert_text(insert_text: &str) -> Option<String> {
         let name = insert_text.strip_prefix('$')?;
         if name.is_empty() {

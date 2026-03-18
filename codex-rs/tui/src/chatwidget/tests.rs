@@ -104,9 +104,6 @@ use codex_together_protocol::ContextKind;
 use codex_together_protocol::ContextRef;
 use codex_together_protocol::ContextSearchResult;
 use codex_together_protocol::ContextStaleState;
-use codex_together_protocol::ContextWriteFilePlan;
-use codex_together_protocol::ContextWritePlanResponse;
-use codex_together_protocol::HandoffPlanResponse;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_approval_presets::builtin_approval_presets;
 use crossterm::event::KeyCode;
@@ -2287,7 +2284,7 @@ fn together_context_global_scope_orders_derived_repo_note_under_artifact() {
 }
 
 #[tokio::test]
-async fn together_context_view_emits_attach_mark_and_write_events() {
+async fn together_context_view_emits_selection_scope_and_handoff_events() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
     chat.thread_id = Some(
         ThreadId::from_string("019cf3a8-0cf0-7eb1-b748-738284242df8").expect("valid thread id"),
@@ -2309,33 +2306,27 @@ async fn together_context_view_emits_attach_mark_and_write_events() {
         TogetherContextScope::Global,
     );
 
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_matches!(
         rx.try_recv().expect("expected toggle event"),
-        AppEvent::ToggleTogetherContextMark { actual_idx: 0 }
+        AppEvent::ToggleTogetherContextSelection { actual_idx: 0 }
     );
 
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('W'), KeyModifiers::SHIFT));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
     assert_matches!(
-        rx.try_recv().expect("expected write event"),
-        AppEvent::PlanTogetherContextWrite { actual_idx: 0 }
+        rx.try_recv().expect("expected handoff event"),
+        AppEvent::PlanTogetherContextHandoff { actual_idx: 0 }
     );
 
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
     assert_matches!(
         rx.try_recv().expect("expected toggle event"),
         AppEvent::ToggleTogetherContextScope
     );
-
-    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert_matches!(
-        rx.try_recv().expect("expected attach event"),
-        AppEvent::AttachTogetherContextSelection { actual_idx: 0 }
-    );
 }
 
 #[tokio::test]
-async fn together_context_marked_attach_inserts_all_marked_tokens() {
+async fn together_context_action_ref_ids_returns_all_selected_refs() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
 
     chat.show_together_context_view(
@@ -2364,13 +2355,17 @@ async fn together_context_marked_attach_inserts_all_marked_tokens() {
         TogetherContextScope::Global,
     );
 
-    chat.toggle_together_context_mark(0);
-    chat.toggle_together_context_mark(1);
-    chat.attach_together_context_selection(1);
+    chat.toggle_together_context_selection(0);
+    chat.toggle_together_context_selection(1);
 
+    let mut selected_ref_ids = chat.together_context_action_ref_ids(1);
+    selected_ref_ids.sort();
     assert_eq!(
-        chat.composer_text_with_pending(),
-        "[ctx: Planning Overview] [ctx: planning sync] "
+        selected_ref_ids,
+        vec![
+            "ctx:file:.codex/context/overview.md".to_string(),
+            "ctx:thread:thread-1".to_string(),
+        ]
     );
 }
 
@@ -2409,73 +2404,11 @@ async fn together_context_source_thread_id_prefers_selected_shared_thread() {
         Some("thread-1")
     );
 
-    chat.toggle_together_context_mark(1);
+    chat.toggle_together_context_selection(1);
 
     assert_eq!(
         chat.together_context_source_thread_id(0).as_deref(),
         Some("thread-1")
-    );
-}
-
-#[tokio::test]
-async fn together_context_write_review_snapshot() {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
-
-    chat.show_together_context_write_review(ContextWritePlanResponse {
-        plan_id: "write-plan-1".to_string(),
-        files: vec![
-            ContextWriteFilePlan {
-                path: ".codex/context/concepts/planning-overview.md".to_string(),
-                title: "Planning Overview".to_string(),
-                kind: "concept".to_string(),
-                exists: false,
-                content: "---\nid: \"planning-overview\"\nkind: \"concept\"\ntitle: \"Planning Overview\"\napplies_to:\n  branches:\n    - \"rewrite-codex-2gether-v2\"\nsource_threads: []\nsource_files: []\nlast_validated_at: 2026-03-16\n---\n\n# Planning Overview\n"
-                    .to_string(),
-            },
-            ContextWriteFilePlan {
-                path: ".codex/context/decisions/branch-routing.md".to_string(),
-                title: "Branch Routing".to_string(),
-                kind: "decision".to_string(),
-                exists: true,
-                content: "---\nid: \"branch-routing\"\nkind: \"decision\"\ntitle: \"Branch Routing\"\n---\n\n# Branch Routing\n"
-                    .to_string(),
-            },
-        ],
-    });
-
-    let mut terminal = Terminal::new(TestBackend::new(120, 22)).expect("create terminal");
-    terminal
-        .draw(|f| chat.render(f.area(), f.buffer_mut()))
-        .expect("draw context write review");
-    assert_snapshot!("together_context_write_review", terminal.backend());
-}
-
-#[tokio::test]
-async fn insert_together_context_binding_appends_token_and_binding() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
-    chat.set_composer_text("Existing draft".to_string(), Vec::new(), Vec::new());
-
-    let context_ref = ContextRef {
-        ref_id: "ctx:file:.codex/context/overview.md".to_string(),
-        kind: ContextKind::RepoContextFile,
-        display_label: "Planning Overview".to_string(),
-        source_thread_id: None,
-        repo_context_id: Some(".codex/context/overview.md".to_string()),
-        git_branch: Some("rewrite-codex-2gether-v2".to_string()),
-        stale_state: Some(ContextStaleState::Fresh),
-    };
-    chat.insert_together_context_binding(context_ref.clone());
-
-    assert_eq!(
-        chat.composer_text_with_pending(),
-        "Existing draft [ctx: Planning Overview] "
-    );
-    assert_eq!(
-        chat.bottom_pane.composer_context_bindings(),
-        vec![ContextBinding { context_ref }]
     );
 }
 
@@ -2521,52 +2454,6 @@ fn strip_context_tokens_from_submission_removes_bound_tokens_and_rebases_other_e
             Some(mention_token.to_string()),
         )]
     );
-}
-
-#[tokio::test]
-async fn together_handoff_review_snapshot() {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
-
-    chat.show_together_handoff_review(HandoffPlanResponse {
-        plan_id: "plan-1".to_string(),
-        source_thread_id: "thread-local-1".to_string(),
-        goal: Some("isolate mobile expiry investigation".to_string()),
-        selected_node_ids: vec![
-            "ctx:thread:thread-local-1".to_string(),
-            "ctx:file:.codex/context/token-refresh-invariant.md".to_string(),
-        ],
-        kept_refs: vec![
-            ContextRef {
-                ref_id: "ctx:thread:thread-local-1".to_string(),
-                kind: ContextKind::SharedThread,
-                display_label: "mobile refresh expiry".to_string(),
-                source_thread_id: Some("thread-local-1".to_string()),
-                repo_context_id: None,
-                git_branch: Some("rewrite-codex-2gether-v2".to_string()),
-                stale_state: Some(ContextStaleState::Fresh),
-            },
-            ContextRef {
-                ref_id: "ctx:file:.codex/context/token-refresh-invariant.md".to_string(),
-                kind: ContextKind::RepoContextFile,
-                display_label: "token-refresh-invariant".to_string(),
-                source_thread_id: None,
-                repo_context_id: Some(".codex/context/token-refresh-invariant.md".to_string()),
-                git_branch: Some("rewrite-codex-2gether-v2".to_string()),
-                stale_state: Some(ContextStaleState::Fresh),
-            },
-        ],
-        dropped_refs: Vec::new(),
-        token_estimate: 128,
-    });
-
-    let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("create terminal");
-    terminal
-        .draw(|f| chat.render(f.area(), f.buffer_mut()))
-        .expect("draw handoff review");
-    assert_snapshot!("together_handoff_review", terminal.backend());
 }
 
 #[test]

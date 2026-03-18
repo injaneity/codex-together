@@ -2133,9 +2133,12 @@ async fn together_handoff_view_snapshot() {
             ],
         ),
         TogetherContextScope::LocalThread,
-        TogetherContextViewMode::Handoff,
-        HashSet::from([handoff_ref_id.clone()]),
-        Some("Continue the handoff with the key UI nodes.".to_string()),
+        TogetherContextViewSelection {
+            mode: TogetherContextViewMode::Handoff,
+            selected_ref_ids: HashSet::from([handoff_ref_id.clone()]),
+            handoff_goal: Some("Continue the handoff with the key UI nodes.".to_string()),
+            handoff_loading_prompt: None,
+        },
     );
 
     let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("create terminal");
@@ -2539,9 +2542,12 @@ async fn together_handoff_view_emits_selection_and_handoff_events() {
             )],
         ),
         TogetherContextScope::Global,
-        TogetherContextViewMode::Handoff,
-        HashSet::new(),
-        Some("Inspect the latest planning context.".to_string()),
+        TogetherContextViewSelection {
+            mode: TogetherContextViewMode::Handoff,
+            selected_ref_ids: HashSet::new(),
+            handoff_goal: Some("Inspect the latest planning context.".to_string()),
+            handoff_loading_prompt: None,
+        },
     );
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -2582,6 +2588,62 @@ fn together_handoff_loading_prompt_snapshot() {
     );
 
     assert_snapshot!("together_handoff_loading_prompt", prompt);
+}
+
+#[test]
+fn together_handoff_selection_request_uses_default_goal_without_custom_instructions() {
+    let thread_id = "thread-1";
+    let anchor_id = context_anchor_id(Some(thread_id));
+    let file_ref_id = "ctx:file:context-graph";
+    let repo_ref_id = "ctx:file:.codex/context/overview.md";
+    let response = rooted_context_query(
+        Some(thread_id),
+        None,
+        None,
+        vec![
+            thread_context_node(
+                file_ref_id,
+                ThreadArtifactKind::FileRead,
+                "Read context-graph/src/lib.rs",
+                Some("file"),
+                Some("file/context-graph"),
+                Some("context-graph/src/lib.rs"),
+                thread_id,
+            ),
+            repo_context_node(
+                repo_ref_id,
+                RepoMemoryKind::Concept,
+                "Planning Overview",
+                Some("overview"),
+                ".codex/context/overview.md",
+                vec![thread_id],
+                (vec![file_ref_id], vec!["context-graph/src/lib.rs"]),
+            ),
+        ],
+        vec![
+            mounted_edge(&anchor_id, file_ref_id, ContextMountReason::Local),
+            related_edge(file_ref_id, repo_ref_id, "source_ref"),
+        ],
+    );
+
+    let request = together_handoff_selection_request(&response, None);
+
+    assert_eq!(
+        request,
+        codex_core::HandoffSelectionRequest {
+            prompt: "\
+Prepare a Codex handoff from the anchored context tree below.
+Goal: Continue the current task in another Codex thread.
+Choose the smallest useful subset of candidate ref_ids, usually 2 to 4 nodes. Prefer concrete files when the goal is about inspecting or improving specific files.
+Write a short loading prompt for the receiving agent. It should tell the agent to inspect /context from the anchor, continue the goal, and avoid repeating raw context verbatim.
+Candidates:
+- ◯ [file] Read file/context-graph :: ctx:file:context-graph
+- ╰─⏣ [insight] Planning Overview :: ctx:file:.codex/context/overview.md"
+                .to_string(),
+            allowed_ref_ids: vec![file_ref_id.to_string(), repo_ref_id.to_string()],
+            max_selected_ref_ids: 4,
+        }
+    );
 }
 
 #[test]

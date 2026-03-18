@@ -444,6 +444,13 @@ pub(crate) enum AppEvent {
         mode: crate::chatwidget::TogetherContextViewMode,
         selected_ref_ids: Vec<String>,
         handoff_goal: Option<String>,
+        handoff_loading_prompt: Option<String>,
+    },
+
+    /// Ask the live source thread to preselect handoff nodes from the anchored tree.
+    PrepareTogetherHandoffView {
+        query_response: ContextQueryResponse,
+        handoff_goal: Option<String>,
     },
 
     /// Toggle whether the selected collaboration context row is selected.

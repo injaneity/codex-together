@@ -16,6 +16,7 @@ use crate::chatwidget::commit_together_handoff_plan;
 use crate::chatwidget::plan_together_context_handoff;
 use crate::chatwidget::search_together_context;
 use crate::chatwidget::together_handoff_loading_prompt;
+use crate::chatwidget::together_handoff_selection_request;
 use crate::cwd_prompt::CwdPromptAction;
 use crate::diff_render::DiffSummary;
 use crate::exec_command::strip_bash_lc_and_escape;
@@ -898,6 +899,80 @@ impl App {
         }
     }
 
+    async fn prepare_together_handoff_view(
+        &mut self,
+        query_response: codex_together_protocol::ContextQueryResponse,
+        handoff_goal: Option<String>,
+    ) {
+        let scope = crate::chatwidget::TogetherContextScope::default_for(
+            query_response.anchor.current_thread_id.as_deref(),
+        );
+        let mut selected_ref_ids = Vec::new();
+        let mut handoff_loading_prompt = None;
+
+        if let Some(source_thread_id) = query_response.anchor.current_thread_id.clone() {
+            if let Ok(thread_id) = ThreadId::from_string(source_thread_id.as_str()) {
+                match self.server.get_thread(thread_id).await {
+                    Ok(thread) => {
+                        let request = together_handoff_selection_request(
+                            &query_response,
+                            handoff_goal.as_deref(),
+                        );
+                        match thread.select_handoff_context(request).await {
+                            Ok(selection) => {
+                                selected_ref_ids = selection.selected_ref_ids;
+                                handoff_loading_prompt = Some(selection.loading_prompt);
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    "model-assisted handoff selection failed; falling back to server recommendations"
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "failed to load source thread for model-assisted handoff selection"
+                        );
+                    }
+                }
+            }
+
+            if selected_ref_ids.is_empty() {
+                match plan_together_context_handoff(
+                    Some(source_thread_id),
+                    Vec::new(),
+                    handoff_goal.clone(),
+                    true,
+                )
+                .await
+                {
+                    Ok(plan) => selected_ref_ids = plan.selected_node_ids,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "fallback handoff preview failed after model-assisted selection"
+                        );
+                    }
+                }
+            }
+        }
+
+        self.chat_widget.show_together_context_view_with_selection(
+            None,
+            query_response,
+            scope,
+            crate::chatwidget::TogetherContextViewSelection {
+                mode: crate::chatwidget::TogetherContextViewMode::Handoff,
+                selected_ref_ids: selected_ref_ids.into_iter().collect(),
+                handoff_goal,
+                handoff_loading_prompt,
+            },
+        );
+    }
+
     async fn plan_together_context_handoff(&mut self, tui: &mut tui::Tui, actual_idx: usize) {
         let source_thread_id = self
             .chat_widget
@@ -918,7 +993,6 @@ impl App {
                 .add_error_message("No collaboration context is selected.".to_string());
             return;
         }
-        let selected_node_labels = self.chat_widget.together_context_selected_node_labels();
 
         match plan_together_context_handoff(
             Some(source_thread_id),
@@ -929,8 +1003,15 @@ impl App {
         .await
         {
             Ok(plan) => {
-                let draft_text =
-                    together_handoff_loading_prompt(plan.goal.as_deref(), &selected_node_labels);
+                let draft_text = self
+                    .chat_widget
+                    .together_context_handoff_loading_prompt()
+                    .filter(|prompt| !prompt.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        let selected_node_labels =
+                            self.chat_widget.together_context_selected_node_labels();
+                        together_handoff_loading_prompt(plan.goal.as_deref(), &selected_node_labels)
+                    });
                 self.commit_together_handoff(
                     tui,
                     plan.plan_id,
@@ -3300,15 +3381,26 @@ impl App {
                 mode,
                 selected_ref_ids,
                 handoff_goal,
+                handoff_loading_prompt,
             } => {
                 self.chat_widget.show_together_context_view_with_selection(
                     query,
                     query_response,
                     scope,
-                    mode,
-                    selected_ref_ids.into_iter().collect(),
-                    handoff_goal,
+                    crate::chatwidget::TogetherContextViewSelection {
+                        mode,
+                        selected_ref_ids: selected_ref_ids.into_iter().collect(),
+                        handoff_goal,
+                        handoff_loading_prompt,
+                    },
                 );
+            }
+            AppEvent::PrepareTogetherHandoffView {
+                query_response,
+                handoff_goal,
+            } => {
+                self.prepare_together_handoff_view(query_response, handoff_goal)
+                    .await;
             }
             AppEvent::ToggleTogetherContextSelection { actual_idx } => {
                 self.chat_widget

@@ -8241,9 +8241,7 @@ impl ChatWidget {
             query,
             query_response,
             scope,
-            TogetherContextViewMode::Browse,
-            HashSet::new(),
-            None,
+            TogetherContextViewSelection::default(),
         );
     }
 
@@ -8252,9 +8250,7 @@ impl ChatWidget {
         query: Option<String>,
         query_response: ContextQueryResponse,
         scope: TogetherContextScope,
-        mode: TogetherContextViewMode,
-        selected_ref_ids: HashSet<String>,
-        handoff_goal: Option<String>,
+        selection: TogetherContextViewSelection,
     ) {
         if query_response.nodes.is_empty() {
             let scope = query.unwrap_or_else(|| "current repo".to_string());
@@ -8264,14 +8260,15 @@ impl ChatWidget {
 
         let rows = together_context_rows_for_scope(&query_response, scope);
         let state = Arc::new(Mutex::new(TogetherContextViewState {
-            mode,
+            mode: selection.mode,
             query: query.clone(),
             scope,
             rows: rows.clone(),
             query_response: query_response.clone(),
             selected_actual_idx: 0,
-            selected_ref_ids,
-            handoff_goal,
+            selected_ref_ids: selection.selected_ref_ids,
+            handoff_goal: selection.handoff_goal,
+            handoff_loading_prompt: selection.handoff_loading_prompt,
         }));
         self.together_context_view_state = Some(Arc::clone(&state));
         let params = self.together_context_view_params(
@@ -8353,6 +8350,12 @@ impl ChatWidget {
         let state = self.together_context_view_state.as_ref()?;
         let state = lock_together_context_view_state(state);
         state.handoff_goal.clone()
+    }
+
+    pub(crate) fn together_context_handoff_loading_prompt(&self) -> Option<String> {
+        let state = self.together_context_view_state.as_ref()?;
+        let state = lock_together_context_view_state(state);
+        state.handoff_loading_prompt.clone()
     }
 
     pub(crate) fn together_context_selected_node_labels(&self) -> Vec<String> {
@@ -8586,6 +8589,7 @@ impl ChatWidget {
                                 mode,
                                 selected_ref_ids,
                                 handoff_goal,
+                                handoff_loading_prompt,
                             } => {
                                 tx.send(AppEvent::OpenTogetherContextView {
                                     query,
@@ -8593,6 +8597,16 @@ impl ChatWidget {
                                     scope,
                                     mode,
                                     selected_ref_ids,
+                                    handoff_goal,
+                                    handoff_loading_prompt,
+                                });
+                            }
+                            TogetherCommandFollowUp::PrepareHandoffView {
+                                query_response,
+                                handoff_goal,
+                            } => {
+                                tx.send(AppEvent::PrepareTogetherHandoffView {
+                                    query_response,
                                     handoff_goal,
                                 });
                             }
@@ -8727,6 +8741,11 @@ enum TogetherCommandFollowUp {
         mode: TogetherContextViewMode,
         selected_ref_ids: Vec<String>,
         handoff_goal: Option<String>,
+        handoff_loading_prompt: Option<String>,
+    },
+    PrepareHandoffView {
+        query_response: ContextQueryResponse,
+        handoff_goal: Option<String>,
     },
 }
 
@@ -8737,7 +8756,7 @@ pub(crate) enum TogetherContextScope {
 }
 
 impl TogetherContextScope {
-    fn default_for(current_thread_ref_id: Option<&str>) -> Self {
+    pub(crate) fn default_for(current_thread_ref_id: Option<&str>) -> Self {
         if current_thread_ref_id.is_some() {
             Self::LocalThread
         } else {
@@ -8753,6 +8772,25 @@ pub(crate) enum TogetherContextViewMode {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct TogetherContextViewSelection {
+    pub(crate) mode: TogetherContextViewMode,
+    pub(crate) selected_ref_ids: HashSet<String>,
+    pub(crate) handoff_goal: Option<String>,
+    pub(crate) handoff_loading_prompt: Option<String>,
+}
+
+impl Default for TogetherContextViewSelection {
+    fn default() -> Self {
+        Self {
+            mode: TogetherContextViewMode::Browse,
+            selected_ref_ids: HashSet::new(),
+            handoff_goal: None,
+            handoff_loading_prompt: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct TogetherContextViewState {
     mode: TogetherContextViewMode,
     query: Option<String>,
@@ -8762,6 +8800,7 @@ struct TogetherContextViewState {
     selected_actual_idx: usize,
     selected_ref_ids: HashSet<String>,
     handoff_goal: Option<String>,
+    handoff_loading_prompt: Option<String>,
 }
 
 impl Default for TogetherContextViewState {
@@ -8788,6 +8827,7 @@ impl Default for TogetherContextViewState {
             selected_actual_idx: 0,
             selected_ref_ids: HashSet::new(),
             handoff_goal: None,
+            handoff_loading_prompt: None,
         }
     }
 }
@@ -9383,6 +9423,76 @@ pub(crate) fn together_handoff_loading_prompt(
     sections.join("\n\n")
 }
 
+pub(crate) fn together_handoff_selection_request(
+    query_response: &ContextQueryResponse,
+    handoff_goal: Option<&str>,
+) -> codex_core::HandoffSelectionRequest {
+    const HANDOFF_SELECTION_LIMIT: usize = 4;
+
+    let rows = together_context_rows_for_scope(
+        query_response,
+        TogetherContextScope::default_for(query_response.anchor.current_thread_id.as_deref()),
+    );
+    let mut prompt_lines = vec![
+        "Prepare a Codex handoff from the anchored context tree below.".to_string(),
+        match handoff_goal.map(str::trim).filter(|goal| !goal.is_empty()) {
+            Some(goal) => format!("Goal: {goal}"),
+            None => "Goal: Continue the current task in another Codex thread.".to_string(),
+        },
+        "Choose the smallest useful subset of candidate ref_ids, usually 2 to 4 nodes. Prefer concrete files when the goal is about inspecting or improving specific files.".to_string(),
+        "Write a short loading prompt for the receiving agent. It should tell the agent to inspect /context from the anchor, continue the goal, and avoid repeating raw context verbatim.".to_string(),
+        "Candidates:".to_string(),
+    ];
+    let mut allowed_ref_ids = Vec::with_capacity(rows.len());
+    for row in rows {
+        let ref_id = together_context_row_node_id(&row).to_string();
+        allowed_ref_ids.push(ref_id.clone());
+        let mut line = format!(
+            "- {}{} [{}] {} :: {}",
+            together_context_tree_text_prefix(&row),
+            together_context_marker_text(&row.node),
+            together_context_tag_label(&row.node),
+            together_context_display_name(&row),
+            ref_id
+        );
+        if let Some(description) = together_context_row_description(&row, &query_response.anchor) {
+            line.push_str(&format!(" ({description})"));
+        }
+        prompt_lines.push(line);
+    }
+
+    codex_core::HandoffSelectionRequest {
+        prompt: prompt_lines.join("\n"),
+        allowed_ref_ids,
+        max_selected_ref_ids: HANDOFF_SELECTION_LIMIT,
+    }
+}
+
+fn together_context_tree_text_prefix(row: &TogetherContextTreeRow) -> String {
+    let mut prefix = String::new();
+    for has_more_siblings in &row.tree_guides {
+        prefix.push_str(if *has_more_siblings { "│ " } else { "  " });
+    }
+    if row.has_parent {
+        prefix.push_str(if row.is_last_sibling {
+            "╰─"
+        } else {
+            "├─"
+        });
+    }
+    if together_context_is_hotspot(&row.node) {
+        prefix.push_str("* ");
+    }
+    prefix
+}
+
+fn together_context_marker_text(node: &ContextQueryNode) -> &'static str {
+    match node {
+        ContextQueryNode::Thread(_) => "◯",
+        ContextQueryNode::Repo(_) => "⏣",
+    }
+}
+
 fn together_context_token(context_ref: &ContextRef) -> String {
     format!("[ctx: {}]", context_ref.display_label)
 }
@@ -9722,7 +9832,7 @@ impl TogetherRpcClient {
 async fn execute_together_command(
     args: String,
     current_thread_id: Option<String>,
-    current_selected_ref_ids: Vec<String>,
+    _current_selected_ref_ids: Vec<String>,
 ) -> anyhow::Result<TogetherCommandOutput> {
     let argv = shlex::split(&args).ok_or_else(|| {
         anyhow::anyhow!("invalid shell-like quoting in together command: `{args}`")
@@ -10021,6 +10131,7 @@ async fn execute_together_command(
                     mode: TogetherContextViewMode::Browse,
                     selected_ref_ids: Vec::new(),
                     handoff_goal: None,
+                    handoff_loading_prompt: None,
                 }),
             })
         }
@@ -10028,49 +10139,26 @@ async fn execute_together_command(
             let Some(source_thread_id) = current_thread_id else {
                 anyhow::bail!("cannot create a handoff without an active thread");
             };
-            let endpoint = current_together_endpoint();
-            let mut client = connect_and_auth(&endpoint).await?;
             let goal = if rest.is_empty() {
                 None
             } else {
                 Some(rest.join(" "))
             };
-            let plan: HandoffPlanResponse = client
-                .call(
-                    METHOD_HANDOFF_PLAN,
-                    HandoffPlanParams {
-                        source_thread_id: Some(source_thread_id),
-                        selected_ref_ids: current_selected_ref_ids,
-                        goal,
-                        preview_only: true,
-                    },
-                )
-                .await?;
             let query_response =
-                fetch_together_context_query(None, Some(plan.source_thread_id.clone())).await?;
+                fetch_together_context_query(None, Some(source_thread_id.clone())).await?;
 
-            let hint = Some(match &plan.goal {
+            let hint = Some(match &goal {
                 Some(goal) => format!(
-                    "Goal: {goal}\nRecommended {} context item(s) from thread {}.",
-                    plan.selected_node_ids.len(),
-                    plan.source_thread_id
+                    "Goal: {goal}\nPreparing handoff context from thread {source_thread_id}."
                 ),
-                None => format!(
-                    "Recommended {} context item(s) from thread {}.",
-                    plan.selected_node_ids.len(),
-                    plan.source_thread_id
-                ),
+                None => format!("Preparing handoff context from thread {source_thread_id}."),
             });
             Ok(TogetherCommandOutput {
-                message: "Review and confirm the handoff context.".to_string(),
+                message: "Preparing the handoff context.".to_string(),
                 hint,
-                follow_up: Some(TogetherCommandFollowUp::OpenContextView {
-                    query: None,
+                follow_up: Some(TogetherCommandFollowUp::PrepareHandoffView {
                     query_response,
-                    scope: TogetherContextScope::default_for(Some(plan.source_thread_id.as_str())),
-                    mode: TogetherContextViewMode::Handoff,
-                    selected_ref_ids: plan.selected_node_ids,
-                    handoff_goal: plan.goal,
+                    handoff_goal: goal,
                 }),
             })
         }

@@ -1841,16 +1841,16 @@ pub(crate) fn build_specs(
 
     builder.push_spec_with_parallel_support(create_view_image_tool(), true);
     builder.register_handler("view_image", view_image_handler);
+    builder.push_spec_with_parallel_support(create_context_graph_tool(), true);
+    builder.register_handler(CONTEXT_GRAPH_TOOL_NAME, context_graph_handler);
 
     if config.collab_tools {
         let multi_agent_handler = Arc::new(MultiAgentHandler);
-        builder.push_spec_with_parallel_support(create_context_graph_tool(), true);
         builder.push_spec(create_spawn_agent_tool(config));
         builder.push_spec(create_send_input_tool());
         builder.push_spec(create_resume_agent_tool());
         builder.push_spec(create_wait_tool());
         builder.push_spec(create_close_agent_tool());
-        builder.register_handler(CONTEXT_GRAPH_TOOL_NAME, context_graph_handler);
         builder.register_handler("spawn_agent", multi_agent_handler.clone());
         builder.register_handler("send_input", multi_agent_handler.clone());
         builder.register_handler("resume_agent", multi_agent_handler.clone());
@@ -2099,6 +2099,7 @@ mod tests {
                 external_web_access: Some(true),
             },
             create_view_image_tool(),
+            create_context_graph_tool(),
         ] {
             expected.insert(tool_name(&spec).to_string(), spec);
         }
@@ -2434,6 +2435,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "context_graph",
             ],
         );
     }
@@ -2452,6 +2454,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "context_graph",
             ],
         );
     }
@@ -2472,6 +2475,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "context_graph",
             ],
         );
     }
@@ -2492,6 +2496,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "context_graph",
             ],
         );
     }
@@ -2510,6 +2515,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "context_graph",
             ],
         );
     }
@@ -2528,6 +2534,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "context_graph",
             ],
         );
     }
@@ -2545,6 +2552,7 @@ mod tests {
                 "request_user_input",
                 "web_search",
                 "view_image",
+                "context_graph",
             ],
         );
     }
@@ -2563,6 +2571,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "context_graph",
             ],
         );
     }
@@ -2583,6 +2592,7 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "view_image",
+                "context_graph",
             ],
         );
     }

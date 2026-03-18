@@ -246,30 +246,12 @@ impl ThreadHistoryBuilder {
         };
 
         let raw_output = output.body.to_text().unwrap_or_default();
-        let parsed_output = serde_json::from_str::<ContextGraphToolOutput>(&raw_output).ok();
-        let success = output.success.unwrap_or(true) && parsed_output.is_some();
-        let result_ref_ids = parsed_output
-            .as_ref()
-            .map(|payload| payload.result_ref_ids.clone())
-            .unwrap_or_default();
-        let summary = parsed_output
-            .as_ref()
-            .map(|payload| payload.summary.clone())
-            .or_else(|| {
-                let text = raw_output.trim();
-                (!text.is_empty()).then(|| text.to_string())
-            });
-
-        self.upsert_item_in_current_turn(ThreadItem::ContextGraphQuery {
-            id: call_id.to_string(),
-            operation: call.operation,
-            scope: call.scope,
-            query: call.query,
-            ref_ids: call.ref_ids,
-            result_ref_ids,
-            summary,
-            success,
-        });
+        self.upsert_item_in_current_turn(context_graph_query_item(
+            call_id.to_string(),
+            call,
+            raw_output.as_str(),
+            output.success.unwrap_or(true),
+        ));
     }
 
     fn handle_user_message(&mut self, payload: &UserMessageEvent) {
@@ -501,6 +483,25 @@ impl ThreadHistoryBuilder {
         &mut self,
         payload: &codex_protocol::dynamic_tools::DynamicToolCallRequest,
     ) {
+        if payload.tool == CONTEXT_GRAPH_TOOL_NAME
+            && let Ok(args) =
+                serde_json::from_value::<ContextGraphToolArgs>(payload.arguments.clone())
+        {
+            self.pending_context_graph_calls.insert(
+                payload.call_id.clone(),
+                PendingContextGraphCall {
+                    operation: args.op.into(),
+                    scope: args.scope.into(),
+                    query: args
+                        .query
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|query| !query.is_empty())
+                        .map(str::to_string),
+                    ref_ids: context_graph_ref_ids(&args),
+                },
+            );
+        }
         let item = ThreadItem::DynamicToolCall {
             id: payload.call_id.clone(),
             tool: payload.tool.clone(),
@@ -518,6 +519,36 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_dynamic_tool_call_response(&mut self, payload: &DynamicToolCallResponseEvent) {
+        if let Some(call) = self.pending_context_graph_calls.remove(&payload.call_id) {
+            let mut raw_output = String::new();
+            let mut only_text_items = true;
+            for item in &payload.content_items {
+                match item {
+                    codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem::InputText {
+                        text,
+                    } => raw_output.push_str(text),
+                    codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem::InputImage {
+                        ..
+                    } => {
+                        only_text_items = false;
+                        break;
+                    }
+                }
+            }
+            if only_text_items {
+                self.upsert_item_in_turn_id(
+                    &payload.turn_id,
+                    context_graph_query_item(
+                        payload.call_id.clone(),
+                        call,
+                        raw_output.as_str(),
+                        payload.success,
+                    ),
+                );
+                return;
+            }
+        }
+
         let status = if payload.success {
             DynamicToolCallStatus::Completed
         } else {
@@ -1133,6 +1164,38 @@ struct PendingContextGraphCall {
     ref_ids: Vec<String>,
 }
 
+fn context_graph_query_item(
+    id: String,
+    call: PendingContextGraphCall,
+    raw_output: &str,
+    success: bool,
+) -> ThreadItem {
+    let parsed_output = serde_json::from_str::<ContextGraphToolOutput>(raw_output).ok();
+    let success = success && parsed_output.is_some();
+    let result_ref_ids = parsed_output
+        .as_ref()
+        .map(|payload| payload.result_ref_ids.clone())
+        .unwrap_or_default();
+    let summary = parsed_output
+        .as_ref()
+        .map(|payload| payload.summary.clone())
+        .or_else(|| {
+            let text = raw_output.trim();
+            (!text.is_empty()).then(|| text.to_string())
+        });
+
+    ThreadItem::ContextGraphQuery {
+        id,
+        operation: call.operation,
+        scope: call.scope,
+        query: call.query,
+        ref_ids: call.ref_ids,
+        result_ref_ids,
+        summary,
+        success,
+    }
+}
+
 fn context_graph_ref_ids(args: &ContextGraphToolArgs) -> Vec<String> {
     let mut ref_ids = Vec::new();
     if let Some(ref_id) = args
@@ -1534,6 +1597,94 @@ mod tests {
                 summary: Some("context node not found".into()),
                 success: false,
             }]
+        );
+    }
+
+    #[test]
+    fn reconstructs_legacy_context_graph_dynamic_tool_response() {
+        let args = ContextGraphToolArgs {
+            op: ContextGraphToolOperation::Search,
+            scope: ContextGraphToolScope::Global,
+            query: Some("handoff".to_string()),
+            ref_id: None,
+            ref_ids: vec!["ctx:thread-insight:thread-1:note-1".to_string()],
+            limit: Some(5),
+        };
+        let output = ContextGraphToolOutput {
+            op: ContextGraphToolOperation::Search,
+            scope: ContextGraphToolScope::Global,
+            summary: "1 global context match(es) for handoff".to_string(),
+            result_ref_ids: vec!["ctx:thread-insight:thread-1:note-1".to_string()],
+            data: serde_json::json!({
+                "results": [
+                    {
+                        "refId": "ctx:thread-insight:thread-1:note-1",
+                        "title": "Planning note",
+                    }
+                ],
+            }),
+        };
+        let events = vec![
+            EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: "turn-1".into(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }),
+            EventMsg::UserMessage(UserMessageEvent {
+                message: "load thread context".into(),
+                images: None,
+                text_elements: Vec::new(),
+                local_images: Vec::new(),
+            }),
+            EventMsg::DynamicToolCallRequest(
+                codex_protocol::dynamic_tools::DynamicToolCallRequest {
+                    call_id: "graph-dyn-1".into(),
+                    turn_id: "turn-1".into(),
+                    tool: CONTEXT_GRAPH_TOOL_NAME.to_string(),
+                    arguments: serde_json::to_value(&args).expect("serialize args"),
+                },
+            ),
+            EventMsg::DynamicToolCallResponse(DynamicToolCallResponseEvent {
+                call_id: "graph-dyn-1".into(),
+                turn_id: "turn-1".into(),
+                tool: CONTEXT_GRAPH_TOOL_NAME.to_string(),
+                arguments: serde_json::to_value(&args).expect("serialize args"),
+                content_items: vec![CoreDynamicToolCallOutputContentItem::InputText {
+                    text: serde_json::to_string(&output).expect("serialize output"),
+                }],
+                success: true,
+                error: None,
+                duration: Duration::from_millis(7),
+            }),
+        ];
+
+        let items = events
+            .into_iter()
+            .map(RolloutItem::EventMsg)
+            .collect::<Vec<_>>();
+        let turns = build_turns_from_rollout_items(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].items,
+            vec![
+                ThreadItem::UserMessage {
+                    id: "item-1".into(),
+                    content: vec![UserInput::Text {
+                        text: "load thread context".into(),
+                        text_elements: Vec::new(),
+                    }],
+                },
+                ThreadItem::ContextGraphQuery {
+                    id: "graph-dyn-1".into(),
+                    operation: ContextGraphQueryOperation::Search,
+                    scope: ContextGraphQueryScope::Global,
+                    query: Some("handoff".into()),
+                    ref_ids: vec!["ctx:thread-insight:thread-1:note-1".into()],
+                    result_ref_ids: vec!["ctx:thread-insight:thread-1:note-1".into()],
+                    summary: Some("1 global context match(es) for handoff".into()),
+                    success: true,
+                },
+            ]
         );
     }
 

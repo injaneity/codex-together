@@ -15,7 +15,7 @@ use crate::chatwidget::ExternalEditorState;
 use crate::chatwidget::commit_together_handoff_plan;
 use crate::chatwidget::plan_together_context_handoff;
 use crate::chatwidget::search_together_context;
-use crate::chatwidget::together_handoff_draft;
+use crate::chatwidget::together_handoff_loading_prompt;
 use crate::cwd_prompt::CwdPromptAction;
 use crate::diff_render::DiffSummary;
 use crate::exec_command::strip_bash_lc_and_escape;
@@ -775,6 +775,8 @@ impl App {
         tui: &mut tui::Tui,
         plan_id: String,
         draft_text: String,
+        handoff_goal: Option<String>,
+        selected_node_count: usize,
     ) {
         let response = match commit_together_handoff_plan(
             plan_id,
@@ -861,13 +863,30 @@ impl App {
                     self.chat_widget
                         .set_composer_text(draft_text, Vec::new(), Vec::new());
                 }
-                self.chat_widget.add_info_message(
-                    format!(
-                        "Opened handoff thread {} from source {}.",
-                        response.thread_id, response.source_thread_id
-                    ),
-                    None,
-                );
+                let node_label = if selected_node_count == 1 {
+                    "1 mounted node".to_string()
+                } else {
+                    format!("{selected_node_count} mounted nodes")
+                };
+                let mut lines = vec![Line::from(vec!["• ".dim(), "Handoff ready".cyan().bold()])];
+                lines.push(Line::from(vec![
+                    "  Review ".into(),
+                    "/context".cyan(),
+                    " to inspect ".into(),
+                    node_label.into(),
+                    " from the source thread.".into(),
+                ]));
+                if let Some(goal) = handoff_goal
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|goal| !goal.is_empty())
+                {
+                    lines.push(Line::from(vec!["  Goal: ".dim(), goal.to_string().into()]));
+                }
+                lines.push(Line::from(
+                    "  A loading prompt has been prepared in the composer.".dim(),
+                ));
+                self.chat_widget.add_plain_history_lines(lines);
             }
             Err(err) => {
                 let path_display = rollout_path.display();
@@ -899,6 +918,7 @@ impl App {
                 .add_error_message("No collaboration context is selected.".to_string());
             return;
         }
+        let selected_node_labels = self.chat_widget.together_context_selected_node_labels();
 
         match plan_together_context_handoff(
             Some(source_thread_id),
@@ -909,9 +929,16 @@ impl App {
         .await
         {
             Ok(plan) => {
-                let draft_text = together_handoff_draft(&plan);
-                self.commit_together_handoff(tui, plan.plan_id, draft_text)
-                    .await;
+                let draft_text =
+                    together_handoff_loading_prompt(plan.goal.as_deref(), &selected_node_labels);
+                self.commit_together_handoff(
+                    tui,
+                    plan.plan_id,
+                    draft_text,
+                    plan.goal,
+                    plan.selected_node_ids.len(),
+                )
+                .await;
             }
             Err(err) => self
                 .chat_widget

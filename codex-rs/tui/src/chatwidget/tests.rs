@@ -2557,6 +2557,27 @@ async fn empty_together_handoff_prompt_still_opens_handoff_selection() {
     );
 }
 
+#[test]
+fn together_handoff_loading_prompt_snapshot() {
+    let prompt = together_handoff_loading_prompt(
+        Some("Keep the files that determine how context is tracked."),
+        &[
+            "Read context-graph/src/lib.rs".to_string(),
+            "Read tui/src/chatwidget.rs".to_string(),
+            "Search: Search results in lib.rs".to_string(),
+        ],
+    );
+
+    assert_snapshot!("together_handoff_loading_prompt", prompt);
+}
+
+#[test]
+fn together_is_contextual_replay_text_skips_chained_context_payloads() {
+    let chained = "# AGENTS.md instructions for /tmp\n\n<INSTRUCTIONS>\nbody\n</INSTRUCTIONS><environment_context>\n<body>\n</environment_context>";
+
+    assert!(together_is_contextual_replay_text(chained));
+}
+
 #[tokio::test]
 async fn together_context_action_ref_ids_returns_all_selected_refs() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
@@ -5897,6 +5918,7 @@ async fn slash_copy_does_not_return_stale_output_after_thread_rollback() {
 }
 
 #[tokio::test]
+#[serial_test::serial(together_status)]
 async fn slash_exit_requests_exit() {
     let _guard = TogetherStatusGuard::set("disconnected");
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
@@ -5907,6 +5929,7 @@ async fn slash_exit_requests_exit() {
 }
 
 #[test]
+#[serial_test::serial(together_status)]
 fn together_exit_command_stops_for_hosts() {
     let _guard = TogetherStatusGuard::set("together host:srv_123");
 
@@ -5914,6 +5937,7 @@ fn together_exit_command_stops_for_hosts() {
 }
 
 #[test]
+#[serial_test::serial(together_status)]
 fn together_exit_command_leaves_for_members() {
     let _guard = TogetherStatusGuard::set("together server:srv_123");
 

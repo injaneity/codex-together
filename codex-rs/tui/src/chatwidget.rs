@@ -8215,7 +8215,7 @@ impl ChatWidget {
         let tx = self.app_event_tx.clone();
         let view = CustomPromptView::new_allow_empty(
             "Handoff instructions".to_string(),
-            "Add optional instructions for the receiving agent, then press Enter".to_string(),
+            "Add optional instructions to preselect context and seed the receiving prompt, then press Enter".to_string(),
             None,
             Box::new(move |value: String| {
                 let trimmed = value.trim();
@@ -8367,6 +8367,23 @@ impl ChatWidget {
         state.handoff_goal.clone()
     }
 
+    pub(crate) fn together_context_selected_node_labels(&self) -> Vec<String> {
+        let Some(state) = self.together_context_view_state.as_ref() else {
+            return Vec::new();
+        };
+        let state = lock_together_context_view_state(state);
+        state
+            .rows
+            .iter()
+            .filter(|row| {
+                state
+                    .selected_ref_ids
+                    .contains(together_context_row_node_id(row))
+            })
+            .map(together_context_row_name)
+            .collect()
+    }
+
     pub(crate) fn together_context_source_thread_id(&self, actual_idx: usize) -> Option<String> {
         let state = self.together_context_view_state.as_ref()?;
         let state = lock_together_context_view_state(state);
@@ -8447,16 +8464,17 @@ impl ChatWidget {
         state: Arc<Mutex<TogetherContextViewState>>,
         initial_selected_idx: Option<usize>,
     ) -> SelectionViewParams {
-        let (mode, scope, selected_ref_ids, has_thread_context) = {
+        let (mode, scope, selected_ref_ids, has_thread_context, handoff_goal) = {
             let state = lock_together_context_view_state(&state);
             (
                 state.mode,
                 state.scope,
                 state.selected_ref_ids.clone(),
                 state.query_response.anchor.current_thread_id.is_some(),
+                state.handoff_goal.clone(),
             )
         };
-        let header = together_context_header(scope, has_thread_context, query);
+        let header = together_context_header(mode, scope, has_thread_context, query, handoff_goal);
         let footer_note = Some(together_context_status_line(mode, has_thread_context));
         let items = if rows.is_empty() {
             vec![together_context_empty_state_item(scope, has_thread_context)]
@@ -8834,12 +8852,24 @@ fn lock_together_context_view_state(
 }
 
 fn together_context_header(
+    mode: TogetherContextViewMode,
     scope: TogetherContextScope,
     has_thread_context: bool,
     query: Option<String>,
+    handoff_goal: Option<String>,
 ) -> ColumnRenderable<'static> {
     let mut header = ColumnRenderable::new();
-    header.push(Line::from("Context".bold()));
+    header.push(Line::from(match mode {
+        TogetherContextViewMode::Browse => "Context".bold(),
+        TogetherContextViewMode::Handoff => "Handoff".bold(),
+    }));
+    if let Some(goal) = handoff_goal
+        .as_deref()
+        .map(str::trim)
+        .filter(|goal| !goal.is_empty())
+    {
+        header.push(Line::from(vec!["Goal: ".dim(), goal.to_string().into()]));
+    }
     header.push(together_context_scope_selector_line(
         scope,
         has_thread_context,
@@ -9339,13 +9369,36 @@ fn together_context_inline_excerpt(text: &str, max_chars: usize) -> String {
     format!("{truncated}…")
 }
 
-pub(crate) fn together_handoff_draft(plan: &HandoffPlanResponse) -> String {
-    plan.goal
-        .as_deref()
-        .map(str::trim)
-        .filter(|goal| !goal.is_empty())
-        .map(str::to_string)
-        .unwrap_or_default()
+pub(crate) fn together_handoff_loading_prompt(
+    goal: Option<&str>,
+    selected_node_labels: &[String],
+) -> String {
+    let mut sections = vec!["Continue this handoff in the current repository.".to_string()];
+    if let Some(goal) = goal.map(str::trim).filter(|goal| !goal.is_empty()) {
+        sections.push(format!("Goal: {goal}"));
+    }
+    sections.push(
+        "Use /context to inspect the mounted handoff nodes from this thread's anchor before making changes."
+            .to_string(),
+    );
+    if !selected_node_labels.is_empty() {
+        let mut focus_lines = selected_node_labels
+            .iter()
+            .take(5)
+            .map(|label| format!("- {label}"))
+            .collect::<Vec<_>>();
+        if selected_node_labels.len() > focus_lines.len() {
+            focus_lines.push(format!(
+                "- and {} more mounted node(s)",
+                selected_node_labels.len() - focus_lines.len()
+            ));
+        }
+        sections.push(format!("Focus first on:\n{}", focus_lines.join("\n")));
+    }
+    sections.push(
+        "Start by summarizing the relevant mounted context, then continue the task.".to_string(),
+    );
+    sections.join("\n\n")
 }
 
 fn together_context_token(context_ref: &ContextRef) -> String {
@@ -9443,6 +9496,8 @@ fn together_should_skip_replayed_initial_message(msg: &EventMsg) -> bool {
 fn together_is_contextual_replay_text(text: &str) -> bool {
     let trimmed_start = text.trim_start();
     let trimmed = trimmed_start.trim_end();
+    let trimmed_start_lower = trimmed_start.to_ascii_lowercase();
+    let trimmed_lower = trimmed.to_ascii_lowercase();
     [
         ("# AGENTS.md instructions for ", "</INSTRUCTIONS>"),
         (
@@ -9460,12 +9515,8 @@ fn together_is_contextual_replay_text(text: &str) -> bool {
     ]
     .iter()
     .any(|(start_marker, end_marker)| {
-        trimmed_start
-            .get(..start_marker.len())
-            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(start_marker))
-            && trimmed
-                .get(trimmed.len().saturating_sub(end_marker.len())..)
-                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(end_marker))
+        trimmed_start_lower.starts_with(&start_marker.to_ascii_lowercase())
+            && trimmed_lower.contains(&end_marker.to_ascii_lowercase())
     })
 }
 
@@ -10029,7 +10080,7 @@ async fn execute_together_command(
                 ),
             });
             Ok(TogetherCommandOutput {
-                message: "Opened handoff selection.".to_string(),
+                message: "Review and confirm the handoff context.".to_string(),
                 hint,
                 follow_up: Some(TogetherCommandFollowUp::OpenContextView {
                     query: None,

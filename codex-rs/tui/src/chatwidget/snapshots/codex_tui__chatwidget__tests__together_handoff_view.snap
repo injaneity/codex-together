@@ -4,7 +4,8 @@ expression: terminal.backend()
 ---
 "                                                                                                                        "
 "                                                                                                                        "
-"  Context                                                                                                               "
+"  Handoff                                                                                                               "
+"  Goal: Continue the handoff with the key UI nodes.                                                                     "
 "  Scope: [Local thread] [Global graph]                                                                                  "
 "                                                                                                                        "
 "  Filter mounted context                                                                                                "
@@ -12,7 +13,6 @@ expression: terminal.backend()
 "  [x] ◯ Simplify /context selection flow  handoff · plan                                                                "
 "                                                                                                                        "
 "  enter toggle | t scope | h handoff | esc close                                                                        "
-"                                                                                                                        "
 "                                                                                                                        "
 "                                                                                                                        "
 "                                                                                                                        "

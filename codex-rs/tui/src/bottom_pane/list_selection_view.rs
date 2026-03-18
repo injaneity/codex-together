@@ -6,6 +6,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Constraint;
 use ratatui::layout::Layout;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
@@ -129,6 +130,7 @@ pub(crate) struct SelectionItem {
     pub name: String,
     pub name_prefix_spans: Vec<Span<'static>>,
     pub selected_name_prefix_spans: Vec<Span<'static>>,
+    pub category_tag: Option<String>,
     pub display_shortcut: Option<KeyBinding>,
     pub description: Option<String>,
     pub selected_description: Option<String>,
@@ -157,11 +159,14 @@ pub(crate) struct SelectionViewParams {
     pub subtitle: Option<String>,
     pub footer_note: Option<Line<'static>>,
     pub footer_hint: Option<Line<'static>>,
+    pub footer_right: Option<Line<'static>>,
     pub items: Vec<SelectionItem>,
     pub is_searchable: bool,
     pub search_placeholder: Option<String>,
     pub col_width_mode: ColumnWidthMode,
     pub single_line_rows: bool,
+    pub show_entry_prefix: bool,
+    pub selected_row_style: Option<Style>,
     pub header: Box<dyn Renderable>,
     pub initial_selected_idx: Option<usize>,
 
@@ -207,11 +212,14 @@ impl Default for SelectionViewParams {
             subtitle: None,
             footer_note: None,
             footer_hint: None,
+            footer_right: None,
             items: Vec::new(),
             is_searchable: false,
             search_placeholder: None,
             col_width_mode: ColumnWidthMode::AutoVisible,
             single_line_rows: false,
+            show_entry_prefix: true,
+            selected_row_style: None,
             header: Box::new(()),
             initial_selected_idx: None,
             side_content: Box::new(()),
@@ -236,6 +244,7 @@ pub(crate) struct ListSelectionView {
     view_id: Option<&'static str>,
     footer_note: Option<Line<'static>>,
     footer_hint: Option<Line<'static>>,
+    footer_right: Option<Line<'static>>,
     items: Vec<SelectionItem>,
     state: ScrollState,
     complete: bool,
@@ -245,6 +254,8 @@ pub(crate) struct ListSelectionView {
     search_placeholder: Option<String>,
     col_width_mode: ColumnWidthMode,
     single_line_rows: bool,
+    show_entry_prefix: bool,
+    selected_row_style: Option<Style>,
     filtered_indices: Vec<usize>,
     last_selected_actual_idx: Option<usize>,
     header: Box<dyn Renderable>,
@@ -291,6 +302,7 @@ impl ListSelectionView {
             view_id: params.view_id,
             footer_note: params.footer_note,
             footer_hint: params.footer_hint,
+            footer_right: params.footer_right,
             items: params.items,
             state: ScrollState::new(),
             complete: false,
@@ -304,6 +316,8 @@ impl ListSelectionView {
             },
             col_width_mode: params.col_width_mode,
             single_line_rows: params.single_line_rows,
+            show_entry_prefix: params.show_entry_prefix,
+            selected_row_style: params.selected_row_style,
             filtered_indices: Vec::new(),
             last_selected_actual_idx: None,
             header,
@@ -399,7 +413,6 @@ impl ListSelectionView {
             .filter_map(|(visible_idx, actual_idx)| {
                 self.items.get(*actual_idx).map(|item| {
                     let is_selected = self.state.selected_idx == Some(visible_idx);
-                    let prefix = if is_selected { '›' } else { ' ' };
                     let name = item.name.as_str();
                     let marker = if item.is_current {
                         " (current)"
@@ -409,17 +422,24 @@ impl ListSelectionView {
                         ""
                     };
                     let name_with_marker = format!("{name}{marker}");
-                    let n = visible_idx + 1;
-                    let wrap_prefix = if self.is_searchable {
-                        // The number keys don't work when search is enabled (since we let the
-                        // numbers be used for the search query).
-                        format!("{prefix} ")
+                    let wrap_prefix = if self.show_entry_prefix {
+                        let prefix = if is_selected { '›' } else { ' ' };
+                        let n = visible_idx + 1;
+                        if self.is_searchable {
+                            // The number keys don't work when search is enabled (since we let the
+                            // numbers be used for the search query).
+                            format!("{prefix} ")
+                        } else {
+                            format!("{prefix} {n}. ")
+                        }
                     } else {
-                        format!("{prefix} {n}. ")
+                        String::new()
                     };
                     let wrap_prefix_width = UnicodeWidthStr::width(wrap_prefix.as_str());
                     let mut name_prefix_spans = Vec::new();
-                    name_prefix_spans.push(wrap_prefix.into());
+                    if !wrap_prefix.is_empty() {
+                        name_prefix_spans.push(wrap_prefix.into());
+                    }
                     name_prefix_spans.extend(
                         if is_selected && !item.selected_name_prefix_spans.is_empty() {
                             item.selected_name_prefix_spans.clone()
@@ -439,7 +459,7 @@ impl ListSelectionView {
                         display_shortcut: item.display_shortcut,
                         match_indices: None,
                         description,
-                        category_tag: None,
+                        category_tag: item.category_tag.clone(),
                         wrap_indent,
                         is_disabled,
                         disabled_reason: item.disabled_reason.clone(),
@@ -893,7 +913,9 @@ impl Renderable for ListSelectionView {
         let note_height = note_lines.as_ref().map_or(0, |lines| lines.len() as u16);
         let footer_hint_lines = self.wrapped_footer_hint_lines(area.width);
         let footer_hint_height = footer_hint_lines.len() as u16;
-        let footer_rows = note_height + footer_hint_height;
+        let footer_hint_area_height =
+            footer_hint_height.max(u16::from(self.footer_right.is_some()));
+        let footer_rows = note_height + footer_hint_area_height;
         let [content_area, footer_area] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(footer_rows)]).areas(area);
 
@@ -988,9 +1010,17 @@ impl Renderable for ListSelectionView {
         // -- List rows --
         if list_area.height > 0 {
             let render_area = Rect {
-                x: list_area.x.saturating_sub(2),
+                x: if self.show_entry_prefix {
+                    list_area.x.saturating_sub(2)
+                } else {
+                    list_area.x
+                },
                 y: list_area.y,
-                width: effective_rows_width.max(1),
+                width: if self.show_entry_prefix {
+                    effective_rows_width.max(1)
+                } else {
+                    effective_rows_width.saturating_sub(2).max(1)
+                },
                 height: list_area.height,
             };
             if self.single_line_rows {
@@ -1001,6 +1031,7 @@ impl Renderable for ListSelectionView {
                     &self.state,
                     render_area.height as usize,
                     "no matches",
+                    self.selected_row_style,
                 );
             } else {
                 match self.col_width_mode {
@@ -1085,7 +1116,7 @@ impl Renderable for ListSelectionView {
         if footer_area.height > 0 {
             let [note_area, hint_area] = Layout::vertical([
                 Constraint::Length(note_height),
-                Constraint::Length(footer_hint_height),
+                Constraint::Length(footer_hint_area_height),
             ])
             .areas(footer_area);
 
@@ -1126,6 +1157,27 @@ impl Renderable for ListSelectionView {
                             x: hint_area.x,
                             y: hint_area.y + idx as u16,
                             width: hint_area.width,
+                            height: 1,
+                        },
+                        buf,
+                    );
+                }
+            }
+
+            if let Some(line) = &self.footer_right {
+                let hint_area = Rect {
+                    x: hint_area.x + 2,
+                    y: hint_area.y,
+                    width: hint_area.width.saturating_sub(2),
+                    height: hint_area.height,
+                };
+                if hint_area.width > 0 && hint_area.height > 0 {
+                    let line_width = line.width().min(hint_area.width as usize) as u16;
+                    line.clone().render(
+                        Rect {
+                            x: hint_area.x + hint_area.width.saturating_sub(line_width),
+                            y: hint_area.y + hint_area.height.saturating_sub(1),
+                            width: line_width,
                             height: 1,
                         },
                         buf,

@@ -464,6 +464,15 @@ pub(crate) enum AppEvent {
         target_display_name: Option<String>,
     },
 
+    TogetherHandoffViewPrepared {
+        query_response: ContextQueryResponse,
+        handoff_goal: Option<String>,
+        target_actor_id: Option<String>,
+        target_display_name: Option<String>,
+        selected_ref_ids: Vec<String>,
+        handoff_loading_prompt: Option<String>,
+    },
+
     /// Toggle whether the selected collaboration context row is selected.
     ToggleTogetherContextSelection {
         actual_idx: usize,

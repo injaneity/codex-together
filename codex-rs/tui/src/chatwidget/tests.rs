@@ -2654,7 +2654,9 @@ fn together_handoff_selection_request_uses_default_goal_without_custom_instructi
             prompt: "\
 Prepare a Codex handoff from the anchored context tree below.
 Goal: Continue the current task in another Codex thread.
-Choose the smallest useful subset of candidate ref_ids, usually 2 to 4 nodes. Prefer concrete files when the goal is about inspecting or improving specific files.
+Choose the smallest useful subset of candidate ref_ids, usually 2 to 4 nodes.
+Prefer [file] nodes whenever the goal is about inspecting, changing, or improving specific files.
+Only include [insight] or [rules] nodes when they materially affect the work. Skip redundant search-result nodes when the relevant file node is already selected.
 Write a short loading prompt for the receiving agent. It should tell the agent to inspect /context from the anchor, continue the goal, and avoid repeating raw context verbatim.
 Candidates:
 - ◯ [file] Read file/context-graph :: ctx:file:context-graph

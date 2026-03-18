@@ -574,6 +574,7 @@ impl Renderable for MultiSelectPicker {
                 &self.state,
                 render_area.height as usize,
                 "no matches",
+                None,
             );
         }
 

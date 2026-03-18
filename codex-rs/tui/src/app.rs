@@ -1003,63 +1003,67 @@ impl App {
         self.chat_widget.add_plain_history_lines(lines);
     }
 
-    async fn prepare_together_handoff_view(
+    fn prepare_together_handoff_view(
         &mut self,
         query_response: codex_together_protocol::ContextQueryResponse,
         handoff_goal: Option<String>,
         target_actor_id: Option<String>,
         target_display_name: Option<String>,
     ) {
-        let scope = crate::chatwidget::TogetherContextScope::default_for(
-            query_response.anchor.current_thread_id.as_deref(),
+        self.chat_widget.add_info_message(
+            "Selecting handoff context.".to_string(),
+            Some(
+                "Using gpt-5.1-codex-mini low to preselect the most relevant mounted nodes."
+                    .to_string(),
+            ),
         );
-        let mut selected_ref_ids = Vec::new();
-        let mut handoff_loading_prompt = None;
 
-        if let Some(source_thread_id) = query_response.anchor.current_thread_id.clone()
-            && let Ok(thread_id) = ThreadId::from_string(source_thread_id.as_str())
-        {
-            match self.server.get_thread(thread_id).await {
-                Ok(thread) => {
-                    let request = together_handoff_selection_request(
-                        &query_response,
-                        handoff_goal.as_deref(),
-                    );
-                    match thread.select_handoff_context(request).await {
-                        Ok(selection) => {
-                            selected_ref_ids = selection.selected_ref_ids;
-                            handoff_loading_prompt = Some(selection.loading_prompt);
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                "model-assisted handoff selection failed"
-                            );
+        let app_event_tx = self.app_event_tx.clone();
+        let server = self.server.clone();
+        tokio::spawn(async move {
+            let mut selected_ref_ids = Vec::new();
+            let mut handoff_loading_prompt = None;
+
+            if let Some(source_thread_id) = query_response.anchor.current_thread_id.clone()
+                && let Ok(thread_id) = ThreadId::from_string(source_thread_id.as_str())
+            {
+                match server.get_thread(thread_id).await {
+                    Ok(thread) => {
+                        let request = together_handoff_selection_request(
+                            &query_response,
+                            handoff_goal.as_deref(),
+                        );
+                        match thread.select_handoff_context(request).await {
+                            Ok(selection) => {
+                                selected_ref_ids = selection.selected_ref_ids;
+                                handoff_loading_prompt = Some(selection.loading_prompt);
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    "model-assisted handoff selection failed"
+                                );
+                            }
                         }
                     }
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "failed to load source thread for model-assisted handoff selection"
-                    );
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "failed to load source thread for model-assisted handoff selection"
+                        );
+                    }
                 }
             }
-        }
 
-        self.chat_widget.show_together_context_view_with_selection(
-            None,
-            query_response,
-            scope,
-            crate::chatwidget::TogetherContextViewSelection {
-                mode: crate::chatwidget::TogetherContextViewMode::Handoff,
-                selected_ref_ids: selected_ref_ids.into_iter().collect(),
+            app_event_tx.send(AppEvent::TogetherHandoffViewPrepared {
+                query_response,
                 handoff_goal,
-                handoff_loading_prompt,
                 target_actor_id,
                 target_display_name,
-            },
-        );
+                selected_ref_ids,
+                handoff_loading_prompt,
+            });
+        });
     }
 
     async fn plan_together_context_handoff(&mut self, tui: &mut tui::Tui, actual_idx: usize) {
@@ -3523,8 +3527,32 @@ impl App {
                     handoff_goal,
                     target_actor_id,
                     target_display_name,
-                )
-                .await;
+                );
+            }
+            AppEvent::TogetherHandoffViewPrepared {
+                query_response,
+                handoff_goal,
+                target_actor_id,
+                target_display_name,
+                selected_ref_ids,
+                handoff_loading_prompt,
+            } => {
+                let scope = crate::chatwidget::TogetherContextScope::default_for(
+                    query_response.anchor.current_thread_id.as_deref(),
+                );
+                self.chat_widget.show_together_context_view_with_selection(
+                    None,
+                    query_response,
+                    scope,
+                    crate::chatwidget::TogetherContextViewSelection {
+                        mode: crate::chatwidget::TogetherContextViewMode::Handoff,
+                        selected_ref_ids: selected_ref_ids.into_iter().collect(),
+                        handoff_goal,
+                        handoff_loading_prompt,
+                        target_actor_id,
+                        target_display_name,
+                    },
+                );
             }
             AppEvent::ToggleTogetherContextSelection { actual_idx } => {
                 self.chat_widget

@@ -8542,7 +8542,8 @@ impl ChatWidget {
             state.target_display_name.clone()
         };
         let header = together_context_header(mode, query, handoff_goal, target_display_name);
-        let footer_note = Some(together_context_status_line(mode));
+        let footer_hint = Some(together_context_commands_line(mode));
+        let footer_right = Some(together_context_legend_line());
         let items = if rows.is_empty() {
             vec![together_context_empty_state_item(has_thread_context)]
         } else {
@@ -8577,30 +8578,12 @@ impl ChatWidget {
                     let is_marked = selected_ref_ids.contains(together_context_row_node_id(&row));
                     SelectionItem {
                         name: together_context_row_name(&row),
-                        name_prefix_spans: if matches!(mode, TogetherContextViewMode::Handoff)
-                            && is_marked
-                        {
-                            together_context_graph_prefix_spans(
-                                &row,
-                                TogetherContextNodePrefix::Checkbox { is_marked: true },
-                            )
-                        } else {
-                            together_context_graph_prefix_spans(
-                                &row,
-                                TogetherContextNodePrefix::Legend,
-                            )
-                        },
-                        selected_name_prefix_spans: if matches!(
-                            mode,
-                            TogetherContextViewMode::Handoff
-                        ) {
-                            together_context_graph_prefix_spans(
-                                &row,
-                                TogetherContextNodePrefix::Checkbox { is_marked },
-                            )
-                        } else {
-                            Vec::new()
-                        },
+                        name_prefix_spans: together_context_graph_prefix_spans(
+                            &row, mode, is_marked,
+                        ),
+                        selected_name_prefix_spans: Vec::new(),
+                        category_tag: together_context_is_hotspot(&row.node)
+                            .then_some("*".to_string()),
                         description,
                         selected_description: None,
                         search_value: Some(search_value),
@@ -8622,13 +8605,16 @@ impl ChatWidget {
             view_id: Some(TOGETHER_CONTEXT_SELECTION_VIEW_ID),
             title: None,
             subtitle: None,
-            footer_note,
-            footer_hint: None,
+            footer_note: None,
+            footer_hint,
+            footer_right,
             items,
-            is_searchable: true,
-            search_placeholder: Some(together_context_search_placeholder().to_string()),
+            is_searchable: false,
+            search_placeholder: None,
             col_width_mode: ColumnWidthMode::AutoAllRows,
             single_line_rows: true,
+            show_entry_prefix: false,
+            selected_row_style: Some(Style::default().bg(Color::DarkGray)),
             header: Box::new(header),
             initial_selected_idx,
             side_content: Box::new(()),
@@ -9012,7 +8998,7 @@ fn lock_together_context_view_state(
 
 fn together_context_header(
     mode: TogetherContextViewMode,
-    query: Option<String>,
+    _query: Option<String>,
     handoff_goal: Option<String>,
     target_display_name: Option<String>,
 ) -> ColumnRenderable<'static> {
@@ -9039,18 +9025,7 @@ fn together_context_header(
             target_display_name.to_string().into(),
         ]));
     }
-    if let Some(query) = query
-        .as_deref()
-        .map(str::trim)
-        .filter(|query| !query.is_empty())
-    {
-        header.push(Line::from(format!("Filter: {query}").dim()));
-    }
     header
-}
-
-fn together_context_search_placeholder() -> &'static str {
-    "Filter anchored context"
 }
 
 fn together_context_empty_state_item(has_thread_context: bool) -> SelectionItem {
@@ -9076,8 +9051,24 @@ fn together_context_empty_state_item(has_thread_context: bool) -> SelectionItem 
     }
 }
 
-fn together_context_status_line(mode: TogetherContextViewMode) -> Line<'static> {
-    let mut spans = vec![
+fn together_context_commands_line(mode: TogetherContextViewMode) -> Line<'static> {
+    let mut spans = Vec::new();
+    if matches!(mode, TogetherContextViewMode::Handoff) {
+        spans.extend([
+            "enter".cyan(),
+            " toggle".dim(),
+            " | ".dim(),
+            "h".cyan(),
+            " handoff".dim(),
+            " | ".dim(),
+        ]);
+    }
+    spans.extend(["esc".cyan(), " close".dim()]);
+    Line::from(spans)
+}
+
+fn together_context_legend_line() -> Line<'static> {
+    Line::from(vec![
         "◯".dim(),
         " thread".dim(),
         "  ".into(),
@@ -9086,19 +9077,7 @@ fn together_context_status_line(mode: TogetherContextViewMode) -> Line<'static> 
         "  ".into(),
         "*".red(),
         " hotspot".dim(),
-    ];
-    if matches!(mode, TogetherContextViewMode::Handoff) {
-        spans.extend([
-            " | ".dim(),
-            "enter".cyan(),
-            " toggle".dim(),
-            " | ".dim(),
-            "h".cyan(),
-            " handoff".dim(),
-        ]);
-    }
-    spans.extend([" | ".dim(), "esc".cyan(), " close".dim()]);
-    Line::from(spans)
+    ])
 }
 
 fn together_context_rows_for_scope(
@@ -9312,17 +9291,12 @@ fn together_context_collect_tree_rows(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TogetherContextNodePrefix {
-    Legend,
-    Checkbox { is_marked: bool },
-}
-
 fn together_context_graph_prefix_spans(
     row: &TogetherContextTreeRow,
-    prefix: TogetherContextNodePrefix,
+    mode: TogetherContextViewMode,
+    is_marked: bool,
 ) -> Vec<Span<'static>> {
-    let mut spans = vec!["    ".into()];
+    let mut spans = Vec::new();
     for has_more_siblings in &row.tree_guides {
         spans.push(if *has_more_siblings {
             "│ ".dim()
@@ -9332,28 +9306,21 @@ fn together_context_graph_prefix_spans(
     }
     if row.has_parent {
         spans.push(if row.is_last_sibling {
-            "╰─".dim()
+            "╰─ ".dim()
         } else {
-            "├─".dim()
+            "├─ ".dim()
         });
     }
-    spans.push(if together_context_is_hotspot(&row.node) {
-        "* ".red()
-    } else {
-        "  ".into()
-    });
-    spans.push(match prefix {
-        TogetherContextNodePrefix::Legend => match &row.node {
-            ContextQueryNode::Thread(_) => "◯ ".dim(),
-            ContextQueryNode::Repo(_) => "⏣ ".dim(),
-        },
-        TogetherContextNodePrefix::Checkbox { is_marked } => {
-            if is_marked {
-                "[x] ".cyan()
-            } else {
-                "[ ] ".dim()
-            }
-        }
+    if matches!(mode, TogetherContextViewMode::Handoff) {
+        spans.push(if is_marked {
+            "[x] ".cyan()
+        } else {
+            "[ ] ".dim()
+        });
+    }
+    spans.push(match &row.node {
+        ContextQueryNode::Thread(_) => "◯ ".dim(),
+        ContextQueryNode::Repo(_) => "⏣ ".dim(),
     });
     let tag_label = together_context_tag_label(&row.node);
     spans.push(Span::styled(
@@ -9607,7 +9574,9 @@ pub(crate) fn together_handoff_selection_request(
             Some(goal) => format!("Goal: {goal}"),
             None => "Goal: Continue the current task in another Codex thread.".to_string(),
         },
-        "Choose the smallest useful subset of candidate ref_ids, usually 2 to 4 nodes. Prefer concrete files when the goal is about inspecting or improving specific files.".to_string(),
+        "Choose the smallest useful subset of candidate ref_ids, usually 2 to 4 nodes.".to_string(),
+        "Prefer [file] nodes whenever the goal is about inspecting, changing, or improving specific files.".to_string(),
+        "Only include [insight] or [rules] nodes when they materially affect the work. Skip redundant search-result nodes when the relevant file node is already selected.".to_string(),
         "Write a short loading prompt for the receiving agent. It should tell the agent to inspect /context from the anchor, continue the goal, and avoid repeating raw context verbatim.".to_string(),
         "Candidates:".to_string(),
     ];

@@ -673,6 +673,7 @@ pub(crate) fn render_rows_single_line(
     state: &ScrollState,
     max_results: usize,
     empty_message: &str,
+    selected_row_style: Option<Style>,
 ) -> u16 {
     if rows_all.is_empty() {
         if area.height > 0 {
@@ -718,8 +719,40 @@ pub(crate) fn render_rows_single_line(
             break;
         }
 
-        let mut full_line = build_full_line(row, desc_col);
-        if Some(i) == state.selected_idx && !row.is_disabled {
+        let row_area = Rect {
+            x: area.x,
+            y: cur_y,
+            width: area.width,
+            height: 1,
+        };
+        let tag = row
+            .category_tag
+            .as_deref()
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_string);
+        let row_without_tag = GenericDisplayRow {
+            name: row.name.clone(),
+            name_prefix_spans: row.name_prefix_spans.clone(),
+            display_shortcut: row.display_shortcut,
+            match_indices: row.match_indices.clone(),
+            description: row.description.clone(),
+            category_tag: None,
+            disabled_reason: row.disabled_reason.clone(),
+            is_disabled: row.is_disabled,
+            wrap_indent: row.wrap_indent,
+        };
+        let mut full_line = build_full_line(&row_without_tag, desc_col);
+        let is_selected = Some(i) == state.selected_idx && !row.is_disabled;
+        if is_selected && let Some(style) = selected_row_style {
+            for y in row_area.y..row_area.y.saturating_add(row_area.height) {
+                for x in row_area.x..row_area.x.saturating_add(row_area.width) {
+                    if x < buf.area().width && y < buf.area().height {
+                        buf[(x, y)].set_style(style);
+                    }
+                }
+            }
+        }
+        if is_selected && selected_row_style.is_none() {
             full_line.spans.iter_mut().for_each(|span| {
                 span.style = Style::default().fg(Color::Cyan).bold();
             });
@@ -729,17 +762,40 @@ pub(crate) fn render_rows_single_line(
                 span.style = span.style.dim();
             });
         }
-
-        let full_line = truncate_line_with_ellipsis_if_overflow(full_line, area.width as usize);
+        let tag_width = tag
+            .as_deref()
+            .map(UnicodeWidthStr::width)
+            .unwrap_or_default();
+        let content_width = if tag_width > 0 && area.width as usize > tag_width + 1 {
+            area.width.saturating_sub((tag_width + 1) as u16)
+        } else {
+            area.width
+        };
+        let full_line =
+            truncate_line_with_ellipsis_if_overflow(full_line, content_width.max(1) as usize);
         full_line.render(
             Rect {
-                x: area.x,
-                y: cur_y,
-                width: area.width,
+                x: row_area.x,
+                y: row_area.y,
+                width: content_width.max(1),
                 height: 1,
             },
             buf,
         );
+        if let Some(tag) = tag
+            && area.width as usize > tag_width
+        {
+            let tag_span = if tag == "*" { tag.red() } else { tag.dim() };
+            Line::from(tag_span).render(
+                Rect {
+                    x: row_area.x + row_area.width.saturating_sub(tag_width as u16),
+                    y: row_area.y,
+                    width: tag_width as u16,
+                    height: 1,
+                },
+                buf,
+            );
+        }
         cur_y = cur_y.saturating_add(1);
         rendered_lines = rendered_lines.saturating_add(1);
     }

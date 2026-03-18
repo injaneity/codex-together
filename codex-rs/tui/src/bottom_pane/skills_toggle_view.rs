@@ -355,6 +355,7 @@ impl Renderable for SkillsToggleView {
                 &self.state,
                 render_area.height as usize,
                 "no matches",
+                None,
             );
         }
 

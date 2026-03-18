@@ -34,6 +34,8 @@ use tokio_util::sync::CancellationToken;
 use crate::state_db::StateDbHandle;
 
 const HANDOFF_SELECTION_SYSTEM_PROMPT: &str = "You are preparing a Codex-to-Codex handoff. Review the anchored /context tree provided by the user, choose the smallest useful subset of candidate ref_ids to mount into the receiving thread, and write a short loading prompt for the receiving agent. Prefer concrete files when the goal is about inspecting or improving specific files. The receiving agent will rediscover the mounted context through /context, so do not paste raw context into the loading prompt. Return only JSON that matches the provided schema.";
+const HANDOFF_SELECTION_MODEL: &str = "gpt-5.1-codex-mini";
+const HANDOFF_SELECTION_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HandoffSelectionRequest {
@@ -204,6 +206,8 @@ impl CodexThread {
 
         let turn_context = self.codex.session.new_default_turn().await;
         let mut sub_agent_config = turn_context.config.as_ref().clone();
+        sub_agent_config.model = Some(HANDOFF_SELECTION_MODEL.to_string());
+        sub_agent_config.model_reasoning_effort = Some(HANDOFF_SELECTION_REASONING_EFFORT);
         sub_agent_config.base_instructions = Some(HANDOFF_SELECTION_SYSTEM_PROMPT.to_string());
         sub_agent_config.permissions.approval_policy =
             Constrained::allow_only(AskForApproval::Never);

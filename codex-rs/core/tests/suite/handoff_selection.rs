@@ -68,6 +68,14 @@ Candidates:
         body.pointer("/text/format/name"),
         Some(&Value::String("codex_output_schema".to_string()))
     );
+    assert_eq!(
+        body.pointer("/model"),
+        Some(&Value::String("gpt-5.1-codex-mini".to_string()))
+    );
+    assert_eq!(
+        body.pointer("/reasoning/effort"),
+        Some(&Value::String("low".to_string()))
+    );
     let body_text = serde_json::to_string(&body)?;
     assert!(body_text.contains("Prepare a Codex handoff from the anchored context tree below."));
     assert!(body_text.contains("ctx:file:chatwidget"));

@@ -6,7 +6,7 @@ expression: terminal.backend()
 "                                                                                                                        "
 "  Context                                                                                                               "
 "                                                                                                                        "
-"    < ⏣ [insight] Summarize this branch in one sentence.                                                                "
+"   < ⏣ [insight] Summarize this branch in one sentence.                                                                 "
 "                                                                                                                        "
 "  esc close                                                                                ◯ thread  ⏣ repo  * hotspot  "
 "                                                                                                                        "

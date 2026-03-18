@@ -8587,7 +8587,7 @@ impl ChatWidget {
                         ),
                         category_tag: together_context_is_hotspot(&row.node)
                             .then_some("*".to_string()),
-                        row_style: None,
+                        row_style: is_marked.then_some(Style::default().fg(Color::Cyan)),
                         description,
                         selected_description: None,
                         search_value: Some(search_value),
@@ -9129,13 +9129,16 @@ fn together_context_legend_line() -> Line<'static> {
 }
 
 fn together_context_preview_lines(state: &TogetherContextViewState) -> Vec<Line<'static>> {
-    let Some(row) = state.rows.get(state.selected_actual_idx) else {
-        return vec![Line::from("Move through the tree to inspect a node.".dim())];
-    };
-    vec![Line::from(together_context_preview_text(
-        row,
-        &state.query_response.anchor,
-    ))]
+    let detail = state
+        .rows
+        .get(state.selected_actual_idx)
+        .map(|row| together_context_preview_text(row, &state.query_response.anchor))
+        .unwrap_or_else(|| "Move through the tree to inspect a node.".to_string());
+    vec![
+        Line::from("Details".bold()),
+        Line::default(),
+        Line::from(detail),
+    ]
 }
 
 fn together_context_preview_text(
@@ -9526,15 +9529,10 @@ fn together_context_tree_style(node: &ContextQueryNode) -> Style {
 }
 
 fn together_context_selection_prefix_spans(
-    is_marked: bool,
+    _is_marked: bool,
     is_hovered: bool,
 ) -> Vec<Span<'static>> {
     vec![
-        if is_marked {
-            Span::styled("*", Style::default().fg(Color::Yellow).bold())
-        } else {
-            " ".into()
-        },
         " ".into(),
         if is_hovered {
             "<".cyan().bold()

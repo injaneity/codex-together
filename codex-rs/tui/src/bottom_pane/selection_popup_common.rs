@@ -502,6 +502,14 @@ fn build_full_line(row: &GenericDisplayRow, desc_col: usize) -> Line<'static> {
     Line::from(full_spans)
 }
 
+fn apply_text_style_to_default_spans(spans: &mut [Span<'static>], style: Style) {
+    spans.iter_mut().for_each(|span| {
+        if span.style.fg.is_none() && span.style.bg.is_none() {
+            span.style = span.style.patch(style);
+        }
+    });
+}
+
 /// Render a list of rows using the provided ScrollState, with shared styling
 /// and behavior for selection popups.
 /// Returns the number of terminal lines actually rendered (including the
@@ -761,18 +769,7 @@ pub(crate) fn render_rows_single_line(
             }
         }
         if let Some(style) = row.row_style {
-            for y in row_area.y..row_area.y.saturating_add(row_area.height) {
-                for x in row_area.x..row_area.x.saturating_add(row_area.width) {
-                    if x < buf.area().width && y < buf.area().height {
-                        let cell = &mut buf[(x, y)];
-                        let patched_style = cell.style().patch(style);
-                        cell.set_style(patched_style);
-                    }
-                }
-            }
-            full_line.spans.iter_mut().for_each(|span| {
-                span.style = span.style.patch(style);
-            });
+            apply_text_style_to_default_spans(&mut full_line.spans, style);
         }
         if is_selected && options.selected_row_style.is_none() {
             full_line.spans.iter_mut().for_each(|span| {

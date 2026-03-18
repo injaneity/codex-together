@@ -7,7 +7,7 @@ expression: terminal.backend()
 "  Handoff                                                                                                               "
 "  Goal: Continue the handoff with the key UI nodes.                                                                     "
 "                                                                                                                        "
-"  [ ] ◯ [file] Changed tui/src/chatwidget.rs                                                                            "
+"  [ ] ◯ [file] Changed tui/src/chatwidget.rs                                                                         <  "
 "  [x] ◯ [insight] Simplify /context selection flow  handoff                                                             "
 "                                                                                                                        "
 "  enter toggle | h handoff | esc close                                                       ◯ thread  ⏣ repo  * hotspot"

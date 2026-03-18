@@ -6,7 +6,7 @@ expression: terminal.backend()
 "                                                                                                                        "
 "  Context                                                                                                               "
 "                                                                                                                        "
-"  ◯ [insight] Search results in chatwidget.rs                                                                           "
+"  ◯ [insight] Search results in chatwidget.rs                                                                        <  "
 "  ╰─ ◯ [file] Changed tui/src/chatwidget.rs                                                                             "
 "  ◯ [insight] Simplify /context selection flow  handoff                                                                 "
 "  ⏣ [rules] Handoff selection flow                                                                                      "

@@ -6,7 +6,7 @@ expression: terminal.backend()
 "                                                                                                                        "
 "  Context                                                                                                               "
 "                                                                                                                        "
-"  ◯ [insight] Capture branch state                    from thread 019cf3a8                                              "
+"  ◯ [insight] Capture branch state                    from thread 019cf3a8                                           <  "
 "  ⏣ [insight] Summarize this branch in one sentence.                                                                    "
 "                                                                                                                        "
 "  esc close                                                                                  ◯ thread  ⏣ repo  * hotspot"

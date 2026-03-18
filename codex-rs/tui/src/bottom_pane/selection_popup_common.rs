@@ -34,6 +34,7 @@ pub(crate) struct GenericDisplayRow {
     pub match_indices: Option<Vec<usize>>, // indices to bold (char positions)
     pub description: Option<String>,       // optional grey text after the name
     pub category_tag: Option<String>,      // optional right-side category label
+    pub row_style: Option<Style>,          // optional style applied across the row content
     pub disabled_reason: Option<String>,   // optional disabled message
     pub is_disabled: bool,
     pub wrap_indent: Option<usize>, // optional indent for wrapped lines
@@ -737,12 +738,18 @@ pub(crate) fn render_rows_single_line(
             match_indices: row.match_indices.clone(),
             description: row.description.clone(),
             category_tag: None,
+            row_style: row.row_style,
             disabled_reason: row.disabled_reason.clone(),
             is_disabled: row.is_disabled,
             wrap_indent: row.wrap_indent,
         };
         let mut full_line = build_full_line(&row_without_tag, desc_col);
         let is_selected = Some(i) == state.selected_idx && !row.is_disabled;
+        if let Some(style) = row.row_style {
+            full_line.spans.iter_mut().for_each(|span| {
+                span.style = span.style.patch(style);
+            });
+        }
         if is_selected && let Some(style) = selected_row_style {
             for y in row_area.y..row_area.y.saturating_add(row_area.height) {
                 for x in row_area.x..row_area.x.saturating_add(row_area.width) {
@@ -762,12 +769,19 @@ pub(crate) fn render_rows_single_line(
                 span.style = span.style.dim();
             });
         }
-        let tag_width = tag
-            .as_deref()
-            .map(UnicodeWidthStr::width)
-            .unwrap_or_default();
-        let content_width = if tag_width > 0 && area.width as usize > tag_width + 1 {
-            area.width.saturating_sub((tag_width + 1) as u16)
+        let mut suffix_spans = Vec::new();
+        if let Some(tag) = tag {
+            suffix_spans.push(if tag == "*" { tag.red() } else { tag.dim() });
+        }
+        if is_selected && selected_row_style.is_some() {
+            if !suffix_spans.is_empty() {
+                suffix_spans.push(" ".into());
+            }
+            suffix_spans.push("<".cyan().bold());
+        }
+        let suffix_width = Line::from(suffix_spans.clone()).width();
+        let content_width = if suffix_width > 0 && area.width as usize > suffix_width + 1 {
+            area.width.saturating_sub((suffix_width + 1) as u16)
         } else {
             area.width
         };
@@ -782,15 +796,12 @@ pub(crate) fn render_rows_single_line(
             },
             buf,
         );
-        if let Some(tag) = tag
-            && area.width as usize > tag_width
-        {
-            let tag_span = if tag == "*" { tag.red() } else { tag.dim() };
-            Line::from(tag_span).render(
+        if suffix_width > 0 && area.width as usize >= suffix_width {
+            Line::from(suffix_spans).render(
                 Rect {
-                    x: row_area.x + row_area.width.saturating_sub(tag_width as u16),
+                    x: row_area.x + row_area.width.saturating_sub(suffix_width as u16),
                     y: row_area.y,
-                    width: tag_width as u16,
+                    width: suffix_width as u16,
                     height: 1,
                 },
                 buf,

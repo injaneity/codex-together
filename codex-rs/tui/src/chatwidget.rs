@@ -8584,6 +8584,7 @@ impl ChatWidget {
                         selected_name_prefix_spans: Vec::new(),
                         category_tag: together_context_is_hotspot(&row.node)
                             .then_some("*".to_string()),
+                        row_style: is_marked.then_some(Style::default().fg(Color::Cyan).bold()),
                         description,
                         selected_description: None,
                         search_value: Some(search_value),
@@ -9430,9 +9431,9 @@ fn together_context_tag_label(node: &ContextQueryNode) -> &'static str {
 
 fn together_context_tag_style(node: &ContextQueryNode) -> Style {
     match together_context_tag(node) {
-        TogetherContextTag::File => Style::default().fg(Color::Cyan),
+        TogetherContextTag::File => Style::default().fg(Color::Green),
         TogetherContextTag::Insight => Style::default().fg(Color::Magenta),
-        TogetherContextTag::Rules => Style::default().fg(Color::Green),
+        TogetherContextTag::Rules => Style::default().bold(),
     }
 }
 

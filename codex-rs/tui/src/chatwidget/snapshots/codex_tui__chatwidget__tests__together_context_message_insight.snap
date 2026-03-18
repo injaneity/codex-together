@@ -6,7 +6,7 @@ expression: terminal.backend()
 "                                                                                                                        "
 "  Context                                                                                                               "
 "                                                                                                                        "
-"   < ◯ [insight] Explained why /context looked empty after a prose-only turn.                                           "
+"     ◯ [insight] Explained why /context looked empty after a prose-only turn.                                        <  "
 "                                                                                                                        "
 "  esc close                                                                                ◯ thread  ⏣ repo  * hotspot  "
 "                                                                                                                        "

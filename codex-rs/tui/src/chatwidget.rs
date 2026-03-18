@@ -8619,7 +8619,7 @@ impl ChatWidget {
             single_line_rows: true,
             show_entry_prefix: false,
             selected_row_style: Some(Style::default().bg(Color::DarkGray)),
-            show_selected_suffix_cursor: false,
+            show_selected_suffix_cursor: true,
             header: Box::new(header),
             initial_selected_idx,
             side_content: if show_preview {
@@ -9530,17 +9530,9 @@ fn together_context_tree_style(node: &ContextQueryNode) -> Style {
 
 fn together_context_selection_prefix_spans(
     _is_marked: bool,
-    is_hovered: bool,
+    _is_hovered: bool,
 ) -> Vec<Span<'static>> {
-    vec![
-        " ".into(),
-        if is_hovered {
-            "<".cyan().bold()
-        } else {
-            " ".into()
-        },
-        " ".into(),
-    ]
+    vec!["   ".into()]
 }
 
 fn together_context_tag(node: &ContextQueryNode) -> TogetherContextTag {

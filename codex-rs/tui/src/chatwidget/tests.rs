@@ -2278,7 +2278,7 @@ async fn together_context_local_view_without_artifacts_snapshot() {
 }
 
 #[test]
-fn together_context_local_scope_keeps_only_mounted_nodes() {
+fn together_context_rows_include_all_anchored_nodes() {
     let anchor_id = context_anchor_id(Some("thread-1"));
     let local_ref_id = "ctx:thread-insight:thread-1:plan-1";
     let prior_ref_id = "ctx:thread-search:thread-0:search-1";
@@ -2331,12 +2331,19 @@ fn together_context_local_scope_keeps_only_mounted_nodes() {
                 row.mount_reason
             ))
             .collect::<Vec<_>>(),
-        vec![(local_ref_id.to_string(), Some(ContextMountReason::Local),)]
+        vec![
+            (local_ref_id.to_string(), Some(ContextMountReason::Local)),
+            (prior_ref_id.to_string(), None),
+            (
+                repo_ref_id.to_string(),
+                Some(ContextMountReason::RepoNeighbor),
+            ),
+        ]
     );
 }
 
 #[test]
-fn together_context_local_scope_is_empty_when_anchor_missing() {
+fn together_context_rows_show_available_nodes_without_anchor() {
     let response = rooted_context_query(
         None,
         None,
@@ -2355,11 +2362,11 @@ fn together_context_local_scope_is_empty_when_anchor_missing() {
 
     let rows = together_context_rows_for_scope(&response, TogetherContextScope::LocalThread);
 
-    assert!(rows.is_empty());
+    assert_eq!(rows.len(), 1);
 }
 
 #[test]
-fn together_context_local_scope_is_empty_when_no_mounted_nodes_exist() {
+fn together_context_rows_show_repo_notes_without_thread_artifacts() {
     let response = rooted_context_query(
         Some("thread-1"),
         None,
@@ -2378,11 +2385,11 @@ fn together_context_local_scope_is_empty_when_no_mounted_nodes_exist() {
 
     let rows = together_context_rows_for_scope(&response, TogetherContextScope::LocalThread);
 
-    assert!(rows.is_empty());
+    assert_eq!(rows.len(), 1);
 }
 
 #[test]
-fn together_context_global_scope_keeps_all_nodes_in_response_order() {
+fn together_context_scopes_resolve_to_same_rooted_rows() {
     let anchor_id = context_anchor_id(Some("thread-1"));
     let local_ref_id = "ctx:thread-insight:thread-1:plan-1";
     let prior_ref_id = "ctx:thread-search:thread-0:search-1";
@@ -2426,10 +2433,12 @@ fn together_context_global_scope_keeps_all_nodes_in_response_order() {
         ],
     );
 
-    let rows = together_context_rows_for_scope(&response, TogetherContextScope::Global);
+    let local_rows = together_context_rows_for_scope(&response, TogetherContextScope::LocalThread);
+    let global_rows = together_context_rows_for_scope(&response, TogetherContextScope::Global);
 
     assert_eq!(
-        rows.iter()
+        local_rows
+            .iter()
             .map(|row| (
                 together_context_row_node_id(row).to_string(),
                 row.mount_reason
@@ -2444,10 +2453,20 @@ fn together_context_global_scope_keeps_all_nodes_in_response_order() {
             ),
         ]
     );
+    assert_eq!(
+        local_rows
+            .iter()
+            .map(|row| together_context_row_node_id(row).to_string())
+            .collect::<Vec<_>>(),
+        global_rows
+            .iter()
+            .map(|row| together_context_row_node_id(row).to_string())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]
-async fn together_context_view_is_browse_only_but_still_toggles_scope() {
+async fn together_context_view_is_browse_only_and_ignores_scope_toggle() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
     let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
     chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
@@ -2480,9 +2499,9 @@ async fn together_context_view_is_browse_only_but_still_toggles_scope() {
     assert!(rx.try_recv().is_err(), "browse view should not select rows");
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
-    assert_matches!(
-        rx.try_recv().expect("expected toggle event"),
-        AppEvent::ToggleTogetherContextScope
+    assert!(
+        rx.try_recv().is_err(),
+        "unified view should not toggle scope"
     );
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
@@ -2493,7 +2512,7 @@ async fn together_context_view_is_browse_only_but_still_toggles_scope() {
 }
 
 #[tokio::test]
-async fn together_handoff_view_emits_selection_scope_and_handoff_events() {
+async fn together_handoff_view_emits_selection_and_handoff_events() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
     let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
     chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
@@ -2535,12 +2554,6 @@ async fn together_handoff_view_emits_selection_scope_and_handoff_events() {
     assert_matches!(
         rx.try_recv().expect("expected handoff event"),
         AppEvent::PlanTogetherContextHandoff { actual_idx: 0 }
-    );
-
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
-    assert_matches!(
-        rx.try_recv().expect("expected toggle event"),
-        AppEvent::ToggleTogetherContextScope
     );
 }
 

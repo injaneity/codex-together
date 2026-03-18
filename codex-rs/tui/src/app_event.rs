@@ -451,9 +451,6 @@ pub(crate) enum AppEvent {
         actual_idx: usize,
     },
 
-    /// Toggle between local-thread and global collaboration context scopes.
-    ToggleTogetherContextScope,
-
     /// Plan and commit a fresh-thread handoff from the selected context rows.
     PlanTogetherContextHandoff {
         actual_idx: usize,

@@ -8324,18 +8324,6 @@ impl ChatWidget {
         self.refresh_together_context_view();
     }
 
-    pub(crate) fn toggle_together_context_scope(&mut self) {
-        let Some(state) = self.together_context_view_state.as_ref() else {
-            return;
-        };
-        {
-            let mut state = lock_together_context_view_state(state);
-            let has_thread_context = state.query_response.anchor.current_thread_id.is_some();
-            state.scope = state.scope.toggled(has_thread_context);
-        }
-        self.refresh_together_context_view();
-    }
-
     pub(crate) fn together_context_action_ref_ids(&self, _actual_idx: usize) -> Vec<String> {
         let Some(state) = self.together_context_view_state.as_ref() else {
             return Vec::new();
@@ -8464,20 +8452,19 @@ impl ChatWidget {
         state: Arc<Mutex<TogetherContextViewState>>,
         initial_selected_idx: Option<usize>,
     ) -> SelectionViewParams {
-        let (mode, scope, selected_ref_ids, has_thread_context, handoff_goal) = {
+        let (mode, selected_ref_ids, has_thread_context, handoff_goal) = {
             let state = lock_together_context_view_state(&state);
             (
                 state.mode,
-                state.scope,
                 state.selected_ref_ids.clone(),
                 state.query_response.anchor.current_thread_id.is_some(),
                 state.handoff_goal.clone(),
             )
         };
-        let header = together_context_header(mode, scope, has_thread_context, query, handoff_goal);
-        let footer_note = Some(together_context_status_line(mode, has_thread_context));
+        let header = together_context_header(mode, query, handoff_goal);
+        let footer_note = Some(together_context_status_line(mode));
         let items = if rows.is_empty() {
-            vec![together_context_empty_state_item(scope, has_thread_context)]
+            vec![together_context_empty_state_item(has_thread_context)]
         } else {
             rows.into_iter()
                 .enumerate()
@@ -8486,11 +8473,14 @@ impl ChatWidget {
                     let description =
                         together_context_row_description(&row, &query_response.anchor);
                     let mut search_value = format!(
-                        "{} {} {}",
+                        "{} {}",
                         display_name,
-                        description,
                         together_context_kind_label(&row.node)
                     );
+                    if let Some(description) = description.as_deref() {
+                        search_value.push(' ');
+                        search_value.push_str(description);
+                    }
                     if let Some(source_thread_id) = together_context_source_thread_id_for_row(&row)
                     {
                         search_value.push(' ');
@@ -8511,7 +8501,7 @@ impl ChatWidget {
                             &row,
                             selected_ref_ids.contains(together_context_row_node_id(&row)),
                         ),
-                        description: Some(description),
+                        description,
                         selected_description: None,
                         search_value: Some(search_value),
                         actions: if matches!(mode, TogetherContextViewMode::Handoff) {
@@ -8536,9 +8526,7 @@ impl ChatWidget {
             footer_hint: None,
             items,
             is_searchable: true,
-            search_placeholder: Some(
-                together_context_search_placeholder(scope, has_thread_context).to_string(),
-            ),
+            search_placeholder: Some(together_context_search_placeholder().to_string()),
             col_width_mode: ColumnWidthMode::AutoAllRows,
             single_line_rows: true,
             header: Box::new(header),
@@ -8553,10 +8541,6 @@ impl ChatWidget {
             })),
             on_char_key: Some(Box::new(
                 move |pressed, actual_idx, tx: &AppEventSender| match pressed {
-                    't' | 'T' if has_thread_context => {
-                        tx.send(AppEvent::ToggleTogetherContextScope);
-                        true
-                    }
                     'h' | 'H' if matches!(mode, TogetherContextViewMode::Handoff) => {
                         tx.send(AppEvent::PlanTogetherContextHandoff { actual_idx });
                         true
@@ -8760,16 +8744,6 @@ impl TogetherContextScope {
             Self::Global
         }
     }
-
-    fn toggled(self, has_current_thread: bool) -> Self {
-        if !has_current_thread {
-            return Self::Global;
-        }
-        match self {
-            Self::LocalThread => Self::Global,
-            Self::Global => Self::LocalThread,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8825,7 +8799,6 @@ struct TogetherContextTreeRow {
     tree_guides: Vec<bool>,
     has_parent: bool,
     is_last_sibling: bool,
-    child_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -8853,8 +8826,6 @@ fn lock_together_context_view_state(
 
 fn together_context_header(
     mode: TogetherContextViewMode,
-    scope: TogetherContextScope,
-    has_thread_context: bool,
     query: Option<String>,
     handoff_goal: Option<String>,
 ) -> ColumnRenderable<'static> {
@@ -8870,10 +8841,6 @@ fn together_context_header(
     {
         header.push(Line::from(vec!["Goal: ".dim(), goal.to_string().into()]));
     }
-    header.push(together_context_scope_selector_line(
-        scope,
-        has_thread_context,
-    ));
     if let Some(query) = query
         .as_deref()
         .map(str::trim)
@@ -8884,67 +8851,21 @@ fn together_context_header(
     header
 }
 
-fn together_context_scope_selector_line(
-    scope: TogetherContextScope,
-    has_thread_context: bool,
-) -> Line<'static> {
-    let mut spans = vec!["Scope: ".dim()];
-    if has_thread_context {
-        spans.extend(together_context_scope_selector(
-            "Local thread",
-            scope == TogetherContextScope::LocalThread,
-        ));
-        spans.push(" ".into());
-    }
-    spans.extend(together_context_scope_selector(
-        "Global graph",
-        scope == TogetherContextScope::Global,
-    ));
-    Line::from(spans)
+fn together_context_search_placeholder() -> &'static str {
+    "Filter anchored context"
 }
 
-fn together_context_scope_selector(label: &str, is_active: bool) -> Vec<Span<'static>> {
-    let label = label.to_string();
-    vec![
-        "[".dim(),
-        if is_active {
-            label.cyan().bold()
-        } else {
-            label.dim()
-        },
-        "]".dim(),
-    ]
-}
-
-fn together_context_search_placeholder(
-    scope: TogetherContextScope,
-    has_thread_context: bool,
-) -> &'static str {
-    match (scope, has_thread_context) {
-        (TogetherContextScope::LocalThread, true) => "Filter mounted context",
-        (TogetherContextScope::LocalThread, false) => "Filter local scope",
-        (TogetherContextScope::Global, _) => "Filter rooted graph",
-    }
-}
-
-fn together_context_empty_state_item(
-    scope: TogetherContextScope,
-    has_thread_context: bool,
-) -> SelectionItem {
-    let (name, description) = match (scope, has_thread_context) {
-        (TogetherContextScope::LocalThread, true) => (
-            "No mounted context in this thread".to_string(),
-            "Local scope only shows nodes mounted into this thread. Press t for the full graph."
-                .to_string(),
-        ),
-        (TogetherContextScope::LocalThread, false) => (
+fn together_context_empty_state_item(has_thread_context: bool) -> SelectionItem {
+    let (name, description) = if has_thread_context {
+        (
+            "No anchored context".to_string(),
+            "Nothing is linked from this thread's anchor yet.".to_string(),
+        )
+    } else {
+        (
             "No active thread context".to_string(),
-            "Start or resume a thread to browse local artifacts.".to_string(),
-        ),
-        (TogetherContextScope::Global, _) => (
-            "No context nodes".to_string(),
-            "Nothing matched the current rooted graph.".to_string(),
-        ),
+            "Start or resume a thread to browse mounted context.".to_string(),
+        )
     };
     let search_value = format!("{name} {description}");
     SelectionItem {
@@ -8957,34 +8878,34 @@ fn together_context_empty_state_item(
     }
 }
 
-fn together_context_status_line(
-    mode: TogetherContextViewMode,
-    has_thread_context: bool,
-) -> Line<'static> {
-    let mut spans = if matches!(mode, TogetherContextViewMode::Handoff) {
-        vec!["enter".cyan(), " toggle".dim()]
-    } else {
-        Vec::new()
-    };
-    if has_thread_context {
-        if !spans.is_empty() {
-            spans.push(" | ".dim());
-        }
-        spans.extend(["t".cyan(), " scope".dim()]);
-    }
+fn together_context_status_line(mode: TogetherContextViewMode) -> Line<'static> {
+    let mut spans = vec![
+        "◯".dim(),
+        " thread".dim(),
+        "  ".into(),
+        "⏣".dim(),
+        " repo".dim(),
+        "  ".into(),
+        "*".red(),
+        " hotspot".dim(),
+    ];
     if matches!(mode, TogetherContextViewMode::Handoff) {
-        spans.extend([" | ".dim(), "h".cyan(), " handoff".dim()]);
+        spans.extend([
+            " | ".dim(),
+            "enter".cyan(),
+            " toggle".dim(),
+            " | ".dim(),
+            "h".cyan(),
+            " handoff".dim(),
+        ]);
     }
-    if !spans.is_empty() {
-        spans.push(" | ".dim());
-    }
-    spans.extend(["esc".cyan(), " close".dim()]);
+    spans.extend([" | ".dim(), "esc".cyan(), " close".dim()]);
     Line::from(spans)
 }
 
 fn together_context_rows_for_scope(
     query_response: &ContextQueryResponse,
-    scope: TogetherContextScope,
+    _scope: TogetherContextScope,
 ) -> Vec<TogetherContextTreeRow> {
     let mount_reason_by_node_id = query_response
         .edges
@@ -8995,33 +8916,17 @@ fn together_context_rows_for_scope(
                 .map(|mount_reason| (edge.to_node_id.clone(), mount_reason))
         })
         .collect::<HashMap<_, _>>();
-    let has_thread_context = query_response.anchor.current_thread_id.is_some();
-
     let mut visible_row_by_node_id = HashMap::<String, TogetherContextVisibleRow>::new();
     let mut visible_order_by_node_id = HashMap::<String, usize>::new();
     for (original_idx, node) in query_response.nodes.iter().enumerate() {
         let mount_reason = mount_reason_by_node_id
             .get(together_context_node_id(node))
             .copied();
-        let visible_row = match scope {
-            TogetherContextScope::LocalThread if has_thread_context => matches!(
-                mount_reason,
-                Some(ContextMountReason::Local)
-                    | Some(ContextMountReason::ForkSeed)
-                    | Some(ContextMountReason::HandoffSeed)
-            )
-            .then_some(TogetherContextVisibleRow {
-                node: node.clone(),
-                mount_reason,
-                original_idx,
-            }),
-            TogetherContextScope::LocalThread => None,
-            TogetherContextScope::Global => Some(TogetherContextVisibleRow {
-                node: node.clone(),
-                mount_reason,
-                original_idx,
-            }),
-        };
+        let visible_row = Some(TogetherContextVisibleRow {
+            node: node.clone(),
+            mount_reason,
+            original_idx,
+        });
         if let Some(visible_row) = visible_row {
             let node_id = together_context_node_id(&visible_row.node).to_string();
             visible_order_by_node_id.insert(node_id.clone(), visible_row.original_idx);
@@ -9104,6 +9009,13 @@ fn together_context_rows_for_scope(
     rows
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TogetherContextTag {
+    File,
+    Insight,
+    Rules,
+}
+
 fn together_context_tree_parent_by_node_id(
     query_response: &ContextQueryResponse,
     visible_order_by_node_id: &HashMap<String, usize>,
@@ -9172,14 +9084,12 @@ fn together_context_collect_tree_rows(
     let Some(row) = visible_row_by_node_id.get(node_id) else {
         return;
     };
-    let child_count = child_ids_by_parent_id.get(node_id).map_or(0, Vec::len);
     rows.push(TogetherContextTreeRow {
         node: row.node.clone(),
         mount_reason: row.mount_reason,
         tree_guides: position.tree_guides.clone(),
         has_parent: position.has_parent,
         is_last_sibling: position.is_last_sibling,
-        child_count,
     });
 
     let mut child_tree_guides = position.tree_guides;
@@ -9228,8 +9138,20 @@ fn together_context_graph_prefix_spans(
             "├─".dim()
         });
     }
-    let node_marker = if row.child_count > 1 { "⏣ " } else { "◯ " };
-    spans.push(node_marker.dim());
+    spans.push(if together_context_is_hotspot(&row.node) {
+        "* ".red()
+    } else {
+        "  ".into()
+    });
+    spans.push(match &row.node {
+        ContextQueryNode::Thread(_) => "◯ ".dim(),
+        ContextQueryNode::Repo(_) => "⏣ ".dim(),
+    });
+    let tag_label = together_context_tag_label(&row.node);
+    spans.push(Span::styled(
+        format!("[{tag_label}] "),
+        together_context_tag_style(&row.node),
+    ));
     spans
 }
 
@@ -9265,26 +9187,23 @@ fn together_context_row_name(row: &TogetherContextTreeRow) -> String {
 fn together_context_row_description(
     row: &TogetherContextTreeRow,
     anchor: &codex_together_protocol::ContextQueryAnchor,
-) -> String {
+) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(provenance_label) = together_context_provenance_label(row) {
         parts.push(provenance_label.to_string());
     }
-    parts.push(together_context_kind_label(&row.node).to_string());
     if let Some(origin_label) = together_context_origin_thread_label(row, anchor) {
         parts.push(origin_label);
     }
-    parts.join(" · ")
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 fn together_context_provenance_label(row: &TogetherContextTreeRow) -> Option<&'static str> {
     match row.mount_reason {
-        Some(ContextMountReason::Local) => Some("here"),
+        Some(ContextMountReason::Local) => None,
         Some(ContextMountReason::ForkSeed) => Some("from prev"),
         Some(ContextMountReason::HandoffSeed) => Some("handoff"),
-        None if matches!(row.node, ContextQueryNode::Repo(_)) => Some("repo"),
-        Some(ContextMountReason::RepoNeighbor) => Some("repo"),
-        None => None,
+        Some(ContextMountReason::RepoNeighbor) | None => None,
     }
 }
 
@@ -9316,27 +9235,90 @@ fn together_context_origin_thread_label(
 }
 
 fn together_context_kind_label(node: &ContextQueryNode) -> &'static str {
+    together_context_tag_label(node)
+}
+
+fn together_context_tag_label(node: &ContextQueryNode) -> &'static str {
     match node {
         ContextQueryNode::Thread(node) => match node.artifact_kind {
-            codex_together_protocol::ThreadArtifactKind::Plan => node
-                .summary
-                .as_deref()
-                .filter(|summary| summary.contains("retained plan output"))
-                .map(|_| "plan")
-                .unwrap_or("insight"),
-            codex_together_protocol::ThreadArtifactKind::FileRead => "read",
-            codex_together_protocol::ThreadArtifactKind::FileChange => "change",
-            codex_together_protocol::ThreadArtifactKind::Search => "search",
-            codex_together_protocol::ThreadArtifactKind::ToolOutput => "tool",
-            codex_together_protocol::ThreadArtifactKind::GraphQuery => "graph",
+            codex_together_protocol::ThreadArtifactKind::FileRead
+            | codex_together_protocol::ThreadArtifactKind::FileChange => "file",
+            codex_together_protocol::ThreadArtifactKind::Plan
+            | codex_together_protocol::ThreadArtifactKind::Search
+            | codex_together_protocol::ThreadArtifactKind::ToolOutput
+            | codex_together_protocol::ThreadArtifactKind::GraphQuery => "insight",
         },
-        ContextQueryNode::Repo(node) => match node.repo_kind {
-            codex_together_protocol::RepoMemoryKind::Concept => "concept",
-            codex_together_protocol::RepoMemoryKind::Decision => "decision",
-            codex_together_protocol::RepoMemoryKind::Playbook => "playbook",
-            codex_together_protocol::RepoMemoryKind::Hotspot => "hotspot",
-        },
+        ContextQueryNode::Repo(node) if together_context_repo_node_is_rules(node) => "rules",
+        ContextQueryNode::Repo(_) => "insight",
     }
+}
+
+fn together_context_tag_style(node: &ContextQueryNode) -> Style {
+    match together_context_tag(node) {
+        TogetherContextTag::File => Style::default().fg(Color::Cyan),
+        TogetherContextTag::Insight => Style::default().fg(Color::Magenta),
+        TogetherContextTag::Rules => Style::default().fg(Color::Green),
+    }
+}
+
+fn together_context_tag(node: &ContextQueryNode) -> TogetherContextTag {
+    match node {
+        ContextQueryNode::Thread(node) => match node.artifact_kind {
+            codex_together_protocol::ThreadArtifactKind::FileRead
+            | codex_together_protocol::ThreadArtifactKind::FileChange => TogetherContextTag::File,
+            codex_together_protocol::ThreadArtifactKind::Plan
+            | codex_together_protocol::ThreadArtifactKind::Search
+            | codex_together_protocol::ThreadArtifactKind::ToolOutput
+            | codex_together_protocol::ThreadArtifactKind::GraphQuery => {
+                TogetherContextTag::Insight
+            }
+        },
+        ContextQueryNode::Repo(node) if together_context_repo_node_is_rules(node) => {
+            TogetherContextTag::Rules
+        }
+        ContextQueryNode::Repo(_) => TogetherContextTag::Insight,
+    }
+}
+
+fn together_context_is_hotspot(node: &ContextQueryNode) -> bool {
+    matches!(
+        node,
+        ContextQueryNode::Repo(codex_together_protocol::ContextRepoNode {
+            repo_kind: codex_together_protocol::RepoMemoryKind::Hotspot,
+            ..
+        })
+    )
+}
+
+fn together_context_repo_node_is_rules(node: &codex_together_protocol::ContextRepoNode) -> bool {
+    if matches!(
+        node.repo_kind,
+        codex_together_protocol::RepoMemoryKind::Playbook
+    ) {
+        return true;
+    }
+    let searchable = format!(
+        "{} {} {}",
+        node.path,
+        node.title,
+        node.summary.clone().unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    [
+        "agent",
+        "instruction",
+        "instructions",
+        "rule",
+        "rules",
+        "policy",
+        "playbook",
+        "guide",
+        "guidance",
+        "convention",
+        "workflow",
+    ]
+    .iter()
+    .any(|needle| searchable.contains(needle))
 }
 
 fn together_context_node_location(node: &ContextQueryNode) -> Option<&str> {

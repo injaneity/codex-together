@@ -946,10 +946,6 @@ impl App {
         }
     }
 
-    fn toggle_together_context_scope(&mut self) {
-        self.chat_widget.toggle_together_context_scope();
-    }
-
     fn start_together_composer_context_search(&self, query: String) {
         let tx = self.app_event_tx.clone();
         let current_thread_id = self.chat_widget.thread_id().map(|id| id.to_string());
@@ -3317,9 +3313,6 @@ impl App {
             AppEvent::ToggleTogetherContextSelection { actual_idx } => {
                 self.chat_widget
                     .toggle_together_context_selection(actual_idx);
-            }
-            AppEvent::ToggleTogetherContextScope => {
-                self.toggle_together_context_scope();
             }
             AppEvent::PlanTogetherContextHandoff { actual_idx } => {
                 self.plan_together_context_handoff(tui, actual_idx).await;

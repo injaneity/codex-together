@@ -47,6 +47,8 @@ use codex_core::AuthManager;
 use codex_core::CodexAuth;
 #[cfg(test)]
 use codex_core::NewThread;
+use codex_core::ThreadContextMount;
+use codex_core::ThreadContextMountKind;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -63,6 +65,7 @@ use codex_core::models_manager::model_presets::HIDE_GPT_5_1_CODEX_MAX_MIGRATION_
 use codex_core::models_manager::model_presets::HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG;
 #[cfg(target_os = "windows")]
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
+use codex_core::write_thread_context_mount;
 use codex_otel::OtelManager;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::ThreadId;
@@ -771,13 +774,14 @@ impl App {
             .map_err(Into::into)
     }
 
-    async fn commit_together_handoff(
+    async fn commit_remote_together_handoff(
         &mut self,
         tui: &mut tui::Tui,
         plan_id: String,
         draft_text: String,
         handoff_goal: Option<String>,
         selected_node_count: usize,
+        target_actor_id: Option<String>,
     ) {
         let response = match commit_together_handoff_plan(
             plan_id,
@@ -795,6 +799,34 @@ impl App {
                 return;
             }
         };
+        if let Some(target_actor_id) = target_actor_id {
+            let node_label = if selected_node_count == 1 {
+                "1 mounted node".to_string()
+            } else {
+                format!("{selected_node_count} mounted nodes")
+            };
+            let mut lines = vec![Line::from(vec!["• ".dim(), "Handoff sent".cyan().bold()])];
+            lines.push(Line::from(vec![
+                "  Sent ".into(),
+                node_label.into(),
+                " to ".into(),
+                target_actor_id.into(),
+                ".".into(),
+            ]));
+            if let Some(goal) = handoff_goal
+                .as_deref()
+                .map(str::trim)
+                .filter(|goal| !goal.is_empty())
+            {
+                lines.push(Line::from(vec!["  Goal: ".dim(), goal.to_string().into()]));
+            }
+            lines.push(Line::from(vec![
+                "  Thread: ".dim(),
+                response.thread_id.into(),
+            ]));
+            self.chat_widget.add_plain_history_lines(lines);
+            return;
+        }
 
         let handoff_cwd = PathBuf::from(&response.cwd);
         let mut handoff_config = if crate::cwds_differ(&self.config.cwd, &handoff_cwd) {
@@ -864,30 +896,7 @@ impl App {
                     self.chat_widget
                         .set_composer_text(draft_text, Vec::new(), Vec::new());
                 }
-                let node_label = if selected_node_count == 1 {
-                    "1 mounted node".to_string()
-                } else {
-                    format!("{selected_node_count} mounted nodes")
-                };
-                let mut lines = vec![Line::from(vec!["• ".dim(), "Handoff ready".cyan().bold()])];
-                lines.push(Line::from(vec![
-                    "  Review ".into(),
-                    "/context".cyan(),
-                    " to inspect ".into(),
-                    node_label.into(),
-                    " from the source thread.".into(),
-                ]));
-                if let Some(goal) = handoff_goal
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|goal| !goal.is_empty())
-                {
-                    lines.push(Line::from(vec!["  Goal: ".dim(), goal.to_string().into()]));
-                }
-                lines.push(Line::from(
-                    "  A loading prompt has been prepared in the composer.".dim(),
-                ));
-                self.chat_widget.add_plain_history_lines(lines);
+                self.show_local_handoff_ready_message(selected_node_count, handoff_goal.as_deref());
             }
             Err(err) => {
                 let path_display = rollout_path.display();
@@ -899,10 +908,107 @@ impl App {
         }
     }
 
+    async fn commit_local_together_handoff(
+        &mut self,
+        tui: &mut tui::Tui,
+        source_thread_id: String,
+        selected_ref_ids: Vec<String>,
+        draft_text: String,
+        handoff_goal: Option<String>,
+    ) {
+        let selected_node_count = selected_ref_ids.len();
+        let started = match self.server.start_thread(self.config.clone()).await {
+            Ok(started) => started,
+            Err(err) => {
+                self.chat_widget
+                    .add_error_message(format!("Failed to create local handoff thread: {err}"));
+                return;
+            }
+        };
+        if let Err(err) = self.handle_thread_created(started.thread_id).await {
+            tracing::warn!(error = %err, "failed to attach listener for local handoff thread");
+        }
+        let Some(rollout_path) = started
+            .session_configured
+            .rollout_path
+            .clone()
+            .or_else(|| started.thread.rollout_path())
+        else {
+            self.chat_widget.add_error_message(format!(
+                "Started local handoff thread {} but it has no rollout path.",
+                started.thread_id
+            ));
+            return;
+        };
+        if let Err(err) = write_thread_context_mount(
+            rollout_path.as_path(),
+            &ThreadContextMount {
+                precursor_thread_id: source_thread_id,
+                precursor_kind: ThreadContextMountKind::Handoff,
+                goal: handoff_goal.clone(),
+                seed_ref_ids: selected_ref_ids,
+                actor_id: None,
+            },
+        )
+        .await
+        {
+            self.chat_widget.add_error_message(format!(
+                "Failed to persist local handoff context for thread {}: {err}",
+                started.thread_id
+            ));
+            return;
+        }
+
+        self.shutdown_current_thread().await;
+        let handoff_config = self.config.clone();
+        self.config = handoff_config;
+        tui.set_notification_method(self.config.tui_notification_method);
+        self.file_search.update_search_dir(self.config.cwd.clone());
+        let init = self.chatwidget_init_for_forked_or_resumed_thread(tui, self.config.clone());
+        self.chat_widget =
+            ChatWidget::new_from_existing(init, started.thread, started.session_configured);
+        self.reset_thread_event_state();
+        self.reset_backtrack_state();
+        if !draft_text.trim().is_empty() {
+            self.chat_widget
+                .set_composer_text(draft_text, Vec::new(), Vec::new());
+        }
+        self.show_local_handoff_ready_message(selected_node_count, handoff_goal.as_deref());
+    }
+
+    fn show_local_handoff_ready_message(
+        &mut self,
+        selected_node_count: usize,
+        handoff_goal: Option<&str>,
+    ) {
+        let node_label = if selected_node_count == 1 {
+            "1 mounted node".to_string()
+        } else {
+            format!("{selected_node_count} mounted nodes")
+        };
+        let mut lines = vec![Line::from(vec!["• ".dim(), "Handoff ready".cyan().bold()])];
+        lines.push(Line::from(vec![
+            "  Review ".into(),
+            "/context".cyan(),
+            " to inspect ".into(),
+            node_label.into(),
+            " from the source thread.".into(),
+        ]));
+        if let Some(goal) = handoff_goal.map(str::trim).filter(|goal| !goal.is_empty()) {
+            lines.push(Line::from(vec!["  Goal: ".dim(), goal.to_string().into()]));
+        }
+        lines.push(Line::from(
+            "  A loading prompt has been prepared in the composer.".dim(),
+        ));
+        self.chat_widget.add_plain_history_lines(lines);
+    }
+
     async fn prepare_together_handoff_view(
         &mut self,
         query_response: codex_together_protocol::ContextQueryResponse,
         handoff_goal: Option<String>,
+        target_actor_id: Option<String>,
+        target_display_name: Option<String>,
     ) {
         let scope = crate::chatwidget::TogetherContextScope::default_for(
             query_response.anchor.current_thread_id.as_deref(),
@@ -910,52 +1016,33 @@ impl App {
         let mut selected_ref_ids = Vec::new();
         let mut handoff_loading_prompt = None;
 
-        if let Some(source_thread_id) = query_response.anchor.current_thread_id.clone() {
-            if let Ok(thread_id) = ThreadId::from_string(source_thread_id.as_str()) {
-                match self.server.get_thread(thread_id).await {
-                    Ok(thread) => {
-                        let request = together_handoff_selection_request(
-                            &query_response,
-                            handoff_goal.as_deref(),
-                        );
-                        match thread.select_handoff_context(request).await {
-                            Ok(selection) => {
-                                selected_ref_ids = selection.selected_ref_ids;
-                                handoff_loading_prompt = Some(selection.loading_prompt);
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    error = %err,
-                                    "model-assisted handoff selection failed; falling back to server recommendations"
-                                );
-                            }
+        if let Some(source_thread_id) = query_response.anchor.current_thread_id.clone()
+            && let Ok(thread_id) = ThreadId::from_string(source_thread_id.as_str())
+        {
+            match self.server.get_thread(thread_id).await {
+                Ok(thread) => {
+                    let request = together_handoff_selection_request(
+                        &query_response,
+                        handoff_goal.as_deref(),
+                    );
+                    match thread.select_handoff_context(request).await {
+                        Ok(selection) => {
+                            selected_ref_ids = selection.selected_ref_ids;
+                            handoff_loading_prompt = Some(selection.loading_prompt);
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "model-assisted handoff selection failed"
+                            );
                         }
                     }
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "failed to load source thread for model-assisted handoff selection"
-                        );
-                    }
                 }
-            }
-
-            if selected_ref_ids.is_empty() {
-                match plan_together_context_handoff(
-                    Some(source_thread_id),
-                    Vec::new(),
-                    handoff_goal.clone(),
-                    true,
-                )
-                .await
-                {
-                    Ok(plan) => selected_ref_ids = plan.selected_node_ids,
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "fallback handoff preview failed after model-assisted selection"
-                        );
-                    }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "failed to load source thread for model-assisted handoff selection"
+                    );
                 }
             }
         }
@@ -969,6 +1056,8 @@ impl App {
                 selected_ref_ids: selected_ref_ids.into_iter().collect(),
                 handoff_goal,
                 handoff_loading_prompt,
+                target_actor_id,
+                target_display_name,
             },
         );
     }
@@ -993,31 +1082,46 @@ impl App {
                 .add_error_message("No collaboration context is selected.".to_string());
             return;
         }
+        let handoff_goal = self.chat_widget.together_context_handoff_goal();
+        let target_actor_id = self.chat_widget.together_context_handoff_target_actor_id();
+        let selected_node_labels = self.chat_widget.together_context_selected_node_labels();
+        let draft_text = self
+            .chat_widget
+            .together_context_handoff_loading_prompt()
+            .filter(|prompt| !prompt.trim().is_empty())
+            .unwrap_or_else(|| {
+                together_handoff_loading_prompt(handoff_goal.as_deref(), &selected_node_labels)
+            });
+
+        if target_actor_id.is_none() {
+            self.commit_local_together_handoff(
+                tui,
+                source_thread_id,
+                selected_ref_ids,
+                draft_text,
+                handoff_goal,
+            )
+            .await;
+            return;
+        }
 
         match plan_together_context_handoff(
             Some(source_thread_id),
             selected_ref_ids,
-            self.chat_widget.together_context_handoff_goal(),
+            handoff_goal.clone(),
+            target_actor_id.clone(),
             false,
         )
         .await
         {
             Ok(plan) => {
-                let draft_text = self
-                    .chat_widget
-                    .together_context_handoff_loading_prompt()
-                    .filter(|prompt| !prompt.trim().is_empty())
-                    .unwrap_or_else(|| {
-                        let selected_node_labels =
-                            self.chat_widget.together_context_selected_node_labels();
-                        together_handoff_loading_prompt(plan.goal.as_deref(), &selected_node_labels)
-                    });
-                self.commit_together_handoff(
+                self.commit_remote_together_handoff(
                     tui,
                     plan.plan_id,
                     draft_text,
                     plan.goal,
                     plan.selected_node_ids.len(),
+                    target_actor_id,
                 )
                 .await;
             }
@@ -3392,15 +3496,35 @@ impl App {
                         selected_ref_ids: selected_ref_ids.into_iter().collect(),
                         handoff_goal,
                         handoff_loading_prompt,
+                        target_actor_id: None,
+                        target_display_name: None,
                     },
                 );
+            }
+            AppEvent::OpenTogetherHandoffPrompt {
+                target_actor_id,
+                target_display_name,
+            } => {
+                self.chat_widget
+                    .show_together_handoff_prompt(target_actor_id, target_display_name);
+            }
+            AppEvent::OpenTogetherHandoffTargetPicker { candidates } => {
+                self.chat_widget
+                    .show_together_handoff_target_picker(candidates);
             }
             AppEvent::PrepareTogetherHandoffView {
                 query_response,
                 handoff_goal,
+                target_actor_id,
+                target_display_name,
             } => {
-                self.prepare_together_handoff_view(query_response, handoff_goal)
-                    .await;
+                self.prepare_together_handoff_view(
+                    query_response,
+                    handoff_goal,
+                    target_actor_id,
+                    target_display_name,
+                )
+                .await;
             }
             AppEvent::ToggleTogetherContextSelection { actual_idx } => {
                 self.chat_widget

@@ -447,10 +447,21 @@ pub(crate) enum AppEvent {
         handoff_loading_prompt: Option<String>,
     },
 
+    OpenTogetherHandoffPrompt {
+        target_actor_id: Option<String>,
+        target_display_name: Option<String>,
+    },
+
+    OpenTogetherHandoffTargetPicker {
+        candidates: Vec<crate::chatwidget::TogetherHandoffTargetCandidate>,
+    },
+
     /// Ask the live source thread to preselect handoff nodes from the anchored tree.
     PrepareTogetherHandoffView {
         query_response: ContextQueryResponse,
         handoff_goal: Option<String>,
+        target_actor_id: Option<String>,
+        target_display_name: Option<String>,
     },
 
     /// Toggle whether the selected collaboration context row is selected.

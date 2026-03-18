@@ -53,11 +53,15 @@ use codex_context_graph::search_context_documents as shared_search_context_docum
 use codex_context_graph::thread_context_document as shared_thread_context_document;
 use codex_context_graph::thread_context_documents as shared_thread_context_documents;
 use codex_core::RolloutRecorder;
+use codex_core::ThreadContextMount as PersistedThreadContextMount;
+use codex_core::ThreadContextMountKind;
 use codex_core::config::find_codex_home;
 use codex_core::find_thread_path_by_id_str;
 use codex_core::git_info::current_branch_name;
 use codex_core::git_info::get_git_repo_root;
 use codex_core::git_info::get_head_commit_hash;
+use codex_core::read_thread_context_mount_for_thread_id;
+use codex_core::write_thread_context_mount;
 use codex_protocol::protocol::InitialHistory;
 use codex_state::StateRuntime;
 use codex_state::TogetherClientMode as StateTogetherClientMode;
@@ -187,6 +191,7 @@ struct ConnectionEntry {
 struct PendingHandoffPlan {
     source_thread_id: String,
     goal: Option<String>,
+    target_actor_id: Option<String>,
     selected_ref_ids: Vec<String>,
     promotion_files: Vec<PendingContextWriteFile>,
 }
@@ -197,6 +202,7 @@ struct ThreadContextMount {
     precursor_kind: ContextPrecursorKind,
     goal: Option<String>,
     seed_ref_ids: Vec<String>,
+    actor_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -752,9 +758,26 @@ async fn context_query(
         Err(_) => return rpc_error(req.id, -32602, "invalid params"),
     };
 
+    let persisted_mount = match payload.current_thread_id.as_deref() {
+        Some(current_thread_id) => match find_codex_home() {
+            Ok(codex_home) => {
+                read_thread_context_mount_for_thread_id(codex_home.as_path(), current_thread_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(thread_context_mount_from_persisted)
+            }
+            Err(_) => None,
+        },
+        None => None,
+    };
     let effective_payload = {
         let guard = state.inner.lock().await;
-        apply_thread_context_mount_to_query_params(&payload, &guard.thread_context_mounts)
+        apply_thread_context_mount_to_query_params(
+            &payload,
+            &guard.thread_context_mounts,
+            persisted_mount.as_ref(),
+        )
     };
     let documents = context_documents(
         state,
@@ -1159,6 +1182,7 @@ async fn handoff_plan(
             PendingHandoffPlan {
                 source_thread_id: source_thread_id.clone(),
                 goal: goal.clone(),
+                target_actor_id: payload.target_actor_id,
                 selected_ref_ids: selected_ref_ids.clone(),
                 promotion_files,
             },
@@ -1236,9 +1260,30 @@ async fn handoff_commit(state: &AppState, req: JsonRpcRequest) -> JsonRpcRespons
                 precursor_kind: ContextPrecursorKind::Handoff,
                 goal: pending.goal.clone(),
                 seed_ref_ids: pending.selected_ref_ids.clone(),
+                actor_id: pending.target_actor_id.clone(),
             },
         );
         guard.handoff_plans.remove(&payload.plan_id);
+    }
+    if let Some(rollout_path) = started.thread.path.as_deref() {
+        let _ = write_thread_context_mount(
+            rollout_path,
+            &PersistedThreadContextMount {
+                precursor_thread_id: pending.source_thread_id.clone(),
+                precursor_kind: ThreadContextMountKind::Handoff,
+                goal: pending.goal.clone(),
+                seed_ref_ids: pending.selected_ref_ids.clone(),
+                actor_id: pending.target_actor_id.clone(),
+            },
+        )
+        .await
+        .inspect_err(|err| {
+            warn!(
+                error = %err,
+                thread_id = %started.thread.id,
+                "failed to persist thread context mount"
+            );
+        });
     }
 
     JsonRpcResponse::ok(
@@ -3084,11 +3129,15 @@ async fn source_thread_cwd(
 fn apply_thread_context_mount_to_query_params(
     payload: &ContextQueryParams,
     thread_context_mounts: &HashMap<String, ThreadContextMount>,
+    persisted_mount: Option<&ThreadContextMount>,
 ) -> ContextQueryParams {
     let Some(current_thread_id) = payload.current_thread_id.as_deref() else {
         return payload.clone();
     };
-    let Some(mount) = thread_context_mounts.get(current_thread_id) else {
+    let mount = thread_context_mounts
+        .get(current_thread_id)
+        .or(persisted_mount);
+    let Some(mount) = mount else {
         return payload.clone();
     };
 
@@ -3124,7 +3173,9 @@ fn thread_summary_from_app_thread(
     let repo_root = get_git_repo_root(&thread.cwd).unwrap_or_else(|| thread.cwd.clone());
     ThreadSummary {
         thread_id: thread.id,
-        actor_id: thread.agent_nickname,
+        actor_id: thread_context_mount
+            .and_then(|mount| mount.actor_id.clone())
+            .or(thread.agent_nickname),
         title: thread.name.and_then(non_empty_string),
         preview: non_empty_string(thread.preview),
         repo_root: Some(repo_root.display().to_string()),
@@ -3134,6 +3185,16 @@ fn thread_summary_from_app_thread(
         precursor_thread_id: thread_context_mount.map(|mount| mount.precursor_thread_id.clone()),
         precursor_kind: thread_context_mount.map(|mount| mount.precursor_kind),
         updated_at: Some(thread.updated_at),
+    }
+}
+
+fn thread_context_mount_from_persisted(mount: PersistedThreadContextMount) -> ThreadContextMount {
+    ThreadContextMount {
+        precursor_thread_id: mount.precursor_thread_id,
+        precursor_kind: ContextPrecursorKind::from(mount.precursor_kind),
+        goal: mount.goal,
+        seed_ref_ids: mount.seed_ref_ids,
+        actor_id: mount.actor_id,
     }
 }
 
@@ -4635,6 +4696,7 @@ mod tests {
                 precursor_kind: ContextPrecursorKind::Handoff,
                 goal: Some("Investigate the mounted context.".to_string()),
                 seed_ref_ids: vec!["ctx:thread-insight:thread-1:plan-1".to_string()],
+                actor_id: None,
             }),
         );
 
@@ -4672,8 +4734,10 @@ mod tests {
                         "ctx:thread-insight:thread-prev:plan-1".to_string(),
                         "ctx:thread-insight:thread-current:plan-1".to_string(),
                     ],
+                    actor_id: None,
                 },
             )]),
+            None,
         );
 
         assert_eq!(

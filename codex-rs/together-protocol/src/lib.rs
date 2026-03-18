@@ -529,6 +529,8 @@ pub struct HandoffPlanParams {
     #[serde(default)]
     pub goal: Option<String>,
     #[serde(default)]
+    pub target_actor_id: Option<String>,
+    #[serde(default)]
     pub preview_only: bool,
 }
 

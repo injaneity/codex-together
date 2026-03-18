@@ -2138,6 +2138,8 @@ async fn together_handoff_view_snapshot() {
             selected_ref_ids: HashSet::from([handoff_ref_id.clone()]),
             handoff_goal: Some("Continue the handoff with the key UI nodes.".to_string()),
             handoff_loading_prompt: None,
+            target_actor_id: None,
+            target_display_name: None,
         },
     );
 
@@ -2547,6 +2549,8 @@ async fn together_handoff_view_emits_selection_and_handoff_events() {
             selected_ref_ids: HashSet::new(),
             handoff_goal: Some("Inspect the latest planning context.".to_string()),
             handoff_loading_prompt: None,
+            target_actor_id: None,
+            target_display_name: None,
         },
     );
 
@@ -2567,12 +2571,28 @@ async fn together_handoff_view_emits_selection_and_handoff_events() {
 async fn empty_together_handoff_prompt_still_opens_handoff_selection() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
-    chat.show_together_handoff_prompt();
+    chat.show_together_handoff_prompt(None, None);
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
     assert_matches!(
         rx.try_recv().expect("expected handoff command"),
         AppEvent::RunTogetherCommand { args } if args == "handoff"
+    );
+}
+
+#[tokio::test]
+async fn targeted_together_handoff_prompt_preserves_actor_prefix_when_empty() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.show_together_handoff_prompt(
+        Some("member@local".to_string()),
+        Some("member@local".to_string()),
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_matches!(
+        rx.try_recv().expect("expected targeted handoff command"),
+        AppEvent::RunTogetherCommand { args } if args == "handoff > member@local"
     );
 }
 

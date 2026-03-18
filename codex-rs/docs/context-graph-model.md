@@ -28,6 +28,13 @@ The proposed model has:
 
 The graph is not meant to be dumped in full into prompts. Agents query rooted projections from the current anchor and expand outward as needed.
 
+For the current demo surface:
+
+- `/context` should render one unified anchored tree, not a local/global toggle.
+- `/context` should be built locally for the current Codex thread from rollout history plus repo notes.
+- `/handoff` without a target should reuse that same local anchored tree and persist the selected mounts locally.
+- `/handoff > <target>` should use the same anchored candidates, but only involve `codex-together-server` for target discovery and remote delivery.
+
 ## Design Principles
 
 1. The repo owns durable memory.

@@ -24,8 +24,10 @@ These are the decisions the next thread should treat as settled unless the user 
 
 1. User starts a thread and asks Codex to do light research.
 2. That thread contributes to a context graph for the repo.
-3. User can `/handoff` to connected agents that the graph advertises as relevant.
-4. User can also `/handoff` to self, which creates another Codex thread under the same human actor.
+3. User can open `/context` locally without manually connecting to Together first.
+4. `/context` should show one anchored tree for the current thread, including mounted thread context and linked repo notes.
+5. User can `/handoff` locally with no target, which creates another Codex thread under the same human actor.
+6. User can `/handoff >` to search connected agents, choose a target, then send a targeted handoff.
 5. Agents can hand off to other agents, reuse repo context, and update repo knowledge autonomously.
 6. User can inspect repo-wide context hotspots and reused knowledge at a glance.
 7. From the agent perspective, connecting to the repo/server should immediately expose the full persisted repo context.
@@ -49,6 +51,9 @@ These are the decisions the next thread should treat as settled unless the user 
 - `.codex/context/` is still the intended long-term canonical location.
 - Thread-local context should keep extracted artifacts, not raw prompts or raw search queries.
 - Thread-local context should be reconstructed from native Codex thread history and exposed through the shared graph engine; Together should consume that view, not own a separate thread-memory source of truth.
+- `/context` should be fully local for the current Codex thread.
+- `/handoff` without a target should stay local and persist handoff mounts with the new thread.
+- `/handoff > <target>` should only use `codex-together-server` for connected-agent discovery and remote handoff delivery.
 - Attached context should use progressive disclosure: give the model refs, summaries, hotspots, and traversal paths first, not full concatenated bodies.
 - `context_graph` should be a native core tool backed by the same shared graph engine that powers `/context`.
 - The graph model should use one synthetic `anchor` node and two real content node types: `thread` and `repo`.
@@ -106,9 +111,11 @@ At a high level, the current branch has already been pushed much closer to the d
 - `/share` and `/threads` were removed from the TUI slash-command surface
 - read-only "inspect/checkout shared thread" flows were removed
 - thread visibility concepts were removed from repo-context metadata and related UI copy
-- `/context` now roots on the current thread and keeps retained artifacts plus linked repo notes
+- `/context` now roots on the current thread, runs locally, and keeps retained artifacts plus linked repo notes
 - context search now indexes thread-local artifacts and persistent repo notes instead of prompt previews
 - attached context bundles now prefer compact discovery packs over eager full-body expansion
+- `/handoff` without a target now stays local and writes precursor/seed metadata with the new thread
+- `/handoff >` now uses a searchable connected-agent picker and only relies on Together RPC where remote delivery is actually needed
 - runtime graph artifacts are intended to be discoverable under `.codex/context/.graph/`
 - repo note promotion should preserve direct artifact refs for graph-derived provenance
 - persisted member bookkeeping was pruned from the state layer

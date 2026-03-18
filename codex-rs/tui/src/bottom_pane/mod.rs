@@ -563,11 +563,6 @@ impl BottomPane {
         );
     }
 
-    pub(crate) fn move_composer_cursor_to_end(&mut self) {
-        self.composer.move_cursor_to_end();
-        self.request_redraw();
-    }
-
     #[allow(dead_code)]
     pub(crate) fn set_composer_input_enabled(
         &mut self,

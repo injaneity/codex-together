@@ -2088,6 +2088,64 @@ async fn together_context_global_view_snapshot() {
 }
 
 #[tokio::test]
+async fn together_handoff_view_snapshot() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
+    let prior_thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df7";
+    chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
+
+    let anchor_id = context_anchor_id(Some(thread_id));
+    let local_ref_id = format!("ctx:thread-file:{thread_id}:chatwidget");
+    let handoff_ref_id = format!("ctx:thread-insight:{prior_thread_id}:plan-1");
+
+    chat.show_together_context_view_with_selection(
+        None,
+        rooted_context_query(
+            Some(thread_id),
+            Some(prior_thread_id),
+            Some(ContextPrecursorKind::Handoff),
+            vec![
+                thread_context_node(
+                    &local_ref_id,
+                    ThreadArtifactKind::FileChange,
+                    "tui/src/chatwidget.rs",
+                    Some("linked file · updated in thread"),
+                    Some("tui/src/chatwidget.rs"),
+                    Some("Adjusted the /context selection view."),
+                    thread_id,
+                ),
+                thread_context_node(
+                    &handoff_ref_id,
+                    ThreadArtifactKind::Plan,
+                    "Simplify /context selection flow",
+                    Some("thread insight · retained plan output"),
+                    Some("insight/plan-1"),
+                    Some("Only show one-line nodes and let Enter toggle selection."),
+                    prior_thread_id,
+                ),
+            ],
+            vec![
+                mounted_edge(&anchor_id, &local_ref_id, ContextMountReason::Local),
+                mounted_edge(&anchor_id, &handoff_ref_id, ContextMountReason::HandoffSeed),
+            ],
+        ),
+        TogetherContextScope::LocalThread,
+        TogetherContextViewMode::Handoff,
+        HashSet::from([handoff_ref_id.clone()]),
+        Some("Continue the handoff with the key UI nodes.".to_string()),
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw handoff view");
+    assert_snapshot!("together_handoff_view", terminal.backend());
+}
+
+#[tokio::test]
 async fn together_context_message_insight_snapshot() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -2389,7 +2447,7 @@ fn together_context_global_scope_keeps_all_nodes_in_response_order() {
 }
 
 #[tokio::test]
-async fn together_context_view_emits_selection_scope_and_handoff_events() {
+async fn together_context_view_is_browse_only_but_still_toggles_scope() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
     let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
     chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
@@ -2419,6 +2477,55 @@ async fn together_context_view_emits_selection_scope_and_handoff_events() {
     );
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(rx.try_recv().is_err(), "browse view should not select rows");
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+    assert_matches!(
+        rx.try_recv().expect("expected toggle event"),
+        AppEvent::ToggleTogetherContextScope
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+    assert!(
+        rx.try_recv().is_err(),
+        "browse view should not trigger handoff"
+    );
+}
+
+#[tokio::test]
+async fn together_handoff_view_emits_selection_scope_and_handoff_events() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
+    chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
+
+    chat.show_together_context_view_with_selection(
+        Some("planning".to_string()),
+        rooted_context_query(
+            Some(thread_id),
+            None,
+            None,
+            vec![repo_context_node(
+                "ctx:file:.codex/context/overview.md",
+                RepoMemoryKind::Concept,
+                "Planning Overview",
+                Some("plan"),
+                ".codex/context/overview.md",
+                vec![thread_id],
+                (vec![], vec![]),
+            )],
+            vec![mounted_edge(
+                &context_anchor_id(Some(thread_id)),
+                "ctx:file:.codex/context/overview.md",
+                ContextMountReason::RepoNeighbor,
+            )],
+        ),
+        TogetherContextScope::Global,
+        TogetherContextViewMode::Handoff,
+        HashSet::new(),
+        Some("Inspect the latest planning context.".to_string()),
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_matches!(
         rx.try_recv().expect("expected toggle event"),
         AppEvent::ToggleTogetherContextSelection { actual_idx: 0 }
@@ -2434,6 +2541,19 @@ async fn together_context_view_emits_selection_scope_and_handoff_events() {
     assert_matches!(
         rx.try_recv().expect("expected toggle event"),
         AppEvent::ToggleTogetherContextScope
+    );
+}
+
+#[tokio::test]
+async fn empty_together_handoff_prompt_still_opens_handoff_selection() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.show_together_handoff_prompt();
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_matches!(
+        rx.try_recv().expect("expected handoff command"),
+        AppEvent::RunTogetherCommand { args } if args == "handoff"
     );
 }
 

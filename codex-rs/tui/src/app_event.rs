@@ -441,6 +441,7 @@ pub(crate) enum AppEvent {
         query: Option<String>,
         query_response: ContextQueryResponse,
         scope: crate::chatwidget::TogetherContextScope,
+        mode: crate::chatwidget::TogetherContextViewMode,
         selected_ref_ids: Vec<String>,
         handoff_goal: Option<String>,
     },

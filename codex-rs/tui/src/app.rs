@@ -775,7 +775,6 @@ impl App {
         tui: &mut tui::Tui,
         plan_id: String,
         draft_text: String,
-        context_refs: Vec<codex_together_protocol::ContextRef>,
     ) {
         let response = match commit_together_handoff_plan(
             plan_id,
@@ -858,8 +857,10 @@ impl App {
                     ChatWidget::new_from_existing(init, resumed.thread, resumed.session_configured);
                 self.reset_thread_event_state();
                 self.reset_backtrack_state();
-                self.chat_widget
-                    .set_composer_text_with_context_bindings(draft_text, context_refs);
+                if !draft_text.trim().is_empty() {
+                    self.chat_widget
+                        .set_composer_text(draft_text, Vec::new(), Vec::new());
+                }
                 self.chat_widget.add_info_message(
                     format!(
                         "Opened handoff thread {} from source {}.",
@@ -909,8 +910,7 @@ impl App {
         {
             Ok(plan) => {
                 let draft_text = together_handoff_draft(&plan);
-                let context_refs = plan.kept_refs.clone();
-                self.commit_together_handoff(tui, plan.plan_id, draft_text, context_refs)
+                self.commit_together_handoff(tui, plan.plan_id, draft_text)
                     .await;
             }
             Err(err) => self
@@ -3274,6 +3274,7 @@ impl App {
                 query,
                 query_response,
                 scope,
+                mode,
                 selected_ref_ids,
                 handoff_goal,
             } => {
@@ -3281,6 +3282,7 @@ impl App {
                     query,
                     query_response,
                     scope,
+                    mode,
                     selected_ref_ids.into_iter().collect(),
                     handoff_goal,
                 );

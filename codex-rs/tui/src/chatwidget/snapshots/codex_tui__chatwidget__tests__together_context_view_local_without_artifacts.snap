@@ -10,7 +10,7 @@ expression: terminal.backend()
 "  Filter mounted context                                                                                                "
 "› No mounted context in this thread  Local scope only shows nodes mounted into this thread. Press t for the full grap…  "
 "                                                                                                                        "
-"  enter select | t scope | h handoff | esc close                                                                        "
+"  t scope | esc close                                                                                                   "
 "                                                                                                                        "
 "                                                                                                                        "
 "                                                                                                                        "

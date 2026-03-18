@@ -3745,7 +3745,7 @@ impl ChatWidget {
                     );
                     return;
                 }
-                self.run_together_command("handoff".to_string());
+                self.show_together_handoff_prompt();
             }
             SlashCommand::Agent => {
                 self.app_event_tx.send(AppEvent::OpenAgentPicker);
@@ -4632,7 +4632,8 @@ impl ChatWidget {
             if matches!(
                 msg,
                 EventMsg::SessionConfigured(_) | EventMsg::ThreadNameUpdated(_)
-            ) {
+            ) || together_should_skip_replayed_initial_message(&msg)
+            {
                 continue;
             }
             // `id: None` indicates a synthetic/fake id coming from replay.
@@ -8210,6 +8211,25 @@ impl ChatWidget {
         self.bottom_pane.show_view(Box::new(view));
     }
 
+    pub(crate) fn show_together_handoff_prompt(&mut self) {
+        let tx = self.app_event_tx.clone();
+        let view = CustomPromptView::new_allow_empty(
+            "Handoff instructions".to_string(),
+            "Add optional instructions for the receiving agent, then press Enter".to_string(),
+            None,
+            Box::new(move |value: String| {
+                let trimmed = value.trim();
+                let args = if trimmed.is_empty() {
+                    "handoff".to_string()
+                } else {
+                    format!("handoff {trimmed}")
+                };
+                tx.send(AppEvent::RunTogetherCommand { args });
+            }),
+        );
+        self.bottom_pane.show_view(Box::new(view));
+    }
+
     #[cfg(test)]
     pub(crate) fn show_together_context_view(
         &mut self,
@@ -8221,6 +8241,7 @@ impl ChatWidget {
             query,
             query_response,
             scope,
+            TogetherContextViewMode::Browse,
             HashSet::new(),
             None,
         );
@@ -8231,6 +8252,7 @@ impl ChatWidget {
         query: Option<String>,
         query_response: ContextQueryResponse,
         scope: TogetherContextScope,
+        mode: TogetherContextViewMode,
         selected_ref_ids: HashSet<String>,
         handoff_goal: Option<String>,
     ) {
@@ -8242,6 +8264,7 @@ impl ChatWidget {
 
         let rows = together_context_rows_for_scope(&query_response, scope);
         let state = Arc::new(Mutex::new(TogetherContextViewState {
+            mode,
             query: query.clone(),
             scope,
             rows: rows.clone(),
@@ -8374,25 +8397,6 @@ impl ChatWidget {
             .find_map(|row| together_context_source_thread_id_for_row(&row))
     }
 
-    pub(crate) fn set_composer_text_with_context_bindings(
-        &mut self,
-        text: String,
-        context_refs: Vec<ContextRef>,
-    ) {
-        let context_bindings = context_refs
-            .into_iter()
-            .map(|context_ref| ContextBinding { context_ref })
-            .collect::<Vec<_>>();
-        self.bottom_pane.set_composer_text_with_bindings(
-            text,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            context_bindings,
-        );
-        self.bottom_pane.move_composer_cursor_to_end();
-    }
-
     fn refresh_together_context_view(&mut self) {
         let Some(state) = self.together_context_view_state.as_ref() else {
             return;
@@ -8443,16 +8447,17 @@ impl ChatWidget {
         state: Arc<Mutex<TogetherContextViewState>>,
         initial_selected_idx: Option<usize>,
     ) -> SelectionViewParams {
-        let (scope, selected_ref_ids, has_thread_context) = {
+        let (mode, scope, selected_ref_ids, has_thread_context) = {
             let state = lock_together_context_view_state(&state);
             (
+                state.mode,
                 state.scope,
                 state.selected_ref_ids.clone(),
                 state.query_response.anchor.current_thread_id.is_some(),
             )
         };
         let header = together_context_header(scope, has_thread_context, query);
-        let footer_note = Some(together_context_status_line(has_thread_context));
+        let footer_note = Some(together_context_status_line(mode, has_thread_context));
         let items = if rows.is_empty() {
             vec![together_context_empty_state_item(scope, has_thread_context)]
         } else {
@@ -8484,15 +8489,20 @@ impl ChatWidget {
                     SelectionItem {
                         name: together_context_row_name(&row),
                         name_prefix_spans: together_context_graph_prefix_spans(
+                            mode,
                             &row,
                             selected_ref_ids.contains(together_context_row_node_id(&row)),
                         ),
                         description: Some(description),
                         selected_description: None,
                         search_value: Some(search_value),
-                        actions: vec![Box::new(move |tx: &AppEventSender| {
-                            tx.send(AppEvent::ToggleTogetherContextSelection { actual_idx });
-                        })],
+                        actions: if matches!(mode, TogetherContextViewMode::Handoff) {
+                            vec![Box::new(move |tx: &AppEventSender| {
+                                tx.send(AppEvent::ToggleTogetherContextSelection { actual_idx });
+                            })]
+                        } else {
+                            Vec::new()
+                        },
                         dismiss_on_select: false,
                         ..Default::default()
                     }
@@ -8529,7 +8539,7 @@ impl ChatWidget {
                         tx.send(AppEvent::ToggleTogetherContextScope);
                         true
                     }
-                    'h' | 'H' => {
+                    'h' | 'H' if matches!(mode, TogetherContextViewMode::Handoff) => {
                         tx.send(AppEvent::PlanTogetherContextHandoff { actual_idx });
                         true
                     }
@@ -8571,6 +8581,7 @@ impl ChatWidget {
                                 query,
                                 query_response,
                                 scope,
+                                mode,
                                 selected_ref_ids,
                                 handoff_goal,
                             } => {
@@ -8578,6 +8589,7 @@ impl ChatWidget {
                                     query,
                                     query_response,
                                     scope,
+                                    mode,
                                     selected_ref_ids,
                                     handoff_goal,
                                 });
@@ -8710,6 +8722,7 @@ enum TogetherCommandFollowUp {
         query: Option<String>,
         query_response: ContextQueryResponse,
         scope: TogetherContextScope,
+        mode: TogetherContextViewMode,
         selected_ref_ids: Vec<String>,
         handoff_goal: Option<String>,
     },
@@ -8741,8 +8754,15 @@ impl TogetherContextScope {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TogetherContextViewMode {
+    Browse,
+    Handoff,
+}
+
 #[derive(Debug, Clone)]
 struct TogetherContextViewState {
+    mode: TogetherContextViewMode,
     query: Option<String>,
     scope: TogetherContextScope,
     rows: Vec<TogetherContextTreeRow>,
@@ -8755,6 +8775,7 @@ struct TogetherContextViewState {
 impl Default for TogetherContextViewState {
     fn default() -> Self {
         Self {
+            mode: TogetherContextViewMode::Browse,
             query: None,
             scope: TogetherContextScope::Global,
             rows: Vec::new(),
@@ -8906,19 +8927,28 @@ fn together_context_empty_state_item(
     }
 }
 
-fn together_context_status_line(has_thread_context: bool) -> Line<'static> {
-    let mut spans = vec!["enter".cyan(), " select".dim()];
+fn together_context_status_line(
+    mode: TogetherContextViewMode,
+    has_thread_context: bool,
+) -> Line<'static> {
+    let mut spans = if matches!(mode, TogetherContextViewMode::Handoff) {
+        vec!["enter".cyan(), " toggle".dim()]
+    } else {
+        Vec::new()
+    };
     if has_thread_context {
-        spans.extend([" | ".dim(), "t".cyan(), " scope".dim()]);
+        if !spans.is_empty() {
+            spans.push(" | ".dim());
+        }
+        spans.extend(["t".cyan(), " scope".dim()]);
     }
-    spans.extend([
-        " | ".dim(),
-        "h".cyan(),
-        " handoff".dim(),
-        " | ".dim(),
-        "esc".cyan(),
-        " close".dim(),
-    ]);
+    if matches!(mode, TogetherContextViewMode::Handoff) {
+        spans.extend([" | ".dim(), "h".cyan(), " handoff".dim()]);
+    }
+    if !spans.is_empty() {
+        spans.push(" | ".dim());
+    }
+    spans.extend(["esc".cyan(), " close".dim()]);
     Line::from(spans)
 }
 
@@ -9145,13 +9175,14 @@ fn together_context_collect_tree_rows(
 }
 
 fn together_context_graph_prefix_spans(
+    mode: TogetherContextViewMode,
     row: &TogetherContextTreeRow,
     is_marked: bool,
 ) -> Vec<Span<'static>> {
-    let mut spans = vec![if is_marked {
-        "[x] ".cyan()
-    } else {
-        "[ ] ".dim()
+    let mut spans = vec![match mode {
+        TogetherContextViewMode::Browse => "    ".into(),
+        TogetherContextViewMode::Handoff if is_marked => "[x] ".cyan(),
+        TogetherContextViewMode::Handoff => "[ ] ".dim(),
     }];
     for has_more_siblings in &row.tree_guides {
         spans.push(if *has_more_siblings {
@@ -9309,17 +9340,12 @@ fn together_context_inline_excerpt(text: &str, max_chars: usize) -> String {
 }
 
 pub(crate) fn together_handoff_draft(plan: &HandoffPlanResponse) -> String {
-    let mut parts = Vec::new();
-    if let Some(goal) = &plan.goal {
-        parts.push(goal.trim().to_string());
-    }
-    if !plan.kept_refs.is_empty() {
-        if !parts.is_empty() {
-            parts.push(String::new());
-        }
-        parts.extend(plan.kept_refs.iter().map(together_context_token));
-    }
-    parts.join("\n")
+    plan.goal
+        .as_deref()
+        .map(str::trim)
+        .filter(|goal| !goal.is_empty())
+        .map(str::to_string)
+        .unwrap_or_default()
 }
 
 fn together_context_token(context_ref: &ContextRef) -> String {
@@ -9403,6 +9429,44 @@ fn collaboration_context_bundle_message(bundle_text: String) -> String {
         bundle_text,
         codex_protocol::protocol::COLLABORATION_CONTEXT_CLOSE_TAG,
     )
+}
+
+fn together_should_skip_replayed_initial_message(msg: &EventMsg) -> bool {
+    match msg {
+        EventMsg::UserMessage(UserMessageEvent { message, .. }) => {
+            together_is_contextual_replay_text(message)
+        }
+        _ => false,
+    }
+}
+
+fn together_is_contextual_replay_text(text: &str) -> bool {
+    let trimmed_start = text.trim_start();
+    let trimmed = trimmed_start.trim_end();
+    [
+        ("# AGENTS.md instructions for ", "</INSTRUCTIONS>"),
+        (
+            codex_protocol::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG,
+            codex_protocol::protocol::ENVIRONMENT_CONTEXT_CLOSE_TAG,
+        ),
+        ("<skill>", "</skill>"),
+        ("<user_shell_command>", "</user_shell_command>"),
+        (
+            codex_protocol::protocol::COLLABORATION_CONTEXT_OPEN_TAG,
+            codex_protocol::protocol::COLLABORATION_CONTEXT_CLOSE_TAG,
+        ),
+        ("<turn_aborted>", "</turn_aborted>"),
+        ("<subagent_notification>", "</subagent_notification>"),
+    ]
+    .iter()
+    .any(|(start_marker, end_marker)| {
+        trimmed_start
+            .get(..start_marker.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(start_marker))
+            && trimmed
+                .get(trimmed.len().saturating_sub(end_marker.len())..)
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(end_marker))
+    })
 }
 
 fn strip_context_tokens_from_submission(
@@ -9921,7 +9985,8 @@ async fn execute_together_command(
                     query,
                     query_response,
                     scope,
-                    selected_ref_ids: current_selected_ref_ids,
+                    mode: TogetherContextViewMode::Browse,
+                    selected_ref_ids: Vec::new(),
                     handoff_goal: None,
                 }),
             })
@@ -9970,6 +10035,7 @@ async fn execute_together_command(
                     query: None,
                     query_response,
                     scope: TogetherContextScope::default_for(Some(plan.source_thread_id.as_str())),
+                    mode: TogetherContextViewMode::Handoff,
                     selected_ref_ids: plan.selected_node_ids,
                     handoff_goal: plan.goal,
                 }),

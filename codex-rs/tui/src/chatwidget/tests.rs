@@ -1924,6 +1924,7 @@ async fn together_context_view_snapshot() {
 
     let anchor_id = context_anchor_id(Some(thread_id));
     let local_ref_id = format!("ctx:thread-file:{thread_id}:chatwidget");
+    let search_ref_id = format!("ctx:thread-search:{thread_id}:search-1");
     let handoff_ref_id = format!("ctx:thread-insight:{prior_thread_id}:plan-1");
     let repo_ref_id = "ctx:file:.codex/context/playbooks/handoff-selection-flow.md";
 
@@ -1941,6 +1942,15 @@ async fn together_context_view_snapshot() {
                     Some("linked file · updated in thread"),
                     Some("tui/src/chatwidget.rs"),
                     Some("Adjusted the /context selection view."),
+                    thread_id,
+                ),
+                thread_context_node(
+                    &search_ref_id,
+                    ThreadArtifactKind::Search,
+                    "Search results in chatwidget.rs",
+                    Some("thread search · current thread"),
+                    Some("search/chatwidget"),
+                    Some("together_context_rows_for_scope"),
                     thread_id,
                 ),
                 thread_context_node(
@@ -1964,8 +1974,10 @@ async fn together_context_view_snapshot() {
             ],
             vec![
                 mounted_edge(&anchor_id, &local_ref_id, ContextMountReason::Local),
+                mounted_edge(&anchor_id, &search_ref_id, ContextMountReason::Local),
                 mounted_edge(&anchor_id, &handoff_ref_id, ContextMountReason::HandoffSeed),
                 mounted_edge(&anchor_id, repo_ref_id, ContextMountReason::RepoNeighbor),
+                related_edge(&search_ref_id, &local_ref_id, "query_result"),
                 related_edge(repo_ref_id, &local_ref_id, "same_file"),
             ],
         ),
@@ -1992,8 +2004,9 @@ async fn together_context_global_view_snapshot() {
 
     let anchor_id = context_anchor_id(Some(thread_id));
     let local_ref_id = format!("ctx:thread-file:{thread_id}:chatwidget");
+    let current_search_ref_id = format!("ctx:thread-search:{thread_id}:search-1");
     let handoff_ref_id = format!("ctx:thread-insight:{prior_thread_id}:plan-1");
-    let search_ref_id = format!("ctx:thread-search:{older_thread_id}:search-1");
+    let older_search_ref_id = format!("ctx:thread-search:{older_thread_id}:search-1");
     let repo_ref_id = "ctx:file:.codex/context/playbooks/handoff-selection-flow.md";
 
     chat.show_together_context_view(
@@ -2013,6 +2026,15 @@ async fn together_context_global_view_snapshot() {
                     thread_id,
                 ),
                 thread_context_node(
+                    &current_search_ref_id,
+                    ThreadArtifactKind::Search,
+                    "Search results in chatwidget.rs",
+                    Some("thread search · current thread"),
+                    Some("search/chatwidget"),
+                    Some("together_context_rows_for_scope"),
+                    thread_id,
+                ),
+                thread_context_node(
                     &handoff_ref_id,
                     ThreadArtifactKind::Plan,
                     "Simplify /context selection flow",
@@ -2022,7 +2044,7 @@ async fn together_context_global_view_snapshot() {
                     prior_thread_id,
                 ),
                 thread_context_node(
-                    &search_ref_id,
+                    &older_search_ref_id,
                     ThreadArtifactKind::Search,
                     "promotion scoring heuristics",
                     Some("thread search · prior exploration"),
@@ -2042,10 +2064,17 @@ async fn together_context_global_view_snapshot() {
             ],
             vec![
                 mounted_edge(&anchor_id, &local_ref_id, ContextMountReason::Local),
+                mounted_edge(
+                    &anchor_id,
+                    &current_search_ref_id,
+                    ContextMountReason::Local,
+                ),
                 mounted_edge(&anchor_id, &handoff_ref_id, ContextMountReason::HandoffSeed),
                 mounted_edge(&anchor_id, repo_ref_id, ContextMountReason::RepoNeighbor),
+                related_edge(&current_search_ref_id, &local_ref_id, "query_result"),
+                related_edge(&handoff_ref_id, repo_ref_id, "source_ref"),
                 related_edge(repo_ref_id, &local_ref_id, "same_file"),
-                related_edge(&handoff_ref_id, &search_ref_id, "same_topic"),
+                related_edge(&handoff_ref_id, &older_search_ref_id, "same_topic"),
             ],
         ),
         TogetherContextScope::Global,

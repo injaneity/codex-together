@@ -8783,6 +8783,24 @@ impl Default for TogetherContextViewState {
 struct TogetherContextTreeRow {
     node: ContextQueryNode,
     mount_reason: Option<ContextMountReason>,
+    tree_guides: Vec<bool>,
+    has_parent: bool,
+    is_last_sibling: bool,
+    child_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct TogetherContextVisibleRow {
+    node: ContextQueryNode,
+    mount_reason: Option<ContextMountReason>,
+    original_idx: usize,
+}
+
+#[derive(Debug, Clone)]
+struct TogetherContextTreePosition {
+    tree_guides: Vec<bool>,
+    has_parent: bool,
+    is_last_sibling: bool,
 }
 
 fn lock_together_context_view_state(
@@ -8919,43 +8937,239 @@ fn together_context_rows_for_scope(
         .collect::<HashMap<_, _>>();
     let has_thread_context = query_response.anchor.current_thread_id.is_some();
 
-    query_response
-        .nodes
-        .iter()
-        .filter_map(|node| {
-            let mount_reason = mount_reason_by_node_id
-                .get(together_context_node_id(node))
-                .copied();
-            match scope {
-                TogetherContextScope::LocalThread if has_thread_context => matches!(
-                    mount_reason,
-                    Some(ContextMountReason::Local)
-                        | Some(ContextMountReason::ForkSeed)
-                        | Some(ContextMountReason::HandoffSeed)
-                )
-                .then_some(TogetherContextTreeRow {
-                    node: node.clone(),
-                    mount_reason,
-                }),
-                TogetherContextScope::LocalThread => None,
-                TogetherContextScope::Global => Some(TogetherContextTreeRow {
-                    node: node.clone(),
-                    mount_reason,
-                }),
+    let mut visible_row_by_node_id = HashMap::<String, TogetherContextVisibleRow>::new();
+    let mut visible_order_by_node_id = HashMap::<String, usize>::new();
+    for (original_idx, node) in query_response.nodes.iter().enumerate() {
+        let mount_reason = mount_reason_by_node_id
+            .get(together_context_node_id(node))
+            .copied();
+        let visible_row = match scope {
+            TogetherContextScope::LocalThread if has_thread_context => matches!(
+                mount_reason,
+                Some(ContextMountReason::Local)
+                    | Some(ContextMountReason::ForkSeed)
+                    | Some(ContextMountReason::HandoffSeed)
+            )
+            .then_some(TogetherContextVisibleRow {
+                node: node.clone(),
+                mount_reason,
+                original_idx,
+            }),
+            TogetherContextScope::LocalThread => None,
+            TogetherContextScope::Global => Some(TogetherContextVisibleRow {
+                node: node.clone(),
+                mount_reason,
+                original_idx,
+            }),
+        };
+        if let Some(visible_row) = visible_row {
+            let node_id = together_context_node_id(&visible_row.node).to_string();
+            visible_order_by_node_id.insert(node_id.clone(), visible_row.original_idx);
+            visible_row_by_node_id.insert(node_id, visible_row);
+        }
+    }
+    let parent_by_node_id =
+        together_context_tree_parent_by_node_id(query_response, &visible_order_by_node_id);
+    let mut child_ids_by_parent_id = HashMap::<String, Vec<String>>::new();
+    for (node_id, parent_id) in &parent_by_node_id {
+        child_ids_by_parent_id
+            .entry(parent_id.clone())
+            .or_default()
+            .push(node_id.clone());
+    }
+    for child_ids in child_ids_by_parent_id.values_mut() {
+        child_ids.sort_by_key(|node_id| {
+            visible_order_by_node_id
+                .get(node_id)
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+    }
+
+    let mut root_node_ids = visible_row_by_node_id
+        .keys()
+        .filter(|node_id| !parent_by_node_id.contains_key(*node_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    root_node_ids.sort_by_key(|node_id| {
+        visible_order_by_node_id
+            .get(node_id)
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+
+    let mut rows = Vec::with_capacity(visible_row_by_node_id.len());
+    let mut visited = HashSet::new();
+    for (idx, root_node_id) in root_node_ids.iter().enumerate() {
+        together_context_collect_tree_rows(
+            root_node_id,
+            &visible_row_by_node_id,
+            &child_ids_by_parent_id,
+            &mut visited,
+            &mut rows,
+            TogetherContextTreePosition {
+                tree_guides: Vec::new(),
+                has_parent: false,
+                is_last_sibling: idx + 1 == root_node_ids.len(),
+            },
+        );
+    }
+
+    let mut leftover_node_ids = visible_row_by_node_id
+        .keys()
+        .filter(|node_id| !visited.contains(*node_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    leftover_node_ids.sort_by_key(|node_id| {
+        visible_order_by_node_id
+            .get(node_id)
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+    for (idx, node_id) in leftover_node_ids.iter().enumerate() {
+        together_context_collect_tree_rows(
+            node_id,
+            &visible_row_by_node_id,
+            &child_ids_by_parent_id,
+            &mut visited,
+            &mut rows,
+            TogetherContextTreePosition {
+                tree_guides: Vec::new(),
+                has_parent: false,
+                is_last_sibling: idx + 1 == leftover_node_ids.len(),
+            },
+        );
+    }
+
+    rows
+}
+
+fn together_context_tree_parent_by_node_id(
+    query_response: &ContextQueryResponse,
+    visible_order_by_node_id: &HashMap<String, usize>,
+) -> HashMap<String, String> {
+    let mut best_parent_by_node_id = HashMap::<String, (u8, usize, String)>::new();
+    for edge in &query_response.edges {
+        if edge.from_node_id == query_response.anchor.anchor_id
+            || edge.from_node_id == edge.to_node_id
+            || !visible_order_by_node_id.contains_key(&edge.from_node_id)
+            || !visible_order_by_node_id.contains_key(&edge.to_node_id)
+        {
+            continue;
+        }
+        let Some(priority) = together_context_tree_edge_priority(edge) else {
+            continue;
+        };
+        let candidate = (
+            priority,
+            visible_order_by_node_id
+                .get(&edge.from_node_id)
+                .copied()
+                .unwrap_or(usize::MAX),
+            edge.from_node_id.clone(),
+        );
+        let child_node_id = edge.to_node_id.clone();
+        match best_parent_by_node_id.get(&child_node_id) {
+            Some(existing) if candidate >= *existing => {}
+            _ => {
+                best_parent_by_node_id.insert(child_node_id, candidate);
             }
-        })
+        }
+    }
+
+    best_parent_by_node_id
+        .into_iter()
+        .map(|(node_id, (_, _, parent_id))| (node_id, parent_id))
         .collect()
 }
 
+fn together_context_tree_edge_priority(
+    edge: &codex_together_protocol::ContextQueryEdge,
+) -> Option<u8> {
+    match edge.reason.as_deref() {
+        Some("query_result") => Some(0),
+        Some("source_ref") => Some(1),
+        _ => match edge.edge_type {
+            codex_together_protocol::ContextEdgeType::CoveredBy => Some(2),
+            codex_together_protocol::ContextEdgeType::PromotedTo => Some(3),
+            codex_together_protocol::ContextEdgeType::Mounted
+            | codex_together_protocol::ContextEdgeType::Related => None,
+        },
+    }
+}
+
+fn together_context_collect_tree_rows(
+    node_id: &str,
+    visible_row_by_node_id: &HashMap<String, TogetherContextVisibleRow>,
+    child_ids_by_parent_id: &HashMap<String, Vec<String>>,
+    visited: &mut HashSet<String>,
+    rows: &mut Vec<TogetherContextTreeRow>,
+    position: TogetherContextTreePosition,
+) {
+    if !visited.insert(node_id.to_string()) {
+        return;
+    }
+    let Some(row) = visible_row_by_node_id.get(node_id) else {
+        return;
+    };
+    let child_count = child_ids_by_parent_id.get(node_id).map_or(0, Vec::len);
+    rows.push(TogetherContextTreeRow {
+        node: row.node.clone(),
+        mount_reason: row.mount_reason,
+        tree_guides: position.tree_guides.clone(),
+        has_parent: position.has_parent,
+        is_last_sibling: position.is_last_sibling,
+        child_count,
+    });
+
+    let mut child_tree_guides = position.tree_guides;
+    if position.has_parent {
+        child_tree_guides.push(!position.is_last_sibling);
+    }
+    if let Some(child_node_ids) = child_ids_by_parent_id.get(node_id) {
+        for (idx, child_node_id) in child_node_ids.iter().enumerate() {
+            together_context_collect_tree_rows(
+                child_node_id,
+                visible_row_by_node_id,
+                child_ids_by_parent_id,
+                visited,
+                rows,
+                TogetherContextTreePosition {
+                    tree_guides: child_tree_guides.clone(),
+                    has_parent: true,
+                    is_last_sibling: idx + 1 == child_node_ids.len(),
+                },
+            );
+        }
+    }
+}
+
 fn together_context_graph_prefix_spans(
-    _row: &TogetherContextTreeRow,
+    row: &TogetherContextTreeRow,
     is_marked: bool,
 ) -> Vec<Span<'static>> {
-    vec![if is_marked {
+    let mut spans = vec![if is_marked {
         "[x] ".cyan()
     } else {
         "[ ] ".dim()
-    }]
+    }];
+    for has_more_siblings in &row.tree_guides {
+        spans.push(if *has_more_siblings {
+            "│ ".dim()
+        } else {
+            "  ".dim()
+        });
+    }
+    if row.has_parent {
+        spans.push(if row.is_last_sibling {
+            "╰─".dim()
+        } else {
+            "├─".dim()
+        });
+    }
+    let node_marker = if row.child_count > 1 { "⏣ " } else { "◯ " };
+    spans.push(node_marker.dim());
+    spans
 }
 
 fn together_context_short_hash(node_id: &str) -> String {
@@ -9162,7 +9376,14 @@ fn together_context_search_display_name(
         Some("web/search") => format!("Web search: {}", node.title),
         Some("web/open-page") => format!("Opened page: {}", node.title),
         Some("web/find-in-page") => format!("Find in page: {}", node.title),
-        _ => format!("Search: {}", node.title),
+        _ => {
+            let title = node.title.trim();
+            if title.to_ascii_lowercase().starts_with("search result") {
+                title.to_string()
+            } else {
+                format!("Search: {title}")
+            }
+        }
     }
 }
 

@@ -8497,13 +8497,33 @@ impl ChatWidget {
                         search_value.push(' ');
                         search_value.push_str(body);
                     }
+                    let is_marked = selected_ref_ids.contains(together_context_row_node_id(&row));
                     SelectionItem {
                         name: together_context_row_name(&row),
-                        name_prefix_spans: together_context_graph_prefix_spans(
+                        name_prefix_spans: if matches!(mode, TogetherContextViewMode::Handoff)
+                            && is_marked
+                        {
+                            together_context_graph_prefix_spans(
+                                &row,
+                                TogetherContextNodePrefix::Checkbox { is_marked: true },
+                            )
+                        } else {
+                            together_context_graph_prefix_spans(
+                                &row,
+                                TogetherContextNodePrefix::Legend,
+                            )
+                        },
+                        selected_name_prefix_spans: if matches!(
                             mode,
-                            &row,
-                            selected_ref_ids.contains(together_context_row_node_id(&row)),
-                        ),
+                            TogetherContextViewMode::Handoff
+                        ) {
+                            together_context_graph_prefix_spans(
+                                &row,
+                                TogetherContextNodePrefix::Checkbox { is_marked },
+                            )
+                        } else {
+                            Vec::new()
+                        },
                         description,
                         selected_description: None,
                         search_value: Some(search_value),
@@ -9154,16 +9174,17 @@ fn together_context_collect_tree_rows(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TogetherContextNodePrefix {
+    Legend,
+    Checkbox { is_marked: bool },
+}
+
 fn together_context_graph_prefix_spans(
-    mode: TogetherContextViewMode,
     row: &TogetherContextTreeRow,
-    is_marked: bool,
+    prefix: TogetherContextNodePrefix,
 ) -> Vec<Span<'static>> {
-    let mut spans = vec![match mode {
-        TogetherContextViewMode::Browse => "    ".into(),
-        TogetherContextViewMode::Handoff if is_marked => "[x] ".cyan(),
-        TogetherContextViewMode::Handoff => "[ ] ".dim(),
-    }];
+    let mut spans = vec!["    ".into()];
     for has_more_siblings in &row.tree_guides {
         spans.push(if *has_more_siblings {
             "│ ".dim()
@@ -9183,9 +9204,18 @@ fn together_context_graph_prefix_spans(
     } else {
         "  ".into()
     });
-    spans.push(match &row.node {
-        ContextQueryNode::Thread(_) => "◯ ".dim(),
-        ContextQueryNode::Repo(_) => "⏣ ".dim(),
+    spans.push(match prefix {
+        TogetherContextNodePrefix::Legend => match &row.node {
+            ContextQueryNode::Thread(_) => "◯ ".dim(),
+            ContextQueryNode::Repo(_) => "⏣ ".dim(),
+        },
+        TogetherContextNodePrefix::Checkbox { is_marked } => {
+            if is_marked {
+                "[x] ".cyan()
+            } else {
+                "[ ] ".dim()
+            }
+        }
     });
     let tag_label = together_context_tag_label(&row.node);
     spans.push(Span::styled(

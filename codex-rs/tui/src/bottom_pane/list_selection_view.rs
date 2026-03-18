@@ -127,6 +127,7 @@ pub(crate) type OnCancelCallback = Option<Box<dyn Fn(&AppEventSender) + Send + S
 pub(crate) struct SelectionItem {
     pub name: String,
     pub name_prefix_spans: Vec<Span<'static>>,
+    pub selected_name_prefix_spans: Vec<Span<'static>>,
     pub display_shortcut: Option<KeyBinding>,
     pub description: Option<String>,
     pub selected_description: Option<String>,
@@ -418,7 +419,13 @@ impl ListSelectionView {
                     let wrap_prefix_width = UnicodeWidthStr::width(wrap_prefix.as_str());
                     let mut name_prefix_spans = Vec::new();
                     name_prefix_spans.push(wrap_prefix.into());
-                    name_prefix_spans.extend(item.name_prefix_spans.clone());
+                    name_prefix_spans.extend(
+                        if is_selected && !item.selected_name_prefix_spans.is_empty() {
+                            item.selected_name_prefix_spans.clone()
+                        } else {
+                            item.name_prefix_spans.clone()
+                        },
+                    );
                     let description = is_selected
                         .then(|| item.selected_description.clone())
                         .flatten()
@@ -1423,6 +1430,44 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "moving down in a single-item list should not fire on_selection_changed",
+        );
+    }
+
+    #[test]
+    fn selected_row_uses_selected_name_prefix_spans() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let view = ListSelectionView::new(
+            SelectionViewParams {
+                items: vec![
+                    SelectionItem {
+                        name: "First".to_string(),
+                        name_prefix_spans: vec!["◯ ".dim()],
+                        selected_name_prefix_spans: vec!["[ ] ".dim()],
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    },
+                    SelectionItem {
+                        name: "Second".to_string(),
+                        name_prefix_spans: vec!["⏣ ".dim()],
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    },
+                ],
+                initial_selected_idx: Some(0),
+                ..Default::default()
+            },
+            tx,
+        );
+
+        let rendered = render_lines_with_width(&view, 24);
+        assert!(
+            rendered.contains("› 1. [ ] First"),
+            "expected selected prefix override to render:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("  2. ⏣ Second"),
+            "expected unselected row to keep its normal prefix:\n{rendered}"
         );
     }
 

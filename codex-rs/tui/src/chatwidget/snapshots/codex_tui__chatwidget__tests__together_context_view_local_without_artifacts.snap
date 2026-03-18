@@ -8,7 +8,7 @@ expression: terminal.backend()
 "                                                                                                                        "
 "  ⏣ [insight] Summarize this branch in one sentence.                                                                 <  "
 "                                                                                                                        "
-"  esc close                                                                                  ◯ thread  ⏣ repo  * hotspot"
+"  esc close                                                                                ◯ thread  ⏣ repo  * hotspot  "
 "                                                                                                                        "
 "                                                                                                                        "
 "                                                                                                                        "

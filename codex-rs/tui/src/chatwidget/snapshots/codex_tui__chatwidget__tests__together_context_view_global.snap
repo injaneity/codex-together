@@ -12,7 +12,7 @@ expression: terminal.backend()
 "  ╰─ ⏣ [rules] Handoff selection flow                                                                                   "
 "  ◯ [insight] Search: promotion scoring heuristics  from thread 019cf3a8                                                "
 "                                                                                                                        "
-"  esc close                                                                                  ◯ thread  ⏣ repo  * hotspot"
+"  esc close                                                                                ◯ thread  ⏣ repo  * hotspot  "
 "                                                                                                                        "
 "                                                                                                                        "
 "                                                                                                                        "

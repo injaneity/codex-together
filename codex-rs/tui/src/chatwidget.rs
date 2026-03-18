@@ -9057,7 +9057,7 @@ fn together_context_commands_line(mode: TogetherContextViewMode) -> Line<'static
     if matches!(mode, TogetherContextViewMode::Handoff) {
         spans.extend([
             "enter".cyan(),
-            " toggle".dim(),
+            " select".dim(),
             " | ".dim(),
             "h".cyan(),
             " handoff".dim(),
@@ -9294,8 +9294,8 @@ fn together_context_collect_tree_rows(
 
 fn together_context_graph_prefix_spans(
     row: &TogetherContextTreeRow,
-    mode: TogetherContextViewMode,
-    is_marked: bool,
+    _mode: TogetherContextViewMode,
+    _is_marked: bool,
 ) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for has_more_siblings in &row.tree_guides {
@@ -9310,13 +9310,6 @@ fn together_context_graph_prefix_spans(
             "╰─ ".dim()
         } else {
             "├─ ".dim()
-        });
-    }
-    if matches!(mode, TogetherContextViewMode::Handoff) {
-        spans.push(if is_marked {
-            "[x] ".cyan()
-        } else {
-            "[ ] ".dim()
         });
     }
     spans.push(match &row.node {

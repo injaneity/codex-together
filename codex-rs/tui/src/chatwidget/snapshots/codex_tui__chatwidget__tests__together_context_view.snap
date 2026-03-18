@@ -11,7 +11,7 @@ expression: terminal.backend()
 "  ◯ [insight] Simplify /context selection flow  handoff                                                                 "
 "  ⏣ [rules] Handoff selection flow                                                                                      "
 "                                                                                                                        "
-"  esc close                                                                                  ◯ thread  ⏣ repo  * hotspot"
+"  esc close                                                                                ◯ thread  ⏣ repo  * hotspot  "
 "                                                                                                                        "
 "                                                                                                                        "
 "                                                                                                                        "

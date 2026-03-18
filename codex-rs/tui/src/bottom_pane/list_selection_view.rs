@@ -1170,7 +1170,7 @@ impl Renderable for ListSelectionView {
                 let hint_area = Rect {
                     x: hint_area.x + 2,
                     y: hint_area.y,
-                    width: hint_area.width.saturating_sub(2),
+                    width: hint_area.width.saturating_sub(4),
                     height: hint_area.height,
                 };
                 if hint_area.width > 0 && hint_area.height > 0 {

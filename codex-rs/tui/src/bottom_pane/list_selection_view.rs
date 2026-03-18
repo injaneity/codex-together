@@ -11,6 +11,7 @@ use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
+use std::borrow::Cow;
 
 use super::selection_popup_common::render_menu_surface;
 use super::selection_popup_common::wrap_styled_line;
@@ -488,6 +489,66 @@ impl ListSelectionView {
         }
     }
 
+    fn scroll_footer_hint(&self) -> Option<Line<'static>> {
+        let len = self.visible_len();
+        let visible_rows = Self::max_visible_rows(len);
+        let hidden_above = self.state.scroll_top > 0;
+        let hidden_below = self.state.scroll_top.saturating_add(visible_rows) < len;
+        if !hidden_above && !hidden_below {
+            return None;
+        }
+
+        let mut spans = Vec::new();
+        if hidden_above {
+            spans.push("↑".dim());
+            spans.push(" more above".dim());
+        }
+        if hidden_above && hidden_below {
+            spans.push(" | ".dim());
+        }
+        if hidden_below {
+            spans.push("↓".dim());
+            spans.push(" more below".dim());
+        }
+        Some(Line::from(spans))
+    }
+
+    fn combined_footer_hint(&self) -> Option<Line<'static>> {
+        match (self.scroll_footer_hint(), self.footer_hint.clone()) {
+            (Some(scroll_hint), Some(footer_hint)) => {
+                let mut spans = footer_hint.spans;
+                spans.push(" | ".dim());
+                spans.extend(scroll_hint.spans);
+                Some(Line::from(spans))
+            }
+            (Some(scroll_hint), None) => Some(scroll_hint),
+            (None, Some(footer_hint)) => Some(footer_hint),
+            (None, None) => None,
+        }
+    }
+
+    fn wrapped_footer_hint_lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.combined_footer_hint()
+            .map(|hint| {
+                wrap_styled_line(&hint, width.saturating_sub(2))
+                    .into_iter()
+                    .map(|line| Line {
+                        style: line.style,
+                        alignment: line.alignment,
+                        spans: line
+                            .spans
+                            .into_iter()
+                            .map(|span| Span {
+                                style: span.style,
+                                content: Cow::Owned(span.content.into_owned()),
+                            })
+                            .collect(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn accept(&mut self) {
         let selected_item = self
             .state
@@ -815,9 +876,7 @@ impl Renderable for ListSelectionView {
             let note_lines = wrap_styled_line(note, note_width);
             height = height.saturating_add(note_lines.len() as u16);
         }
-        if self.footer_hint.is_some() {
-            height = height.saturating_add(1);
-        }
+        height = height.saturating_add(self.wrapped_footer_hint_lines(width).len() as u16);
         height
     }
 
@@ -832,7 +891,9 @@ impl Renderable for ListSelectionView {
             .as_ref()
             .map(|note| wrap_styled_line(note, note_width));
         let note_height = note_lines.as_ref().map_or(0, |lines| lines.len() as u16);
-        let footer_rows = note_height + u16::from(self.footer_hint.is_some());
+        let footer_hint_lines = self.wrapped_footer_hint_lines(area.width);
+        let footer_hint_height = footer_hint_lines.len() as u16;
+        let footer_rows = note_height + footer_hint_height;
         let [content_area, footer_area] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(footer_rows)]).areas(area);
 
@@ -1024,7 +1085,7 @@ impl Renderable for ListSelectionView {
         if footer_area.height > 0 {
             let [note_area, hint_area] = Layout::vertical([
                 Constraint::Length(note_height),
-                Constraint::Length(if self.footer_hint.is_some() { 1 } else { 0 }),
+                Constraint::Length(footer_hint_height),
             ])
             .areas(footer_area);
 
@@ -1049,14 +1110,27 @@ impl Renderable for ListSelectionView {
                 }
             }
 
-            if let Some(hint) = &self.footer_hint {
+            if !footer_hint_lines.is_empty() {
                 let hint_area = Rect {
                     x: hint_area.x + 2,
                     y: hint_area.y,
                     width: hint_area.width.saturating_sub(2),
                     height: hint_area.height,
                 };
-                hint.clone().dim().render(hint_area, buf);
+                for (idx, line) in footer_hint_lines.iter().enumerate() {
+                    if idx as u16 >= hint_area.height {
+                        break;
+                    }
+                    line.clone().dim().render(
+                        Rect {
+                            x: hint_area.x,
+                            y: hint_area.y + idx as u16,
+                            width: hint_area.width,
+                            height: 1,
+                        },
+                        buf,
+                    );
+                }
             }
         }
     }
@@ -1343,6 +1417,33 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_scroll_hint_wraps_without_hiding_footer_shortcuts() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let view = ListSelectionView::new(
+            SelectionViewParams {
+                title: Some("Debug".to_string()),
+                footer_hint: Some(standard_popup_hint_line()),
+                items: (1..=10)
+                    .map(|idx| SelectionItem {
+                        name: format!("Item {idx}"),
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    })
+                    .collect(),
+                initial_selected_idx: Some(8),
+                ..Default::default()
+            },
+            tx,
+        );
+
+        assert_snapshot!(
+            "list_selection_scroll_hint_wraps",
+            render_lines_with_width(&view, 40)
+        );
+    }
+
+    #[test]
     fn renders_search_query_line_when_enabled() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
@@ -1468,6 +1569,33 @@ mod tests {
         assert!(
             rendered.contains("  2. ⏣ Second"),
             "expected unselected row to keep its normal prefix:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn clipped_list_shows_more_above_and_below_on_initial_render() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let view = ListSelectionView::new(
+            SelectionViewParams {
+                title: Some("Debug".to_string()),
+                items: (1..=10)
+                    .map(|idx| SelectionItem {
+                        name: format!("Item {idx}"),
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    })
+                    .collect(),
+                initial_selected_idx: Some(8),
+                ..Default::default()
+            },
+            tx,
+        );
+
+        let rendered = render_lines_with_width(&view, 48);
+        assert!(
+            rendered.contains("↑ more above | ↓ more below"),
+            "expected clipped list to show overflow hint on first render:\n{rendered}"
         );
     }
 

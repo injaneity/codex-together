@@ -3603,6 +3603,7 @@ impl AppServerBridge {
                 mock_experimental_field: None,
                 experimental_raw_events: false,
                 persist_extended_history: true,
+                materialize_rollout_path: true,
             })
             .map_err(|err| {
                 AppServerError::Decode(anyhow::anyhow!(

@@ -130,6 +130,10 @@ impl CodexThread {
         self.rollout_path.clone()
     }
 
+    pub async fn ensure_rollout_materialized(&self) {
+        self.codex.session.ensure_rollout_materialized().await;
+    }
+
     pub fn state_db(&self) -> Option<StateDbHandle> {
         self.codex.state_db()
     }

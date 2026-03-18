@@ -1826,6 +1826,11 @@ pub struct ThreadStartParams {
     #[experimental("thread/start.persistFullHistory")]
     #[serde(default)]
     pub persist_extended_history: bool,
+    /// If true, eagerly materialize the rollout file before replying so the
+    /// returned path can be consumed immediately.
+    #[experimental("thread/start.materializeRolloutPath")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub materialize_rollout_path: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]

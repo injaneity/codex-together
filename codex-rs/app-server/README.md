@@ -227,6 +227,8 @@ To branch from a stored session, call `thread/fork` with the `thread.id`. This c
 
 Experimental API: `thread/start`, `thread/resume`, and `thread/fork` accept `persistExtendedHistory: true` to persist a richer subset of ThreadItems for non-lossy history when calling `thread/read`, `thread/resume`, and `thread/fork` later. This does not backfill events that were not persisted previously.
 
+Experimental API: `thread/start` also accepts `materializeRolloutPath: true` to eagerly create the rollout file before the response is sent. Use this when you need to immediately consume the returned `thread.path`, such as cross-process handoff flows that reopen the new thread by rollout path.
+
 ### Example: List threads (with pagination & filters)
 
 `thread/list` lets you render a history UI. Results default to `createdAt` (newest first) descending. Pass any combination of:

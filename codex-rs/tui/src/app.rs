@@ -805,22 +805,16 @@ fn assigned_handoff_status_lines(
 
 async fn write_assigned_handoff_rollout(
     codex_home: &Path,
-    expected_thread_id: ThreadId,
     history: &[RolloutItem],
 ) -> Result<PathBuf> {
-    let Some(actual_thread_id) = history.iter().find_map(|item| match item {
+    let Some(thread_id) = history.iter().find_map(|item| match item {
         RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.id),
         _ => None,
     }) else {
         return Err(eyre!(
-            "assigned handoff rollout is missing session metadata for thread {expected_thread_id}"
+            "assigned handoff rollout is missing session metadata"
         ));
     };
-    if actual_thread_id != expected_thread_id {
-        return Err(eyre!(
-            "assigned handoff rollout thread mismatch: expected {expected_thread_id}, got {actual_thread_id}"
-        ));
-    }
 
     let timestamp = Local::now();
     let mut dir = codex_home.join(SESSIONS_SUBDIR);
@@ -829,7 +823,7 @@ async fn write_assigned_handoff_rollout(
     dir.push(format!("{:02}", timestamp.day()));
 
     let date_str = timestamp.format("%Y-%m-%dT%H-%M-%S").to_string();
-    let rollout_path = dir.join(format!("rollout-{date_str}-{actual_thread_id}.jsonl"));
+    let rollout_path = dir.join(format!("rollout-{date_str}-{thread_id}.jsonl"));
     let line_timestamp = Utc::now().to_rfc3339();
 
     let mut serialized = String::new();
@@ -989,32 +983,19 @@ impl App {
                 return;
             }
         };
-        let expected_thread_id = match ThreadId::from_string(notification.thread_id.as_str()) {
-            Ok(thread_id) => thread_id,
-            Err(err) => {
-                self.chat_widget.add_error_message(format!(
-                    "Assigned handoff thread id {} is invalid: {err}",
-                    notification.thread_id
-                ));
-                return;
-            }
-        };
-        let rollout_path = match write_assigned_handoff_rollout(
-            handoff_config.codex_home.as_path(),
-            expected_thread_id,
-            &history,
-        )
-        .await
-        {
-            Ok(path) => path,
-            Err(err) => {
-                self.chat_widget.add_error_message(format!(
-                    "Failed to prepare assigned handoff thread {} locally: {err}",
-                    notification.thread_id
-                ));
-                return;
-            }
-        };
+        let rollout_path =
+            match write_assigned_handoff_rollout(handoff_config.codex_home.as_path(), &history)
+                .await
+            {
+                Ok(path) => path,
+                Err(err) => {
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to prepare assigned handoff thread {} locally: {err}",
+                        notification.thread_id
+                    ));
+                    return;
+                }
+            };
         let loading_prompt = assigned_handoff_loading_prompt(notification.goal.as_deref());
 
         match self
@@ -4560,7 +4541,7 @@ mod tests {
             git: None,
         })];
 
-        let rollout_path = write_assigned_handoff_rollout(temp.path(), thread_id, &history)
+        let rollout_path = write_assigned_handoff_rollout(temp.path(), &history)
             .await
             .expect("write rollout");
         let resumed = RolloutRecorder::get_rollout_history(&rollout_path)
@@ -4584,28 +4565,28 @@ mod tests {
     #[test]
     fn assigned_handoff_loading_prompt_snapshot() {
         assert_snapshot!(
-                                                                    assigned_handoff_loading_prompt(Some("Fix Together handoff delivery")),
-                                                                    @r"
+                                                                                    assigned_handoff_loading_prompt(Some("Fix Together handoff delivery")),
+                                                                                    @r"
 Continue the assigned handoff.
 
 Goal: Fix Together handoff delivery
 
 This addressed handoff thread is already open. Review /context, then continue the task.
 "
-                                                                );
+                                                                                );
     }
 
     #[test]
     fn assigned_handoff_status_lines_snapshot() {
         let notification = sample_assigned_handoff_notification();
         assert_snapshot!(
-                                                                    lines_to_string(&assigned_handoff_status_lines(
-                                                                        &notification,
-                                                                        Some(
-                                                                            "Sender cwd /repo/feature is not available locally; using current cwd /Users/test/project."
-                                                                        )
-                                                                    )),
-                                                                    @r"
+                                                                                    lines_to_string(&assigned_handoff_status_lines(
+                                                                                        &notification,
+                                                                                        Some(
+                                                                                            "Sender cwd /repo/feature is not available locally; using current cwd /Users/test/project."
+                                                                                        )
+                                                                                    )),
+                                                                                    @r"
 • Handoff received
   From: alice@example.com
   Thread: thread_target
@@ -4616,7 +4597,7 @@ This addressed handoff thread is already open. Review /context, then continue th
   Note: Sender cwd /repo/feature is not available locally; using current cwd /Users/test/project.
   A loading prompt has been prepared in the composer.
 "
-                                                                );
+                                                                                );
     }
 
     #[test]

@@ -13,7 +13,7 @@ If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="http
 > [!NOTE]  
 > `codex-together` is a fork of `codex` for Codex-native collaboration across threads and users.
 >
-> Get started with `/host`, then `/fork`, `/share` and `/together`.
+> Get started with `/host`, `/join`, `/share on|off`, `/threads`, `/context`, and `/handoff`.
 > 
 > Read more about `codex-together` [here](./CODEX-TOGETHER.md).
 

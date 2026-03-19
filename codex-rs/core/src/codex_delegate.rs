@@ -16,6 +16,7 @@ use codex_protocol::protocol::Submission;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
+use serde_json::Value;
 use std::time::Duration;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -58,7 +59,7 @@ pub(crate) async fn run_codex_thread_interactive(
         SessionSource::SubAgent(SubAgentSource::Review),
         parent_session.services.agent_control.clone(),
         Vec::new(),
-        false,
+        true,
         None,
     )
     .await?;
@@ -112,6 +113,32 @@ pub(crate) async fn run_codex_thread_one_shot(
     cancel_token: CancellationToken,
     initial_history: Option<InitialHistory>,
 ) -> Result<Codex, CodexErr> {
+    run_codex_thread_one_shot_with_schema(
+        config,
+        auth_manager,
+        models_manager,
+        input,
+        None,
+        parent_session,
+        parent_ctx,
+        cancel_token,
+        initial_history,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_codex_thread_one_shot_with_schema(
+    config: Config,
+    auth_manager: Arc<AuthManager>,
+    models_manager: Arc<ModelsManager>,
+    input: Vec<UserInput>,
+    final_output_json_schema: Option<Value>,
+    parent_session: Arc<Session>,
+    parent_ctx: Arc<TurnContext>,
+    cancel_token: CancellationToken,
+    initial_history: Option<InitialHistory>,
+) -> Result<Codex, CodexErr> {
     // Use a child token so we can stop the delegate after completion without
     // requiring the caller to cancel the parent token.
     let child_cancel = cancel_token.child_token();
@@ -129,7 +156,7 @@ pub(crate) async fn run_codex_thread_one_shot(
     // Send the initial input to kick off the one-shot turn.
     io.submit(Op::UserInput {
         items: input,
-        final_output_json_schema: None,
+        final_output_json_schema,
     })
     .await?;
 

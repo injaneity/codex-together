@@ -10,6 +10,7 @@ use ratatui::widgets::WidgetRef;
 use super::popup_consts::MAX_POPUP_ROWS;
 use super::scroll_state::ScrollState;
 use super::selection_popup_common::GenericDisplayRow;
+use super::selection_popup_common::SingleLineRowRenderOptions;
 use super::selection_popup_common::render_rows_single_line;
 use crate::key_hint;
 use crate::render::Insets;
@@ -106,6 +107,7 @@ impl SkillPopup {
                     display_shortcut: None,
                     description: Some(description).filter(|desc| !desc.is_empty()),
                     category_tag: mention.category_tag.clone(),
+                    row_style: None,
                     is_disabled: false,
                     disabled_reason: None,
                     wrap_indent: None,
@@ -190,6 +192,7 @@ impl WidgetRef for SkillPopup {
             &self.state,
             MAX_POPUP_ROWS,
             "no matches",
+            SingleLineRowRenderOptions::default(),
         );
         if let Some(hint_area) = hint_area {
             let hint_area = Rect {

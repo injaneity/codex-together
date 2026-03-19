@@ -34,9 +34,16 @@ pub(crate) struct GenericDisplayRow {
     pub match_indices: Option<Vec<usize>>, // indices to bold (char positions)
     pub description: Option<String>,       // optional grey text after the name
     pub category_tag: Option<String>,      // optional right-side category label
+    pub row_style: Option<Style>,          // optional style applied across the row content
     pub disabled_reason: Option<String>,   // optional disabled message
     pub is_disabled: bool,
     pub wrap_indent: Option<usize>, // optional indent for wrapped lines
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SingleLineRowRenderOptions {
+    pub selected_row_style: Option<Style>,
+    pub show_selected_suffix_cursor: bool,
 }
 
 /// Controls how selection rows choose the split between left/right name/description columns.
@@ -495,6 +502,14 @@ fn build_full_line(row: &GenericDisplayRow, desc_col: usize) -> Line<'static> {
     Line::from(full_spans)
 }
 
+fn apply_text_style_to_default_spans(spans: &mut [Span<'static>], style: Style) {
+    spans.iter_mut().for_each(|span| {
+        if span.style.fg.is_none() && span.style.bg.is_none() {
+            span.style = span.style.patch(style);
+        }
+    });
+}
+
 /// Render a list of rows using the provided ScrollState, with shared styling
 /// and behavior for selection popups.
 /// Returns the number of terminal lines actually rendered (including the
@@ -673,6 +688,7 @@ pub(crate) fn render_rows_single_line(
     state: &ScrollState,
     max_results: usize,
     empty_message: &str,
+    options: SingleLineRowRenderOptions,
 ) -> u16 {
     if rows_all.is_empty() {
         if area.height > 0 {
@@ -718,8 +734,44 @@ pub(crate) fn render_rows_single_line(
             break;
         }
 
-        let mut full_line = build_full_line(row, desc_col);
-        if Some(i) == state.selected_idx && !row.is_disabled {
+        let row_area = Rect {
+            x: area.x,
+            y: cur_y,
+            width: area.width,
+            height: 1,
+        };
+        let tag = row
+            .category_tag
+            .as_deref()
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_string);
+        let row_without_tag = GenericDisplayRow {
+            name: row.name.clone(),
+            name_prefix_spans: row.name_prefix_spans.clone(),
+            display_shortcut: row.display_shortcut,
+            match_indices: row.match_indices.clone(),
+            description: row.description.clone(),
+            category_tag: None,
+            row_style: row.row_style,
+            disabled_reason: row.disabled_reason.clone(),
+            is_disabled: row.is_disabled,
+            wrap_indent: row.wrap_indent,
+        };
+        let mut full_line = build_full_line(&row_without_tag, desc_col);
+        let is_selected = Some(i) == state.selected_idx && !row.is_disabled;
+        if is_selected && let Some(style) = options.selected_row_style {
+            for y in row_area.y..row_area.y.saturating_add(row_area.height) {
+                for x in row_area.x..row_area.x.saturating_add(row_area.width) {
+                    if x < buf.area().width && y < buf.area().height {
+                        buf[(x, y)].set_style(style);
+                    }
+                }
+            }
+        }
+        if let Some(style) = row.row_style {
+            apply_text_style_to_default_spans(&mut full_line.spans, style);
+        }
+        if is_selected && options.selected_row_style.is_none() {
             full_line.spans.iter_mut().for_each(|span| {
                 span.style = Style::default().fg(Color::Cyan).bold();
             });
@@ -729,17 +781,52 @@ pub(crate) fn render_rows_single_line(
                 span.style = span.style.dim();
             });
         }
-
-        let full_line = truncate_line_with_ellipsis_if_overflow(full_line, area.width as usize);
+        if row.row_style.is_some() {
+            full_line.spans.iter_mut().for_each(|span| {
+                span.style = span.style.bold();
+            });
+        }
+        let mut suffix_spans = Vec::new();
+        if let Some(tag) = tag {
+            suffix_spans.push(if tag == "*" { tag.red() } else { tag.dim() });
+        }
+        if options.show_selected_suffix_cursor
+            && is_selected
+            && options.selected_row_style.is_some()
+        {
+            if !suffix_spans.is_empty() {
+                suffix_spans.push(" ".into());
+            }
+            suffix_spans.push("<".cyan().bold());
+        }
+        let suffix_width = Line::from(suffix_spans.clone()).width();
+        let content_width = if suffix_width > 0 && area.width as usize > suffix_width + 1 {
+            area.width.saturating_sub((suffix_width + 1) as u16)
+        } else {
+            area.width
+        };
+        let full_line =
+            truncate_line_with_ellipsis_if_overflow(full_line, content_width.max(1) as usize);
         full_line.render(
             Rect {
-                x: area.x,
-                y: cur_y,
-                width: area.width,
+                x: row_area.x,
+                y: row_area.y,
+                width: content_width.max(1),
                 height: 1,
             },
             buf,
         );
+        if suffix_width > 0 && area.width as usize >= suffix_width {
+            Line::from(suffix_spans).render(
+                Rect {
+                    x: row_area.x + row_area.width.saturating_sub(suffix_width as u16),
+                    y: row_area.y,
+                    width: suffix_width as u16,
+                    height: 1,
+                },
+                buf,
+            );
+        }
         cur_y = cur_y.saturating_add(1);
         rendered_lines = rendered_lines.saturating_add(1);
     }

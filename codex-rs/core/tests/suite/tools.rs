@@ -7,9 +7,14 @@ use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_app_server_protocol::CommandAction;
+use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::build_turns_from_rollout_items;
+use codex_core::RolloutRecorder;
 use codex_core::features::Feature;
 use codex_core::sandboxing::SandboxPermissions;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::SandboxPolicy;
 use core_test_support::assert_regex_match;
 use core_test_support::responses::ev_assistant_message;
@@ -184,6 +189,81 @@ async fn shell_escalated_permissions_rejected_then_ok() -> Result<()> {
     let stdout = output_json["output"].as_str().unwrap_or_default();
     let stdout_pattern = r"(?s)^shell ok\n?$";
     assert_regex_match(stdout_pattern, stdout);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_local_threads_persist_shell_history_for_context_graph() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_model("gpt-5");
+    let test = builder.build(&server).await?;
+
+    let target_path = test.workspace_path("context-source.txt");
+    fs::write(&target_path, "retained context\n")?;
+
+    let call_id = "shell-search";
+    let target_name = target_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("target file name should be valid utf-8")?;
+    let args = json!({
+        "shell": "bash".to_string(),
+        "cmd": format!("rg -n retained {target_name}"),
+        "yield_time_ms": 250,
+    });
+
+    mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    test.submit_turn("Read context-source.txt and confirm it exists.")
+        .await?;
+
+    let rollout_path = test
+        .codex
+        .rollout_path()
+        .context("rollout path should exist for persistent thread")?;
+    let history = RolloutRecorder::get_rollout_history(&rollout_path).await?;
+    let InitialHistory::Resumed(resumed) = history else {
+        panic!("expected resumed rollout history");
+    };
+    let turns = build_turns_from_rollout_items(&resumed.history);
+
+    assert!(
+        turns.iter().flat_map(|turn| &turn.items).any(|item| {
+            matches!(
+                item,
+                ThreadItem::CommandExecution {
+                    command_actions,
+                    aggregated_output: Some(_),
+                    ..
+                } if command_actions.iter().any(|action| matches!(
+                    action,
+                    CommandAction::Search { query, path, .. }
+                        if query.as_deref() == Some("retained")
+                            && path.as_deref() == Some(target_name)
+                ))
+            )
+        }),
+        "expected rollout-backed history to retain shell search actions for local context graph; rollout_items={:?}; turns={:?}",
+        resumed.history,
+        turns
+    );
 
     Ok(())
 }

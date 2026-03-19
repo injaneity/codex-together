@@ -21,7 +21,7 @@ pub(crate) fn builtins_for_input(
         .unwrap_or_else(|_| "disconnected".to_string())
         .to_ascii_lowercase();
     let connected = !status.trim().is_empty() && status != "disconnected";
-    let hosting = status.starts_with("together host:");
+    let hosting = status.contains("host:");
 
     built_in_slash_commands()
         .into_iter()
@@ -34,18 +34,8 @@ pub(crate) fn builtins_for_input(
         .filter(|(_, cmd)| personality_command_enabled || *cmd != SlashCommand::Personality)
         .filter(|(_, cmd)| realtime_conversation_enabled || *cmd != SlashCommand::Realtime)
         .filter(|(_, cmd)| audio_device_selection_enabled || *cmd != SlashCommand::Settings)
-        .filter(|(_, cmd)| !connected || *cmd != SlashCommand::Host)
-        .filter(|(_, cmd)| {
-            connected
-                || !matches!(
-                    cmd,
-                    SlashCommand::Leave
-                        | SlashCommand::Share
-                        | SlashCommand::Threads
-                        | SlashCommand::History
-                )
-        })
-        .filter(|(_, cmd)| hosting || *cmd != SlashCommand::Close)
+        .filter(|(_, cmd)| !connected || hosting || *cmd != SlashCommand::Host)
+        .filter(|(_, cmd)| connected || *cmd != SlashCommand::Leave)
         .collect()
 }
 
@@ -163,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn threads_hidden_when_disconnected() {
+    fn threads_command_is_pruned_while_disconnected() {
         let _guard = TogetherStatusGuard::set("disconnected");
         assert_eq!(
             find_builtin_command("threads", true, true, true, false, true, false),
@@ -172,11 +162,29 @@ mod tests {
     }
 
     #[test]
-    fn threads_visible_when_connected() {
+    fn threads_command_is_pruned_while_connected() {
         let _guard = TogetherStatusGuard::set("together @owner@local");
         assert_eq!(
             find_builtin_command("threads", true, true, true, false, true, false),
-            Some(SlashCommand::Threads)
+            None
+        );
+    }
+
+    #[test]
+    fn context_visible_when_disconnected() {
+        let _guard = TogetherStatusGuard::set("disconnected");
+        assert_eq!(
+            find_builtin_command("context", true, true, true, false, true, false),
+            Some(SlashCommand::Context)
+        );
+    }
+
+    #[test]
+    fn handoff_visible_when_disconnected() {
+        let _guard = TogetherStatusGuard::set("disconnected");
+        assert_eq!(
+            find_builtin_command("handoff", true, true, true, false, true, false),
+            Some(SlashCommand::Handoff)
         );
     }
 
@@ -190,7 +198,16 @@ mod tests {
     }
 
     #[test]
-    fn host_hidden_when_connected() {
+    fn host_visible_when_connected_as_host() {
+        let _guard = TogetherStatusGuard::set("together host:srv_123");
+        assert_eq!(
+            find_builtin_command("host", true, true, true, false, true, false),
+            Some(SlashCommand::Host)
+        );
+    }
+
+    #[test]
+    fn host_hidden_when_connected_as_member() {
         let _guard = TogetherStatusGuard::set("together @owner@local");
         assert_eq!(
             find_builtin_command("host", true, true, true, false, true, false),
@@ -217,34 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn close_hidden_when_disconnected() {
-        let _guard = TogetherStatusGuard::set("disconnected");
-        assert_eq!(
-            find_builtin_command("close", true, true, true, false, true, false),
-            None
-        );
-    }
-
-    #[test]
-    fn close_visible_when_connected() {
-        let _guard = TogetherStatusGuard::set("together host:abc123");
-        assert_eq!(
-            find_builtin_command("close", true, true, true, false, true, false),
-            Some(SlashCommand::Close)
-        );
-    }
-
-    #[test]
-    fn close_hidden_for_member() {
-        let _guard = TogetherStatusGuard::set("together @owner@local");
-        assert_eq!(
-            find_builtin_command("close", true, true, true, false, true, false),
-            None
-        );
-    }
-
-    #[test]
-    fn share_hidden_when_disconnected() {
+    fn share_command_is_pruned_while_disconnected() {
         let _guard = TogetherStatusGuard::set("disconnected");
         assert_eq!(
             find_builtin_command("share", true, true, true, false, true, false),
@@ -253,11 +243,11 @@ mod tests {
     }
 
     #[test]
-    fn share_visible_when_connected() {
+    fn share_command_is_pruned_while_connected() {
         let _guard = TogetherStatusGuard::set("together @owner@local");
         assert_eq!(
             find_builtin_command("share", true, true, true, false, true, false),
-            Some(SlashCommand::Share)
+            None
         );
     }
 }

@@ -75,6 +75,7 @@ mod exec;
 mod exec_policy;
 mod fork_thread;
 mod grep_files;
+mod handoff_selection;
 mod hierarchical_agents;
 mod image_rollout;
 mod items;

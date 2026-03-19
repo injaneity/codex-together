@@ -1741,6 +1741,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-context-graph"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "codex-app-server-protocol",
+ "codex-protocol",
+ "codex-together-protocol",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "codex-core"
 version = "0.0.0"
 dependencies = [
@@ -1763,6 +1780,7 @@ dependencies = [
  "codex-async-utils",
  "codex-client",
  "codex-config",
+ "codex-context-graph",
  "codex-execpolicy",
  "codex-file-search",
  "codex-git",
@@ -1778,6 +1796,7 @@ dependencies = [
  "codex-skills",
  "codex-state",
  "codex-test-macros",
+ "codex-together-protocol",
  "codex-utils-absolute-path",
  "codex-utils-cargo-bin",
  "codex-utils-home-dir",
@@ -2390,6 +2409,7 @@ name = "codex-together-protocol"
 version = "0.0.0"
 dependencies = [
  "codex-protocol",
+ "pretty_assertions",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2404,6 +2424,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "codex-app-server-protocol",
+ "codex-context-graph",
  "codex-core",
  "codex-protocol",
  "codex-state",

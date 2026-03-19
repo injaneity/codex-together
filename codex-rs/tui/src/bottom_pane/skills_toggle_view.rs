@@ -29,6 +29,7 @@ use super::bottom_pane_view::BottomPaneView;
 use super::popup_consts::MAX_POPUP_ROWS;
 use super::scroll_state::ScrollState;
 use super::selection_popup_common::GenericDisplayRow;
+use super::selection_popup_common::SingleLineRowRenderOptions;
 use super::selection_popup_common::render_rows_single_line;
 
 const SEARCH_PLACEHOLDER: &str = "Type to search skills";
@@ -355,6 +356,7 @@ impl Renderable for SkillsToggleView {
                 &self.state,
                 render_area.height as usize,
                 "no matches",
+                SingleLineRowRenderOptions::default(),
             );
         }
 

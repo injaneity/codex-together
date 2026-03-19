@@ -185,6 +185,22 @@
       ],
       "type": "string"
     },
+    "ContextGraphQueryOperation": {
+      "enum": [
+        "search",
+        "neighbors",
+        "open",
+        "hotspots"
+      ],
+      "type": "string"
+    },
+    "ContextGraphQueryScope": {
+      "enum": [
+        "local",
+        "global"
+      ],
+      "type": "string"
+    },
     "DynamicToolCallOutputContentItem": {
       "oneOf": [
         {
@@ -736,6 +752,64 @@
             "type"
           ],
           "title": "DynamicToolCallThreadItem",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "operation": {
+              "$ref": "#/definitions/ContextGraphQueryOperation"
+            },
+            "query": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "refIds": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "resultRefIds": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "scope": {
+              "$ref": "#/definitions/ContextGraphQueryScope"
+            },
+            "success": {
+              "type": "boolean"
+            },
+            "summary": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "contextGraphQuery"
+              ],
+              "title": "ContextGraphQueryThreadItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "operation",
+            "refIds",
+            "resultRefIds",
+            "scope",
+            "success",
+            "type"
+          ],
+          "title": "ContextGraphQueryThreadItem",
           "type": "object"
         },
         {

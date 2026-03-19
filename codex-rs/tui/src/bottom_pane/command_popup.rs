@@ -229,6 +229,7 @@ impl CommandPopup {
                     display_shortcut: None,
                     description: Some(description),
                     category_tag: None,
+                    row_style: None,
                     wrap_indent: None,
                     is_disabled: false,
                     disabled_reason: None,

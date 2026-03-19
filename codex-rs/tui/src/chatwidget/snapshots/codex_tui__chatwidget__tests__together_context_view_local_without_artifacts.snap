@@ -1,0 +1,28 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: terminal.backend()
+---
+"                                                                                                                        "
+"                                                                                                                        "
+"  Context                                                                                                               "
+"                                                                                                                        "
+"  Filter anchored context                                                                                               "
+"  › ⏣ [insight] Summarize this branch in one sentence.                                                                  "
+"                                                                                                                        "
+"  esc close                                                                                ◯ thread  ⏣ repo  * hotspot  "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "

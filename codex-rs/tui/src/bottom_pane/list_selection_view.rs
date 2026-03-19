@@ -6,11 +6,13 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Constraint;
 use ratatui::layout::Layout;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
+use std::borrow::Cow;
 
 use super::selection_popup_common::render_menu_surface;
 use super::selection_popup_common::wrap_styled_line;
@@ -25,10 +27,12 @@ use super::popup_consts::MAX_POPUP_ROWS;
 use super::scroll_state::ScrollState;
 pub(crate) use super::selection_popup_common::ColumnWidthMode;
 use super::selection_popup_common::GenericDisplayRow;
+use super::selection_popup_common::SingleLineRowRenderOptions;
 use super::selection_popup_common::measure_rows_height;
 use super::selection_popup_common::measure_rows_height_stable_col_widths;
 use super::selection_popup_common::measure_rows_height_with_col_width_mode;
 use super::selection_popup_common::render_rows;
+use super::selection_popup_common::render_rows_single_line;
 use super::selection_popup_common::render_rows_stable_col_widths;
 use super::selection_popup_common::render_rows_with_col_width_mode;
 use unicode_width::UnicodeWidthStr;
@@ -62,6 +66,13 @@ impl Default for SideContentWidth {
     fn default() -> Self {
         Self::Fixed(0)
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ScrollHintMode {
+    #[default]
+    Basic,
+    Counts,
 }
 
 /// Returns the popup content width after subtracting the shared menu-surface
@@ -100,6 +111,13 @@ pub(crate) type SelectionAction = Box<dyn Fn(&AppEventSender) + Send + Sync>;
 pub(crate) type OnSelectionCharKeyCallback =
     Option<Box<dyn Fn(char, usize, &AppEventSender) -> bool + Send + Sync>>;
 
+/// Callback for arbitrary key actions while the list is open.
+///
+/// Receives `(key_event, selected_item_actual_index, app_event_tx)` and
+/// returns `true` when the key was consumed.
+pub(crate) type OnSelectionKeyCallback =
+    Option<Box<dyn Fn(&KeyEvent, Option<usize>, &AppEventSender) -> bool + Send + Sync>>;
+
 /// Callback invoked whenever the highlighted item changes (arrow keys, search
 /// filter, number-key jump).  Receives the *actual* index into the unfiltered
 /// `items` list and the event sender.  Used by the theme picker for live preview.
@@ -126,6 +144,9 @@ pub(crate) type OnCancelCallback = Option<Box<dyn Fn(&AppEventSender) + Send + S
 pub(crate) struct SelectionItem {
     pub name: String,
     pub name_prefix_spans: Vec<Span<'static>>,
+    pub selected_name_prefix_spans: Vec<Span<'static>>,
+    pub category_tag: Option<String>,
+    pub row_style: Option<Style>,
     pub display_shortcut: Option<KeyBinding>,
     pub description: Option<String>,
     pub selected_description: Option<String>,
@@ -154,10 +175,16 @@ pub(crate) struct SelectionViewParams {
     pub subtitle: Option<String>,
     pub footer_note: Option<Line<'static>>,
     pub footer_hint: Option<Line<'static>>,
+    pub footer_right: Option<Line<'static>>,
     pub items: Vec<SelectionItem>,
     pub is_searchable: bool,
     pub search_placeholder: Option<String>,
     pub col_width_mode: ColumnWidthMode,
+    pub single_line_rows: bool,
+    pub show_entry_prefix: bool,
+    pub selected_row_style: Option<Style>,
+    pub show_selected_suffix_cursor: bool,
+    pub scroll_hint_mode: ScrollHintMode,
     pub header: Box<dyn Renderable>,
     pub initial_selected_idx: Option<usize>,
 
@@ -193,6 +220,10 @@ pub(crate) struct SelectionViewParams {
     /// Optional callback to handle single-character key actions (for example
     /// `f` for fork in together thread lists).
     pub on_char_key: OnSelectionCharKeyCallback,
+
+    /// Optional callback to intercept arbitrary key events before the list's
+    /// default navigation and selection handling runs.
+    pub on_key_event: OnSelectionKeyCallback,
 }
 
 impl Default for SelectionViewParams {
@@ -203,10 +234,16 @@ impl Default for SelectionViewParams {
             subtitle: None,
             footer_note: None,
             footer_hint: None,
+            footer_right: None,
             items: Vec::new(),
             is_searchable: false,
             search_placeholder: None,
             col_width_mode: ColumnWidthMode::AutoVisible,
+            single_line_rows: false,
+            show_entry_prefix: true,
+            selected_row_style: None,
+            show_selected_suffix_cursor: true,
+            scroll_hint_mode: ScrollHintMode::default(),
             header: Box::new(()),
             initial_selected_idx: None,
             side_content: Box::new(()),
@@ -218,6 +255,7 @@ impl Default for SelectionViewParams {
             on_cancel: None,
             on_selection_footer_hint: None,
             on_char_key: None,
+            on_key_event: None,
         }
     }
 }
@@ -231,6 +269,7 @@ pub(crate) struct ListSelectionView {
     view_id: Option<&'static str>,
     footer_note: Option<Line<'static>>,
     footer_hint: Option<Line<'static>>,
+    footer_right: Option<Line<'static>>,
     items: Vec<SelectionItem>,
     state: ScrollState,
     complete: bool,
@@ -239,6 +278,11 @@ pub(crate) struct ListSelectionView {
     search_query: String,
     search_placeholder: Option<String>,
     col_width_mode: ColumnWidthMode,
+    single_line_rows: bool,
+    show_entry_prefix: bool,
+    selected_row_style: Option<Style>,
+    show_selected_suffix_cursor: bool,
+    scroll_hint_mode: ScrollHintMode,
     filtered_indices: Vec<usize>,
     last_selected_actual_idx: Option<usize>,
     header: Box<dyn Renderable>,
@@ -260,6 +304,9 @@ pub(crate) struct ListSelectionView {
 
     /// Optional callback for custom single-character key actions.
     on_char_key: OnSelectionCharKeyCallback,
+
+    /// Optional callback for arbitrary key handling.
+    on_key_event: OnSelectionKeyCallback,
 }
 
 impl ListSelectionView {
@@ -285,6 +332,7 @@ impl ListSelectionView {
             view_id: params.view_id,
             footer_note: params.footer_note,
             footer_hint: params.footer_hint,
+            footer_right: params.footer_right,
             items: params.items,
             state: ScrollState::new(),
             complete: false,
@@ -297,6 +345,11 @@ impl ListSelectionView {
                 None
             },
             col_width_mode: params.col_width_mode,
+            single_line_rows: params.single_line_rows,
+            show_entry_prefix: params.show_entry_prefix,
+            selected_row_style: params.selected_row_style,
+            show_selected_suffix_cursor: params.show_selected_suffix_cursor,
+            scroll_hint_mode: params.scroll_hint_mode,
             filtered_indices: Vec::new(),
             last_selected_actual_idx: None,
             header,
@@ -310,6 +363,7 @@ impl ListSelectionView {
             on_cancel: params.on_cancel,
             on_selection_footer_hint: params.on_selection_footer_hint,
             on_char_key: params.on_char_key,
+            on_key_event: params.on_key_event,
         };
         s.apply_filter();
         s
@@ -392,7 +446,6 @@ impl ListSelectionView {
             .filter_map(|(visible_idx, actual_idx)| {
                 self.items.get(*actual_idx).map(|item| {
                     let is_selected = self.state.selected_idx == Some(visible_idx);
-                    let prefix = if is_selected { '›' } else { ' ' };
                     let name = item.name.as_str();
                     let marker = if item.is_current {
                         " (current)"
@@ -402,18 +455,31 @@ impl ListSelectionView {
                         ""
                     };
                     let name_with_marker = format!("{name}{marker}");
-                    let n = visible_idx + 1;
-                    let wrap_prefix = if self.is_searchable {
-                        // The number keys don't work when search is enabled (since we let the
-                        // numbers be used for the search query).
-                        format!("{prefix} ")
+                    let wrap_prefix = if self.show_entry_prefix {
+                        let prefix = if is_selected { '›' } else { ' ' };
+                        let n = visible_idx + 1;
+                        if self.is_searchable {
+                            // The number keys don't work when search is enabled (since we let the
+                            // numbers be used for the search query).
+                            format!("{prefix} ")
+                        } else {
+                            format!("{prefix} {n}. ")
+                        }
                     } else {
-                        format!("{prefix} {n}. ")
+                        String::new()
                     };
                     let wrap_prefix_width = UnicodeWidthStr::width(wrap_prefix.as_str());
                     let mut name_prefix_spans = Vec::new();
-                    name_prefix_spans.push(wrap_prefix.into());
-                    name_prefix_spans.extend(item.name_prefix_spans.clone());
+                    if !wrap_prefix.is_empty() {
+                        name_prefix_spans.push(wrap_prefix.into());
+                    }
+                    name_prefix_spans.extend(
+                        if is_selected && !item.selected_name_prefix_spans.is_empty() {
+                            item.selected_name_prefix_spans.clone()
+                        } else {
+                            item.name_prefix_spans.clone()
+                        },
+                    );
                     let description = is_selected
                         .then(|| item.selected_description.clone())
                         .flatten()
@@ -426,7 +492,8 @@ impl ListSelectionView {
                         display_shortcut: item.display_shortcut,
                         match_indices: None,
                         description,
-                        category_tag: None,
+                        category_tag: item.category_tag.clone(),
+                        row_style: item.row_style,
                         wrap_indent,
                         is_disabled,
                         disabled_reason: item.disabled_reason.clone(),
@@ -474,6 +541,79 @@ impl ListSelectionView {
         if let Some(cb) = &self.on_selection_footer_hint {
             self.footer_hint = self.selected_actual_idx().map(cb);
         }
+    }
+
+    fn scroll_footer_hint(&self) -> Option<Line<'static>> {
+        let len = self.visible_len();
+        let visible_rows = Self::max_visible_rows(len);
+        let hidden_above_count = self.state.scroll_top;
+        let hidden_below_count =
+            len.saturating_sub(self.state.scroll_top.saturating_add(visible_rows));
+        let hidden_above = hidden_above_count > 0;
+        let hidden_below = hidden_below_count > 0;
+        if !hidden_above && !hidden_below {
+            return None;
+        }
+
+        let mut spans = Vec::new();
+        if hidden_above {
+            spans.push("↑".dim());
+            match self.scroll_hint_mode {
+                ScrollHintMode::Basic => spans.push(" more above".dim()),
+                ScrollHintMode::Counts => {
+                    spans.push(format!(" {hidden_above_count} more above").dim());
+                }
+            }
+        }
+        if hidden_above && hidden_below {
+            spans.push(" | ".dim());
+        }
+        if hidden_below {
+            spans.push("↓".dim());
+            match self.scroll_hint_mode {
+                ScrollHintMode::Basic => spans.push(" more below".dim()),
+                ScrollHintMode::Counts => {
+                    spans.push(format!(" {hidden_below_count} more below").dim());
+                }
+            }
+        }
+        Some(Line::from(spans))
+    }
+
+    fn combined_footer_hint(&self) -> Option<Line<'static>> {
+        match (self.scroll_footer_hint(), self.footer_hint.clone()) {
+            (Some(scroll_hint), Some(footer_hint)) => {
+                let mut spans = footer_hint.spans;
+                spans.push(" | ".dim());
+                spans.extend(scroll_hint.spans);
+                Some(Line::from(spans))
+            }
+            (Some(scroll_hint), None) => Some(scroll_hint),
+            (None, Some(footer_hint)) => Some(footer_hint),
+            (None, None) => None,
+        }
+    }
+
+    fn wrapped_footer_hint_lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.combined_footer_hint()
+            .map(|hint| {
+                wrap_styled_line(&hint, width.saturating_sub(2))
+                    .into_iter()
+                    .map(|line| Line {
+                        style: line.style,
+                        alignment: line.alignment,
+                        spans: line
+                            .spans
+                            .into_iter()
+                            .map(|span| Span {
+                                style: span.style,
+                                content: Cow::Owned(span.content.into_owned()),
+                            })
+                            .collect(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn accept(&mut self) {
@@ -613,6 +753,12 @@ impl ListSelectionView {
 
 impl BottomPaneView for ListSelectionView {
     fn handle_key_event(&mut self, key_event: KeyEvent) {
+        if let Some(cb) = &self.on_key_event
+            && cb(&key_event, self.selected_actual_idx(), &self.app_event_tx)
+        {
+            return;
+        }
+
         if let KeyEvent {
             code: KeyCode::Char(c),
             modifiers,
@@ -754,26 +900,30 @@ impl Renderable for ListSelectionView {
 
         // Measure wrapped height for up to MAX_POPUP_ROWS items.
         let rows = self.build_rows();
-        let rows_height = match self.col_width_mode {
-            ColumnWidthMode::AutoVisible => measure_rows_height(
-                &rows,
-                &self.state,
-                MAX_POPUP_ROWS,
-                effective_rows_width.saturating_add(1),
-            ),
-            ColumnWidthMode::AutoAllRows => measure_rows_height_stable_col_widths(
-                &rows,
-                &self.state,
-                MAX_POPUP_ROWS,
-                effective_rows_width.saturating_add(1),
-            ),
-            ColumnWidthMode::Fixed => measure_rows_height_with_col_width_mode(
-                &rows,
-                &self.state,
-                MAX_POPUP_ROWS,
-                effective_rows_width.saturating_add(1),
-                ColumnWidthMode::Fixed,
-            ),
+        let rows_height = if self.single_line_rows {
+            rows.len().clamp(1, MAX_POPUP_ROWS) as u16
+        } else {
+            match self.col_width_mode {
+                ColumnWidthMode::AutoVisible => measure_rows_height(
+                    &rows,
+                    &self.state,
+                    MAX_POPUP_ROWS,
+                    effective_rows_width.saturating_add(1),
+                ),
+                ColumnWidthMode::AutoAllRows => measure_rows_height_stable_col_widths(
+                    &rows,
+                    &self.state,
+                    MAX_POPUP_ROWS,
+                    effective_rows_width.saturating_add(1),
+                ),
+                ColumnWidthMode::Fixed => measure_rows_height_with_col_width_mode(
+                    &rows,
+                    &self.state,
+                    MAX_POPUP_ROWS,
+                    effective_rows_width.saturating_add(1),
+                    ColumnWidthMode::Fixed,
+                ),
+            }
         };
 
         let mut height = self.header.desired_height(inner_width);
@@ -799,9 +949,7 @@ impl Renderable for ListSelectionView {
             let note_lines = wrap_styled_line(note, note_width);
             height = height.saturating_add(note_lines.len() as u16);
         }
-        if self.footer_hint.is_some() {
-            height = height.saturating_add(1);
-        }
+        height = height.saturating_add(self.wrapped_footer_hint_lines(width).len() as u16);
         height
     }
 
@@ -816,7 +964,11 @@ impl Renderable for ListSelectionView {
             .as_ref()
             .map(|note| wrap_styled_line(note, note_width));
         let note_height = note_lines.as_ref().map_or(0, |lines| lines.len() as u16);
-        let footer_rows = note_height + u16::from(self.footer_hint.is_some());
+        let footer_hint_lines = self.wrapped_footer_hint_lines(area.width);
+        let footer_hint_height = footer_hint_lines.len() as u16;
+        let footer_hint_area_height =
+            footer_hint_height.max(u16::from(self.footer_right.is_some()));
+        let footer_rows = note_height + footer_hint_area_height;
         let [content_area, footer_area] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(footer_rows)]).areas(area);
 
@@ -837,26 +989,30 @@ impl Renderable for ListSelectionView {
 
         let header_height = self.header.desired_height(inner_width);
         let rows = self.build_rows();
-        let rows_height = match self.col_width_mode {
-            ColumnWidthMode::AutoVisible => measure_rows_height(
-                &rows,
-                &self.state,
-                MAX_POPUP_ROWS,
-                effective_rows_width.saturating_add(1),
-            ),
-            ColumnWidthMode::AutoAllRows => measure_rows_height_stable_col_widths(
-                &rows,
-                &self.state,
-                MAX_POPUP_ROWS,
-                effective_rows_width.saturating_add(1),
-            ),
-            ColumnWidthMode::Fixed => measure_rows_height_with_col_width_mode(
-                &rows,
-                &self.state,
-                MAX_POPUP_ROWS,
-                effective_rows_width.saturating_add(1),
-                ColumnWidthMode::Fixed,
-            ),
+        let rows_height = if self.single_line_rows {
+            rows.len().clamp(1, MAX_POPUP_ROWS) as u16
+        } else {
+            match self.col_width_mode {
+                ColumnWidthMode::AutoVisible => measure_rows_height(
+                    &rows,
+                    &self.state,
+                    MAX_POPUP_ROWS,
+                    effective_rows_width.saturating_add(1),
+                ),
+                ColumnWidthMode::AutoAllRows => measure_rows_height_stable_col_widths(
+                    &rows,
+                    &self.state,
+                    MAX_POPUP_ROWS,
+                    effective_rows_width.saturating_add(1),
+                ),
+                ColumnWidthMode::Fixed => measure_rows_height_with_col_width_mode(
+                    &rows,
+                    &self.state,
+                    MAX_POPUP_ROWS,
+                    effective_rows_width.saturating_add(1),
+                    ColumnWidthMode::Fixed,
+                ),
+            }
         };
 
         // Stacked (fallback) side content height — only used when not side-by-side.
@@ -907,38 +1063,61 @@ impl Renderable for ListSelectionView {
         // -- List rows --
         if list_area.height > 0 {
             let render_area = Rect {
-                x: list_area.x.saturating_sub(2),
+                x: if self.show_entry_prefix {
+                    list_area.x.saturating_sub(2)
+                } else {
+                    list_area.x
+                },
                 y: list_area.y,
-                width: effective_rows_width.max(1),
+                width: if self.show_entry_prefix {
+                    effective_rows_width.max(1)
+                } else {
+                    effective_rows_width.saturating_sub(2).max(1)
+                },
                 height: list_area.height,
             };
-            match self.col_width_mode {
-                ColumnWidthMode::AutoVisible => render_rows(
+            if self.single_line_rows {
+                render_rows_single_line(
                     render_area,
                     buf,
                     &rows,
                     &self.state,
                     render_area.height as usize,
                     "no matches",
-                ),
-                ColumnWidthMode::AutoAllRows => render_rows_stable_col_widths(
-                    render_area,
-                    buf,
-                    &rows,
-                    &self.state,
-                    render_area.height as usize,
-                    "no matches",
-                ),
-                ColumnWidthMode::Fixed => render_rows_with_col_width_mode(
-                    render_area,
-                    buf,
-                    &rows,
-                    &self.state,
-                    render_area.height as usize,
-                    "no matches",
-                    ColumnWidthMode::Fixed,
-                ),
-            };
+                    SingleLineRowRenderOptions {
+                        selected_row_style: self.selected_row_style,
+                        show_selected_suffix_cursor: self.show_selected_suffix_cursor,
+                    },
+                );
+            } else {
+                match self.col_width_mode {
+                    ColumnWidthMode::AutoVisible => render_rows(
+                        render_area,
+                        buf,
+                        &rows,
+                        &self.state,
+                        render_area.height as usize,
+                        "no matches",
+                    ),
+                    ColumnWidthMode::AutoAllRows => render_rows_stable_col_widths(
+                        render_area,
+                        buf,
+                        &rows,
+                        &self.state,
+                        render_area.height as usize,
+                        "no matches",
+                    ),
+                    ColumnWidthMode::Fixed => render_rows_with_col_width_mode(
+                        render_area,
+                        buf,
+                        &rows,
+                        &self.state,
+                        render_area.height as usize,
+                        "no matches",
+                        ColumnWidthMode::Fixed,
+                    ),
+                };
+            }
         }
 
         // -- Side content (preview panel) --
@@ -993,7 +1172,7 @@ impl Renderable for ListSelectionView {
         if footer_area.height > 0 {
             let [note_area, hint_area] = Layout::vertical([
                 Constraint::Length(note_height),
-                Constraint::Length(if self.footer_hint.is_some() { 1 } else { 0 }),
+                Constraint::Length(footer_hint_area_height),
             ])
             .areas(footer_area);
 
@@ -1018,14 +1197,48 @@ impl Renderable for ListSelectionView {
                 }
             }
 
-            if let Some(hint) = &self.footer_hint {
+            if !footer_hint_lines.is_empty() {
                 let hint_area = Rect {
                     x: hint_area.x + 2,
                     y: hint_area.y,
                     width: hint_area.width.saturating_sub(2),
                     height: hint_area.height,
                 };
-                hint.clone().dim().render(hint_area, buf);
+                for (idx, line) in footer_hint_lines.iter().enumerate() {
+                    if idx as u16 >= hint_area.height {
+                        break;
+                    }
+                    line.clone().dim().render(
+                        Rect {
+                            x: hint_area.x,
+                            y: hint_area.y + idx as u16,
+                            width: hint_area.width,
+                            height: 1,
+                        },
+                        buf,
+                    );
+                }
+            }
+
+            if let Some(line) = &self.footer_right {
+                let hint_area = Rect {
+                    x: hint_area.x + 2,
+                    y: hint_area.y,
+                    width: hint_area.width.saturating_sub(4),
+                    height: hint_area.height,
+                };
+                if hint_area.width > 0 && hint_area.height > 0 {
+                    let line_width = line.width().min(hint_area.width as usize) as u16;
+                    line.clone().render(
+                        Rect {
+                            x: hint_area.x + hint_area.width.saturating_sub(line_width),
+                            y: hint_area.y + hint_area.height.saturating_sub(1),
+                            width: line_width,
+                            height: 1,
+                        },
+                        buf,
+                    );
+                }
             }
         }
     }
@@ -1312,6 +1525,33 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_scroll_hint_wraps_without_hiding_footer_shortcuts() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let view = ListSelectionView::new(
+            SelectionViewParams {
+                title: Some("Debug".to_string()),
+                footer_hint: Some(standard_popup_hint_line()),
+                items: (1..=10)
+                    .map(|idx| SelectionItem {
+                        name: format!("Item {idx}"),
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    })
+                    .collect(),
+                initial_selected_idx: Some(8),
+                ..Default::default()
+            },
+            tx,
+        );
+
+        assert_snapshot!(
+            "list_selection_scroll_hint_wraps",
+            render_lines_with_width(&view, 40)
+        );
+    }
+
+    #[test]
     fn renders_search_query_line_when_enabled() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
@@ -1399,6 +1639,71 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "moving down in a single-item list should not fire on_selection_changed",
+        );
+    }
+
+    #[test]
+    fn selected_row_uses_selected_name_prefix_spans() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let view = ListSelectionView::new(
+            SelectionViewParams {
+                items: vec![
+                    SelectionItem {
+                        name: "First".to_string(),
+                        name_prefix_spans: vec!["◯ ".dim()],
+                        selected_name_prefix_spans: vec!["[ ] ".dim()],
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    },
+                    SelectionItem {
+                        name: "Second".to_string(),
+                        name_prefix_spans: vec!["⏣ ".dim()],
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    },
+                ],
+                initial_selected_idx: Some(0),
+                ..Default::default()
+            },
+            tx,
+        );
+
+        let rendered = render_lines_with_width(&view, 24);
+        assert!(
+            rendered.contains("› 1. [ ] First"),
+            "expected selected prefix override to render:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("  2. ⏣ Second"),
+            "expected unselected row to keep its normal prefix:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn clipped_list_shows_more_above_and_below_on_initial_render() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let view = ListSelectionView::new(
+            SelectionViewParams {
+                title: Some("Debug".to_string()),
+                items: (1..=10)
+                    .map(|idx| SelectionItem {
+                        name: format!("Item {idx}"),
+                        dismiss_on_select: true,
+                        ..Default::default()
+                    })
+                    .collect(),
+                initial_selected_idx: Some(8),
+                ..Default::default()
+            },
+            tx,
+        );
+
+        let rendered = render_lines_with_width(&view, 48);
+        assert!(
+            rendered.contains("↑ more above | ↓ more below"),
+            "expected clipped list to show overflow hint on first render:\n{rendered}"
         );
     }
 

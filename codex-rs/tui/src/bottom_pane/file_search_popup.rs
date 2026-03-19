@@ -127,6 +127,7 @@ impl WidgetRef for &FileSearchPopup {
                     display_shortcut: None,
                     description: None,
                     category_tag: None,
+                    row_style: None,
                     wrap_indent: None,
                     is_disabled: false,
                     disabled_reason: None,

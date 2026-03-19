@@ -1,0 +1,18 @@
+---
+source: tui/src/bottom_pane/list_selection_view.rs
+expression: "render_lines_with_width(&view, 40)"
+---
+                                        
+  Debug                                 
+                                        
+  2. Item 2                             
+  3. Item 3                             
+  4. Item 4                             
+  5. Item 5                             
+  6. Item 6                             
+  7. Item 7                             
+  8. Item 8                             
+› 9. Item 9                             
+                                        
+  Press enter to confirm or esc to go   
+  back | ↑ more above | ↓ more below

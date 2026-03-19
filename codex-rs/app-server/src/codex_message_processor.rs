@@ -2059,6 +2059,7 @@ impl CodexMessageProcessor {
             personality,
             ephemeral,
             persist_extended_history,
+            materialize_rollout_path,
         } = params;
         let mut typesafe_overrides = self.build_thread_config_overrides(
             model,
@@ -2093,6 +2094,7 @@ impl CodexMessageProcessor {
                 typesafe_overrides,
                 dynamic_tools,
                 persist_extended_history,
+                materialize_rollout_path,
                 service_name,
                 experimental_raw_events,
             )
@@ -2110,6 +2112,7 @@ impl CodexMessageProcessor {
         typesafe_overrides: ConfigOverrides,
         dynamic_tools: Option<Vec<ApiDynamicToolSpec>>,
         persist_extended_history: bool,
+        materialize_rollout_path: bool,
         service_name: Option<String>,
         experimental_raw_events: bool,
     ) {
@@ -2179,6 +2182,9 @@ impl CodexMessageProcessor {
                     session_configured,
                     ..
                 } = new_conv;
+                if materialize_rollout_path && session_configured.rollout_path.is_some() {
+                    thread.ensure_rollout_materialized().await;
+                }
                 let config_snapshot = thread.config_snapshot().await;
                 let mut thread = build_thread_from_snapshot(
                     thread_id,

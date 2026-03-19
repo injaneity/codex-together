@@ -91,9 +91,6 @@ pub(crate) enum StatusLineItem {
 
     /// Full session UUID.
     SessionId,
-
-    /// Together collaboration connection summary.
-    Together,
 }
 
 impl StatusLineItem {
@@ -127,7 +124,6 @@ impl StatusLineItem {
             StatusLineItem::SessionId => {
                 "Current session identifier (omitted until session starts)"
             }
-            StatusLineItem::Together => "Together server status (omitted when disconnected)",
         }
     }
 
@@ -152,7 +148,6 @@ impl StatusLineItem {
             StatusLineItem::TotalInputTokens => "17,588 in",
             StatusLineItem::TotalOutputTokens => "265 out",
             StatusLineItem::SessionId => "019c19bd-ceb6-73b0-adc8-8ec0397b85cf",
-            StatusLineItem::Together => "together @owner@example.com",
         }
     }
 }

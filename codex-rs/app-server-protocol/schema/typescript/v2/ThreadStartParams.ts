@@ -14,4 +14,8 @@ experimentalRawEvents: boolean, /**
  * If true, persist additional rollout EventMsg variants required to
  * reconstruct a richer thread history on resume/fork/read.
  */
-persistExtendedHistory: boolean};
+persistExtendedHistory: boolean, /**
+ * If true, eagerly materialize the rollout file before replying so the
+ * returned path can be consumed immediately.
+ */
+materializeRolloutPath?: boolean};

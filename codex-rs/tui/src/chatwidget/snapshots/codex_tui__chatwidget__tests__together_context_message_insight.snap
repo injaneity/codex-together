@@ -1,0 +1,28 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: terminal.backend()
+---
+"                                                                                                                        "
+"                                                                                                                        "
+"  Context                                                                                                               "
+"                                                                                                                        "
+"  Filter anchored context                                                                                               "
+"  › ◯ [insight] Explained why /context looked empty after a prose-only turn.                                            "
+"                                                                                                                        "
+"  esc close                                                                                ◯ thread  ⏣ repo  * hotspot  "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "
+"                                                                                                                        "

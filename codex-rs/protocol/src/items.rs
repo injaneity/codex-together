@@ -3,6 +3,8 @@ use crate::models::WebSearchAction;
 use crate::protocol::AgentMessageEvent;
 use crate::protocol::AgentReasoningEvent;
 use crate::protocol::AgentReasoningRawContentEvent;
+use crate::protocol::COLLABORATION_CONTEXT_CLOSE_TAG;
+use crate::protocol::COLLABORATION_CONTEXT_OPEN_TAG;
 use crate::protocol::ContextCompactedEvent;
 use crate::protocol::EventMsg;
 use crate::protocol::UserMessageEvent;
@@ -125,7 +127,7 @@ impl UserMessageItem {
         self.content
             .iter()
             .map(|c| match c {
-                UserInput::Text { text, .. } => text.clone(),
+                UserInput::Text { text, .. } if !is_contextual_user_text(text) => text.clone(),
                 _ => String::new(),
             })
             .collect::<Vec<String>>()
@@ -141,6 +143,9 @@ impl UserMessageItem {
                 text_elements,
             } = input
             {
+                if is_contextual_user_text(text) {
+                    continue;
+                }
                 // Text element ranges are relative to each text chunk; offset them so they align
                 // with the concatenated message returned by `message()`.
                 for elem in text_elements {
@@ -178,6 +183,14 @@ impl UserMessageItem {
             })
             .collect()
     }
+}
+
+fn is_contextual_user_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed
+        .strip_prefix(COLLABORATION_CONTEXT_OPEN_TAG)
+        .and_then(|body| body.strip_suffix(COLLABORATION_CONTEXT_CLOSE_TAG))
+        .is_some()
 }
 
 impl AgentMessageItem {

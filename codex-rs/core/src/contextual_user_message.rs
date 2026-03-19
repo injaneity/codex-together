@@ -1,5 +1,7 @@
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::COLLABORATION_CONTEXT_CLOSE_TAG;
+use codex_protocol::protocol::COLLABORATION_CONTEXT_OPEN_TAG;
 use codex_protocol::protocol::ENVIRONMENT_CONTEXT_CLOSE_TAG;
 use codex_protocol::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
 
@@ -77,6 +79,11 @@ pub(crate) const USER_SHELL_COMMAND_FRAGMENT: ContextualUserFragmentDefinition =
         USER_SHELL_COMMAND_OPEN_TAG,
         USER_SHELL_COMMAND_CLOSE_TAG,
     );
+pub(crate) const COLLABORATION_CONTEXT_FRAGMENT: ContextualUserFragmentDefinition =
+    ContextualUserFragmentDefinition::new(
+        COLLABORATION_CONTEXT_OPEN_TAG,
+        COLLABORATION_CONTEXT_CLOSE_TAG,
+    );
 pub(crate) const TURN_ABORTED_FRAGMENT: ContextualUserFragmentDefinition =
     ContextualUserFragmentDefinition::new(TURN_ABORTED_OPEN_TAG, TURN_ABORTED_CLOSE_TAG);
 pub(crate) const SUBAGENT_NOTIFICATION_FRAGMENT: ContextualUserFragmentDefinition =
@@ -90,13 +97,15 @@ const CONTEXTUAL_USER_FRAGMENTS: &[ContextualUserFragmentDefinition] = &[
     ENVIRONMENT_CONTEXT_FRAGMENT,
     SKILL_FRAGMENT,
     USER_SHELL_COMMAND_FRAGMENT,
+    COLLABORATION_CONTEXT_FRAGMENT,
     TURN_ABORTED_FRAGMENT,
     SUBAGENT_NOTIFICATION_FRAGMENT,
 ];
 
 pub(crate) fn is_contextual_user_fragment(content_item: &ContentItem) -> bool {
-    let ContentItem::InputText { text } = content_item else {
-        return false;
+    let text = match content_item {
+        ContentItem::InputText { text } | ContentItem::OutputText { text } => text,
+        ContentItem::InputImage { .. } => return false,
     };
     CONTEXTUAL_USER_FRAGMENTS
         .iter()
@@ -111,6 +120,13 @@ mod tests {
     fn detects_environment_context_fragment() {
         assert!(is_contextual_user_fragment(&ContentItem::InputText {
             text: "<environment_context>\n<cwd>/tmp</cwd>\n</environment_context>".to_string(),
+        }));
+    }
+
+    #[test]
+    fn detects_collaboration_context_fragment_in_output_text() {
+        assert!(is_contextual_user_fragment(&ContentItem::OutputText {
+            text: "<collaboration_context>\nsummary\n</collaboration_context>".to_string(),
         }));
     }
 

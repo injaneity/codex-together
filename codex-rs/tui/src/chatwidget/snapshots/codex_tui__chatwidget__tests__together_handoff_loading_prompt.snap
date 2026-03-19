@@ -1,0 +1,16 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: prompt
+---
+Continue this handoff in the current repository.
+
+Goal: Keep the files that determine how context is tracked.
+
+Use /context to inspect the mounted handoff nodes from this thread's anchor before making changes.
+
+Focus first on:
+- Read context-graph/src/lib.rs
+- Read tui/src/chatwidget.rs
+- Search: Search results in lib.rs
+
+Start by summarizing the relevant mounted context, then continue the task.

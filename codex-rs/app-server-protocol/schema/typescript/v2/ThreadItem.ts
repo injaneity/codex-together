@@ -8,6 +8,8 @@ import type { CollabAgentTool } from "./CollabAgentTool";
 import type { CollabAgentToolCallStatus } from "./CollabAgentToolCallStatus";
 import type { CommandAction } from "./CommandAction";
 import type { CommandExecutionStatus } from "./CommandExecutionStatus";
+import type { ContextGraphQueryOperation } from "./ContextGraphQueryOperation";
+import type { ContextGraphQueryScope } from "./ContextGraphQueryScope";
 import type { DynamicToolCallOutputContentItem } from "./DynamicToolCallOutputContentItem";
 import type { DynamicToolCallStatus } from "./DynamicToolCallStatus";
 import type { FileUpdateChange } from "./FileUpdateChange";
@@ -56,7 +58,7 @@ durationMs: number | null, } | { "type": "dynamicToolCall", id: string, tool: st
 /**
  * The duration of the dynamic tool call in milliseconds.
  */
-durationMs: number | null, } | { "type": "collabAgentToolCall", 
+durationMs: number | null, } | { "type": "contextGraphQuery", id: string, operation: ContextGraphQueryOperation, scope: ContextGraphQueryScope, query: string | null, refIds: Array<string>, resultRefIds: Array<string>, summary: string | null, success: boolean, } | { "type": "collabAgentToolCall", 
 /**
  * Unique identifier for this collab tool call.
  */

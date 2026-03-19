@@ -285,8 +285,7 @@ impl ThreadManager {
     }
 
     pub async fn start_thread(&self, config: Config) -> CodexResult<NewThread> {
-        self.start_thread_with_tools(config, Vec::new(), false)
-            .await
+        self.start_thread_with_tools(config, Vec::new(), true).await
     }
 
     pub async fn start_thread_with_tools(
@@ -331,7 +330,7 @@ impl ThreadManager {
         auth_manager: Arc<AuthManager>,
     ) -> CodexResult<NewThread> {
         let initial_history = RolloutRecorder::get_rollout_history(&rollout_path).await?;
-        self.resume_thread_with_history(config, initial_history, auth_manager, false)
+        self.resume_thread_with_history(config, initial_history, auth_manager, true)
             .await
     }
 

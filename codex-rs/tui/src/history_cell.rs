@@ -57,7 +57,6 @@ use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputQuestion;
 use codex_protocol::user_input::TextElement;
-use codex_together_client::status_env_key;
 use codex_utils_cli::format_env_display::format_env_display;
 use image::DynamicImage;
 use image::ImageReader;
@@ -1059,8 +1058,6 @@ pub(crate) fn new_session_info(
     );
     let mut parts: Vec<Box<dyn HistoryCell>> = vec![Box::new(header)];
 
-    parts.push(Box::new(TogetherStatusHistoryCell));
-
     if is_first_event {
         // Help lines below the header (new copy and list)
         let help_lines: Vec<Line<'static>> = vec![
@@ -1115,21 +1112,6 @@ pub(crate) fn new_session_info(
     }
 
     SessionInfoCell(CompositeHistoryCell { parts })
-}
-
-#[derive(Debug)]
-struct TogetherStatusHistoryCell;
-
-impl HistoryCell for TogetherStatusHistoryCell {
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        let together_status = std::env::var(status_env_key())
-            .ok()
-            .unwrap_or_else(|| "disconnected".to_string());
-        vec![Line::from(vec![
-            "  together: ".dim(),
-            together_status.into(),
-        ])]
-    }
 }
 
 pub(crate) fn new_user_prompt(
@@ -2438,31 +2420,6 @@ mod tests {
 
     const SMALL_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
-    struct TogetherStatusGuard {
-        previous: Option<String>,
-    }
-
-    impl TogetherStatusGuard {
-        fn set(value: &str) -> Self {
-            let previous = std::env::var(status_env_key()).ok();
-            unsafe {
-                std::env::set_var(status_env_key(), value);
-            }
-            Self { previous }
-        }
-    }
-
-    impl Drop for TogetherStatusGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var(status_env_key(), value),
-                    None => std::env::remove_var(status_env_key()),
-                }
-            }
-        }
-    }
-
     async fn test_config() -> Config {
         let codex_home = std::env::temp_dir();
         ConfigBuilder::default()
@@ -2637,7 +2594,6 @@ mod tests {
 
     #[tokio::test]
     async fn session_info_availability_nux_tooltip_snapshot() {
-        let _guard = TogetherStatusGuard::set("disconnected");
         let mut config = test_config().await;
         config.cwd = PathBuf::from("/tmp/project");
         let cell = new_session_info(

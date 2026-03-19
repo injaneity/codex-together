@@ -1,5 +1,6 @@
 pub(crate) mod agent_jobs;
 pub mod apply_patch;
+mod context_graph;
 mod dynamic;
 mod grep_files;
 mod js_repl;
@@ -29,6 +30,7 @@ use crate::sandboxing::normalize_additional_permissions;
 pub use apply_patch::ApplyPatchHandler;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
+pub use context_graph::ContextGraphHandler;
 pub use dynamic::DynamicToolHandler;
 pub use grep_files::GrepFilesHandler;
 pub use js_repl::JsReplHandler;

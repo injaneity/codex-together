@@ -10,6 +10,7 @@ use crate::app_event::ExitMode;
 #[cfg(all(not(target_os = "linux"), feature = "voice-input"))]
 use crate::app_event::RealtimeAudioDeviceKind;
 use crate::app_event_sender::AppEventSender;
+use crate::bottom_pane::ContextBinding;
 use crate::bottom_pane::FeedbackAudience;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::MentionBinding;
@@ -96,9 +97,23 @@ use codex_protocol::protocol::ViewImageToolCallEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::TextElement;
 use codex_protocol::user_input::UserInput;
-use codex_together_protocol::LineageEdge;
-use codex_together_protocol::LineageNode;
-use codex_together_protocol::TogetherHistoryLineageResponse;
+use codex_together_protocol::ConnectedMember;
+use codex_together_protocol::ContextEdgeType;
+use codex_together_protocol::ContextKind;
+use codex_together_protocol::ContextMountReason;
+use codex_together_protocol::ContextPrecursorKind;
+use codex_together_protocol::ContextQueryAnchor;
+use codex_together_protocol::ContextQueryEdge;
+use codex_together_protocol::ContextQueryNode;
+use codex_together_protocol::ContextQueryResponse;
+use codex_together_protocol::ContextRef;
+use codex_together_protocol::ContextRepoNode;
+use codex_together_protocol::ContextStaleState;
+use codex_together_protocol::ContextThreadNode;
+use codex_together_protocol::RepoMemoryKind;
+use codex_together_protocol::ThreadArtifactKind;
+use codex_together_protocol::TogetherActorKind;
+use codex_together_protocol::TogetherRole;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_approval_presets::builtin_approval_presets;
 use crossterm::event::KeyCode;
@@ -1030,6 +1045,7 @@ async fn blocked_image_restore_preserves_mention_bindings() {
         local_images.clone(),
         mention_bindings.clone(),
         Vec::new(),
+        Vec::new(),
     );
 
     let mention_start = text.find("$file").expect("mention token exists");
@@ -1094,6 +1110,7 @@ async fn blocked_image_restore_with_remote_images_keeps_local_placeholder_mappin
         text_elements.clone(),
         local_images.clone(),
         Vec::new(),
+        Vec::new(),
         remote_image_urls.clone(),
     );
 
@@ -1139,6 +1156,7 @@ async fn queued_restore_with_remote_images_keeps_local_placeholder_mapping() {
         remote_image_urls: remote_image_urls.clone(),
         text_elements: text_elements.clone(),
         mention_bindings: Vec::new(),
+        context_bindings: Vec::new(),
     });
 
     assert_eq!(chat.bottom_pane.composer_text(), text);
@@ -1184,6 +1202,7 @@ async fn interrupted_turn_restores_queued_messages_with_images_and_elements() {
         remote_image_urls: Vec::new(),
         text_elements: first_elements,
         mention_bindings: Vec::new(),
+        context_bindings: Vec::new(),
     });
     chat.queued_user_messages.push_back(UserMessage {
         text: second_text,
@@ -1194,6 +1213,7 @@ async fn interrupted_turn_restores_queued_messages_with_images_and_elements() {
         remote_image_urls: Vec::new(),
         text_elements: second_elements,
         mention_bindings: Vec::new(),
+        context_bindings: Vec::new(),
     });
     chat.refresh_queued_user_messages();
 
@@ -1264,6 +1284,7 @@ async fn interrupted_turn_restore_keeps_active_mode_for_resubmission() {
         remote_image_urls: Vec::new(),
         text_elements: Vec::new(),
         mention_bindings: Vec::new(),
+        context_bindings: Vec::new(),
     });
     chat.refresh_queued_user_messages();
 
@@ -1326,6 +1347,7 @@ async fn remap_placeholders_uses_attachment_labels() {
         local_images: attachments,
         remote_image_urls: vec!["https://example.com/a.png".to_string()],
         mention_bindings: Vec::new(),
+        context_bindings: Vec::new(),
     };
     let mut next_label = 3usize;
     let remapped = remap_placeholders_for_message(message, &mut next_label);
@@ -1392,6 +1414,7 @@ async fn remap_placeholders_uses_byte_ranges_when_placeholder_missing() {
         local_images: attachments,
         remote_image_urls: Vec::new(),
         mention_bindings: Vec::new(),
+        context_bindings: Vec::new(),
     };
     let mut next_label = 3usize;
     let remapped = remap_placeholders_for_message(message, &mut next_label);
@@ -1734,6 +1757,8 @@ async fn make_chatwidget_manual(
         show_welcome_banner: true,
         startup_tooltip_override: None,
         queued_user_messages: VecDeque::new(),
+        pending_together_context_submission: None,
+        together_context_view_state: None,
         queued_message_edit_binding: crate::key_hint::alt(KeyCode::Up),
         suppress_session_configured_redraw: false,
         pending_notification: None,
@@ -1753,7 +1778,6 @@ async fn make_chatwidget_manual(
         feedback: codex_feedback::CodexFeedback::new(),
         feedback_audience: FeedbackAudience::External,
         current_rollout_path: None,
-        read_only_together_checkout_owner: None,
         current_cwd: None,
         session_network_proxy: None,
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
@@ -1763,10 +1787,6 @@ async fn make_chatwidget_manual(
         status_line_branch_lookup_complete: false,
         external_editor_state: ExternalEditorState::Closed,
         realtime_conversation: RealtimeConversationUiState::default(),
-        together_member_emails: HashSet::new(),
-        together_member_roles: HashMap::new(),
-        together_presence_seen_once: false,
-        together_presence_monitor: None,
         last_rendered_user_message_event: None,
     };
     widget.set_model(&resolved_model);
@@ -1795,57 +1815,1393 @@ fn assert_no_submit_op(op_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Op>) {
     }
 }
 
-#[test]
-fn together_replay_is_skipped_for_current_thread() {
-    assert!(!should_replay_together_thread(
-        Some("thread-1"),
-        Some("thread-1")
-    ));
-    assert!(should_replay_together_thread(
-        Some("thread-1"),
-        Some("thread-2")
-    ));
-    assert!(should_replay_together_thread(Some("thread-1"), None));
-    assert!(!should_replay_together_thread(None, Some("thread-1")));
+fn context_anchor_id(current_thread_id: Option<&str>) -> String {
+    current_thread_id
+        .map(|thread_id| format!("anchor:{thread_id}"))
+        .unwrap_or_else(|| "anchor:workspace".to_string())
+}
+
+fn rooted_context_query(
+    current_thread_id: Option<&str>,
+    precursor_thread_id: Option<&str>,
+    precursor_kind: Option<ContextPrecursorKind>,
+    nodes: Vec<ContextQueryNode>,
+    edges: Vec<ContextQueryEdge>,
+) -> ContextQueryResponse {
+    ContextQueryResponse {
+        anchor: ContextQueryAnchor {
+            anchor_id: context_anchor_id(current_thread_id),
+            current_thread_id: current_thread_id.map(str::to_string),
+            precursor_thread_id: precursor_thread_id.map(str::to_string),
+            precursor_kind,
+            actor_id: None,
+            repo_root: None,
+            git_branch: None,
+            goal: None,
+        },
+        nodes,
+        edges,
+    }
+}
+
+fn thread_context_node(
+    node_id: &str,
+    artifact_kind: ThreadArtifactKind,
+    title: &str,
+    summary: Option<&str>,
+    location: Option<&str>,
+    body: Option<&str>,
+    origin_thread_id: &str,
+) -> ContextQueryNode {
+    ContextQueryNode::Thread(ContextThreadNode {
+        node_id: node_id.to_string(),
+        artifact_kind,
+        title: title.to_string(),
+        summary: summary.map(str::to_string),
+        location: location.map(str::to_string),
+        body: body.map(str::to_string),
+        origin_thread_id: origin_thread_id.to_string(),
+        source_files: Vec::new(),
+        source_refs: Vec::new(),
+        created_at: None,
+    })
+}
+
+fn repo_context_node(
+    node_id: &str,
+    repo_kind: RepoMemoryKind,
+    title: &str,
+    summary: Option<&str>,
+    path: &str,
+    source_threads: Vec<&str>,
+    source_metadata: (Vec<&str>, Vec<&str>),
+) -> ContextQueryNode {
+    let (source_refs, source_files) = source_metadata;
+    ContextQueryNode::Repo(ContextRepoNode {
+        node_id: node_id.to_string(),
+        repo_kind,
+        title: title.to_string(),
+        summary: summary.map(str::to_string),
+        path: path.to_string(),
+        source_threads: source_threads.into_iter().map(str::to_string).collect(),
+        source_refs: source_refs.into_iter().map(str::to_string).collect(),
+        source_files: source_files.into_iter().map(str::to_string).collect(),
+        last_validated_at: None,
+    })
+}
+
+fn mounted_edge(
+    anchor_id: &str,
+    to_node_id: &str,
+    mount_reason: ContextMountReason,
+) -> ContextQueryEdge {
+    ContextQueryEdge {
+        from_node_id: anchor_id.to_string(),
+        to_node_id: to_node_id.to_string(),
+        edge_type: ContextEdgeType::Mounted,
+        mount_reason: Some(mount_reason),
+        reason: None,
+    }
+}
+
+fn related_edge(from_node_id: &str, to_node_id: &str, reason: &str) -> ContextQueryEdge {
+    ContextQueryEdge {
+        from_node_id: from_node_id.to_string(),
+        to_node_id: to_node_id.to_string(),
+        edge_type: ContextEdgeType::Related,
+        mount_reason: None,
+        reason: Some(reason.to_string()),
+    }
 }
 
 #[tokio::test]
-async fn together_threads_view_refresh_snapshot() {
+async fn together_context_view_snapshot() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
-    let actor = local_together_actor_id();
+    let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
+    let prior_thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df7";
+    chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
 
-    chat.show_together_threads_view(vec![
-        TogetherThreadSummary {
-            thread_id: "thread-1".to_string(),
-            owner_email: actor.clone(),
-            preview: Some("first preview".to_string()),
-            created_at: "2026-03-06T12:00:00Z".to_string(),
-        },
-        TogetherThreadSummary {
-            thread_id: "thread-2".to_string(),
-            owner_email: actor.clone(),
-            preview: Some("second preview".to_string()),
-            created_at: "2026-03-06T12:05:00Z".to_string(),
-        },
-    ]);
+    let anchor_id = context_anchor_id(Some(thread_id));
+    let local_ref_id = format!("ctx:thread-file:{thread_id}:chatwidget");
+    let search_ref_id = format!("ctx:thread-search:{thread_id}:search-1");
+    let handoff_ref_id = format!("ctx:thread-insight:{prior_thread_id}:plan-1");
+    let repo_ref_id = "ctx:file:.codex/context/playbooks/handoff-selection-flow.md";
 
-    chat.refresh_together_threads_view_if_open(vec![TogetherThreadSummary {
-        thread_id: "thread-2".to_string(),
-        owner_email: actor,
-        preview: Some("second preview".to_string()),
-        created_at: "2026-03-06T12:05:00Z".to_string(),
-    }]);
+    chat.show_together_context_view(
+        None,
+        rooted_context_query(
+            Some(thread_id),
+            Some(prior_thread_id),
+            Some(ContextPrecursorKind::Handoff),
+            vec![
+                thread_context_node(
+                    &local_ref_id,
+                    ThreadArtifactKind::FileChange,
+                    "tui/src/chatwidget.rs",
+                    Some("linked file · updated in thread"),
+                    Some("tui/src/chatwidget.rs"),
+                    Some("Adjusted the /context selection view."),
+                    thread_id,
+                ),
+                thread_context_node(
+                    &search_ref_id,
+                    ThreadArtifactKind::Search,
+                    "Search results in chatwidget.rs",
+                    Some("thread search · current thread"),
+                    Some("search/chatwidget"),
+                    Some("together_context_rows_for_scope"),
+                    thread_id,
+                ),
+                thread_context_node(
+                    &handoff_ref_id,
+                    ThreadArtifactKind::Plan,
+                    "Simplify /context selection flow",
+                    Some("thread insight · retained plan output"),
+                    Some("insight/plan-1"),
+                    Some("Only show one-line nodes and let Enter toggle selection."),
+                    prior_thread_id,
+                ),
+                repo_context_node(
+                    repo_ref_id,
+                    RepoMemoryKind::Playbook,
+                    "Handoff selection flow",
+                    Some("playbook · one-line context selection"),
+                    ".codex/context/playbooks/handoff-selection-flow.md",
+                    vec![prior_thread_id],
+                    (vec![handoff_ref_id.as_str()], vec!["tui/src/chatwidget.rs"]),
+                ),
+            ],
+            vec![
+                mounted_edge(&anchor_id, &local_ref_id, ContextMountReason::Local),
+                mounted_edge(&anchor_id, &search_ref_id, ContextMountReason::Local),
+                mounted_edge(&anchor_id, &handoff_ref_id, ContextMountReason::HandoffSeed),
+                mounted_edge(&anchor_id, repo_ref_id, ContextMountReason::RepoNeighbor),
+                related_edge(&search_ref_id, &local_ref_id, "query_result"),
+                related_edge(repo_ref_id, &local_ref_id, "same_file"),
+            ],
+        ),
+        TogetherContextScope::LocalThread,
+    );
 
-    let mut terminal = Terminal::new(TestBackend::new(100, 16)).expect("create terminal");
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("create terminal");
     terminal
         .draw(|f| chat.render(f.area(), f.buffer_mut()))
-        .expect("draw refreshed threads view");
+        .expect("draw context view");
+    assert_snapshot!("together_context_view", terminal.backend());
+}
+
+#[tokio::test]
+async fn together_context_global_view_snapshot() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
+    let prior_thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df7";
+    let older_thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df6";
+    chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
+
+    let anchor_id = context_anchor_id(Some(thread_id));
+    let local_ref_id = format!("ctx:thread-file:{thread_id}:chatwidget");
+    let current_search_ref_id = format!("ctx:thread-search:{thread_id}:search-1");
+    let handoff_ref_id = format!("ctx:thread-insight:{prior_thread_id}:plan-1");
+    let older_search_ref_id = format!("ctx:thread-search:{older_thread_id}:search-1");
+    let repo_ref_id = "ctx:file:.codex/context/playbooks/handoff-selection-flow.md";
+
+    chat.show_together_context_view(
+        None,
+        rooted_context_query(
+            Some(thread_id),
+            Some(prior_thread_id),
+            Some(ContextPrecursorKind::Handoff),
+            vec![
+                thread_context_node(
+                    &local_ref_id,
+                    ThreadArtifactKind::FileChange,
+                    "tui/src/chatwidget.rs",
+                    Some("linked file · updated in thread"),
+                    Some("tui/src/chatwidget.rs"),
+                    Some("Adjusted the /context selection view."),
+                    thread_id,
+                ),
+                thread_context_node(
+                    &current_search_ref_id,
+                    ThreadArtifactKind::Search,
+                    "Search results in chatwidget.rs",
+                    Some("thread search · current thread"),
+                    Some("search/chatwidget"),
+                    Some("together_context_rows_for_scope"),
+                    thread_id,
+                ),
+                thread_context_node(
+                    &handoff_ref_id,
+                    ThreadArtifactKind::Plan,
+                    "Simplify /context selection flow",
+                    Some("thread insight · retained plan output"),
+                    Some("insight/plan-1"),
+                    Some("Only show one-line nodes and let Enter toggle selection."),
+                    prior_thread_id,
+                ),
+                thread_context_node(
+                    &older_search_ref_id,
+                    ThreadArtifactKind::Search,
+                    "promotion scoring heuristics",
+                    Some("thread search · prior exploration"),
+                    Some("search/promotion"),
+                    Some("promotion scoring heuristics"),
+                    older_thread_id,
+                ),
+                repo_context_node(
+                    repo_ref_id,
+                    RepoMemoryKind::Playbook,
+                    "Handoff selection flow",
+                    Some("playbook · one-line context selection"),
+                    ".codex/context/playbooks/handoff-selection-flow.md",
+                    vec![prior_thread_id],
+                    (vec![handoff_ref_id.as_str()], vec!["tui/src/chatwidget.rs"]),
+                ),
+            ],
+            vec![
+                mounted_edge(&anchor_id, &local_ref_id, ContextMountReason::Local),
+                mounted_edge(
+                    &anchor_id,
+                    &current_search_ref_id,
+                    ContextMountReason::Local,
+                ),
+                mounted_edge(&anchor_id, &handoff_ref_id, ContextMountReason::HandoffSeed),
+                mounted_edge(&anchor_id, repo_ref_id, ContextMountReason::RepoNeighbor),
+                related_edge(&current_search_ref_id, &local_ref_id, "query_result"),
+                related_edge(&handoff_ref_id, repo_ref_id, "source_ref"),
+                related_edge(repo_ref_id, &local_ref_id, "same_file"),
+                related_edge(&handoff_ref_id, &older_search_ref_id, "same_topic"),
+            ],
+        ),
+        TogetherContextScope::Global,
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw context view");
+    assert_snapshot!("together_context_view_global", terminal.backend());
+}
+
+#[tokio::test]
+async fn together_handoff_view_snapshot() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
+    let prior_thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df7";
+    chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
+
+    let anchor_id = context_anchor_id(Some(thread_id));
+    let local_ref_id = format!("ctx:thread-file:{thread_id}:chatwidget");
+    let handoff_ref_id = format!("ctx:thread-insight:{prior_thread_id}:plan-1");
+
+    chat.show_together_context_view_with_selection(
+        None,
+        rooted_context_query(
+            Some(thread_id),
+            Some(prior_thread_id),
+            Some(ContextPrecursorKind::Handoff),
+            vec![
+                thread_context_node(
+                    &local_ref_id,
+                    ThreadArtifactKind::FileChange,
+                    "tui/src/chatwidget.rs",
+                    Some("linked file · updated in thread"),
+                    Some("tui/src/chatwidget.rs"),
+                    Some("Adjusted the /context selection view."),
+                    thread_id,
+                ),
+                thread_context_node(
+                    &handoff_ref_id,
+                    ThreadArtifactKind::Plan,
+                    "Simplify /context selection flow",
+                    Some("thread insight · retained plan output"),
+                    Some("insight/plan-1"),
+                    Some("Only show one-line nodes and let Enter toggle selection."),
+                    prior_thread_id,
+                ),
+            ],
+            vec![
+                mounted_edge(&anchor_id, &local_ref_id, ContextMountReason::Local),
+                mounted_edge(&anchor_id, &handoff_ref_id, ContextMountReason::HandoffSeed),
+            ],
+        ),
+        TogetherContextScope::LocalThread,
+        TogetherContextViewSelection {
+            mode: TogetherContextViewMode::Handoff,
+            selected_ref_ids: HashSet::from([handoff_ref_id.clone()]),
+            handoff_goal: Some("Continue the handoff with the key UI nodes.".to_string()),
+            handoff_loading_prompt: None,
+            handoff_targets: vec![
+                TogetherHandoffTarget {
+                    connection_id: "11111111-0000-0000-0000-000000000000".to_string(),
+                    actor_id: "weisintai@local".to_string(),
+                    display_name: Some("Self".to_string()),
+                    actor_kind: TogetherActorKind::Human,
+                    agent_role: None,
+                    membership_role: Some(TogetherRole::Owner),
+                    is_self: true,
+                },
+                TogetherHandoffTarget {
+                    connection_id: "22222222-0000-0000-0000-000000000000".to_string(),
+                    actor_id: "lobster-worker@local".to_string(),
+                    display_name: Some("Lobster Worker".to_string()),
+                    actor_kind: TogetherActorKind::Agent,
+                    agent_role: Some("research".to_string()),
+                    membership_role: Some(TogetherRole::Member),
+                    is_self: false,
+                },
+            ],
+            selected_handoff_target_idx: 1,
+            focused_handoff_pane: TogetherHandoffPane::Context,
+        },
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw handoff view");
+    assert_snapshot!("together_handoff_view", terminal.backend());
+}
+
+#[tokio::test]
+async fn together_context_message_insight_snapshot() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
+    chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
+
+    let anchor_id = context_anchor_id(Some(thread_id));
+    let insight_ref_id = format!("ctx:thread-insight:{thread_id}:assistant-1");
+
+    chat.show_together_context_view(
+        None,
+        rooted_context_query(
+            Some(thread_id),
+            None,
+            None,
+            vec![thread_context_node(
+                &insight_ref_id,
+                ThreadArtifactKind::Plan,
+                "Explained why /context looked empty after a prose-only turn.",
+                Some("thread insight · recent assistant output"),
+                Some("message/assistant-1"),
+                Some("Explained why /context looked empty after a prose-only turn."),
+                thread_id,
+            )],
+            vec![mounted_edge(
+                &anchor_id,
+                &insight_ref_id,
+                ContextMountReason::Local,
+            )],
+        ),
+        TogetherContextScope::LocalThread,
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw context view");
+    assert_snapshot!("together_context_message_insight", terminal.backend());
+}
+
+#[tokio::test]
+async fn together_handoff_scroll_hint_snapshot() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
+    chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
+
+    let anchor_id = context_anchor_id(Some(thread_id));
+    let nodes = (0..12)
+        .map(|idx| {
+            repo_context_node(
+                &format!("ctx:file:.codex/context/note-{idx}.md"),
+                RepoMemoryKind::Concept,
+                &format!("Planning note {idx}"),
+                Some("plan"),
+                &format!(".codex/context/note-{idx}.md"),
+                vec![thread_id],
+                (vec![], vec![]),
+            )
+        })
+        .collect();
+    let edges = (0..12)
+        .map(|idx| {
+            mounted_edge(
+                &anchor_id,
+                &format!("ctx:file:.codex/context/note-{idx}.md"),
+                ContextMountReason::RepoNeighbor,
+            )
+        })
+        .collect();
+
+    chat.show_together_context_view_with_selection(
+        Some("planning".to_string()),
+        rooted_context_query(Some(thread_id), None, None, nodes, edges),
+        TogetherContextScope::Global,
+        TogetherContextViewSelection {
+            mode: TogetherContextViewMode::Handoff,
+            selected_ref_ids: HashSet::new(),
+            handoff_goal: Some("Inspect the latest planning context.".to_string()),
+            handoff_loading_prompt: None,
+            handoff_targets: vec![TogetherHandoffTarget {
+                connection_id: "11111111-0000-0000-0000-000000000000".to_string(),
+                actor_id: "weisintai@local".to_string(),
+                display_name: Some("Self".to_string()),
+                actor_kind: TogetherActorKind::Human,
+                agent_role: None,
+                membership_role: Some(TogetherRole::Owner),
+                is_self: true,
+            }],
+            selected_handoff_target_idx: 0,
+            focused_handoff_pane: TogetherHandoffPane::Context,
+        },
+    );
+
+    for _ in 0..5 {
+        chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    }
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 14)).expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw handoff view with scroll");
+    assert_snapshot!("together_handoff_scroll_hint", terminal.backend());
+}
+
+#[tokio::test]
+async fn together_context_local_view_without_anchor_snapshot() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
+    chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
+
+    chat.show_together_context_view(
+        None,
+        rooted_context_query(
+            None,
+            None,
+            None,
+            vec![
+                thread_context_node(
+                    &format!("ctx:thread-insight:{thread_id}:plan-1"),
+                    ThreadArtifactKind::Plan,
+                    "Capture branch state",
+                    Some("thread insight · retained plan output"),
+                    Some("insight/plan-1"),
+                    Some("Capture branch state"),
+                    thread_id,
+                ),
+                repo_context_node(
+                    "ctx:file:.codex/context/overview.md",
+                    RepoMemoryKind::Concept,
+                    "Summarize this branch in one sentence.",
+                    Some("concept · Branch summary for demo flow."),
+                    ".codex/context/overview.md",
+                    vec![thread_id],
+                    (vec![], vec!["tui/src/chatwidget.rs"]),
+                ),
+            ],
+            Vec::new(),
+        ),
+        TogetherContextScope::LocalThread,
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw context view");
     assert_snapshot!(
-        "together_threads_view_refresh_after_delete",
+        "together_context_view_local_without_anchor",
         terminal.backend()
+    );
+}
+
+#[tokio::test]
+async fn together_context_local_view_without_artifacts_snapshot() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
+    chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
+
+    chat.show_together_context_view(
+        None,
+        rooted_context_query(
+            Some(thread_id),
+            None,
+            None,
+            vec![repo_context_node(
+                "ctx:file:.codex/context/overview.md",
+                RepoMemoryKind::Concept,
+                "Summarize this branch in one sentence.",
+                Some("concept · Branch summary for demo flow."),
+                ".codex/context/overview.md",
+                vec![thread_id],
+                (vec![], vec!["tui/src/chatwidget.rs"]),
+            )],
+            Vec::new(),
+        ),
+        TogetherContextScope::LocalThread,
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw context view");
+    assert_snapshot!(
+        "together_context_view_local_without_artifacts",
+        terminal.backend()
+    );
+}
+
+#[test]
+fn together_context_rows_include_all_anchored_nodes() {
+    let anchor_id = context_anchor_id(Some("thread-1"));
+    let local_ref_id = "ctx:thread-insight:thread-1:plan-1";
+    let prior_ref_id = "ctx:thread-search:thread-0:search-1";
+    let repo_ref_id = "ctx:file:.codex/context/overview.md";
+    let response = rooted_context_query(
+        Some("thread-1"),
+        Some("thread-0"),
+        Some(ContextPrecursorKind::Fork),
+        vec![
+            thread_context_node(
+                local_ref_id,
+                ThreadArtifactKind::Plan,
+                "Capture the branch state.",
+                Some("insight"),
+                Some("insight/plan-1"),
+                None,
+                "thread-1",
+            ),
+            thread_context_node(
+                prior_ref_id,
+                ThreadArtifactKind::Search,
+                "Search prior commits",
+                Some("search"),
+                Some("search/prior"),
+                None,
+                "thread-0",
+            ),
+            repo_context_node(
+                repo_ref_id,
+                RepoMemoryKind::Concept,
+                "Planning Overview",
+                Some("plan"),
+                ".codex/context/overview.md",
+                vec!["thread-1"],
+                (vec![], vec![]),
+            ),
+        ],
+        vec![
+            mounted_edge(&anchor_id, local_ref_id, ContextMountReason::Local),
+            mounted_edge(&anchor_id, repo_ref_id, ContextMountReason::RepoNeighbor),
+        ],
+    );
+
+    let rows = together_context_rows_for_scope(&response, TogetherContextScope::LocalThread);
+
+    assert_eq!(
+        rows.iter()
+            .map(|row| (
+                together_context_row_node_id(row).to_string(),
+                row.mount_reason
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (local_ref_id.to_string(), Some(ContextMountReason::Local)),
+            (prior_ref_id.to_string(), None),
+            (
+                repo_ref_id.to_string(),
+                Some(ContextMountReason::RepoNeighbor),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn together_context_rows_show_available_nodes_without_anchor() {
+    let response = rooted_context_query(
+        None,
+        None,
+        None,
+        vec![thread_context_node(
+            "ctx:thread-insight:thread-1:plan-1",
+            ThreadArtifactKind::Plan,
+            "Capture the branch state.",
+            Some("insight"),
+            Some("insight/plan-1"),
+            None,
+            "thread-1",
+        )],
+        Vec::new(),
+    );
+
+    let rows = together_context_rows_for_scope(&response, TogetherContextScope::LocalThread);
+
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn together_context_rows_show_repo_notes_without_thread_artifacts() {
+    let response = rooted_context_query(
+        Some("thread-1"),
+        None,
+        None,
+        vec![repo_context_node(
+            "ctx:file:.codex/context/overview.md",
+            RepoMemoryKind::Concept,
+            "Planning Overview",
+            Some("plan"),
+            ".codex/context/overview.md",
+            vec!["thread-1"],
+            (vec![], vec![]),
+        )],
+        Vec::new(),
+    );
+
+    let rows = together_context_rows_for_scope(&response, TogetherContextScope::LocalThread);
+
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn together_context_scopes_resolve_to_same_rooted_rows() {
+    let anchor_id = context_anchor_id(Some("thread-1"));
+    let local_ref_id = "ctx:thread-insight:thread-1:plan-1";
+    let prior_ref_id = "ctx:thread-search:thread-0:search-1";
+    let repo_ref_id = "ctx:file:.codex/context/overview.md";
+    let response = rooted_context_query(
+        Some("thread-1"),
+        Some("thread-0"),
+        Some(ContextPrecursorKind::Fork),
+        vec![
+            thread_context_node(
+                local_ref_id,
+                ThreadArtifactKind::Plan,
+                "Capture the branch state.",
+                Some("insight"),
+                Some("insight/plan-1"),
+                None,
+                "thread-1",
+            ),
+            thread_context_node(
+                prior_ref_id,
+                ThreadArtifactKind::Search,
+                "Search prior commits",
+                Some("search"),
+                Some("search/prior"),
+                None,
+                "thread-0",
+            ),
+            repo_context_node(
+                repo_ref_id,
+                RepoMemoryKind::Concept,
+                "Planning Overview",
+                Some("plan"),
+                ".codex/context/overview.md",
+                vec!["thread-1"],
+                (vec![], vec![]),
+            ),
+        ],
+        vec![
+            mounted_edge(&anchor_id, local_ref_id, ContextMountReason::Local),
+            mounted_edge(&anchor_id, repo_ref_id, ContextMountReason::RepoNeighbor),
+        ],
+    );
+
+    let local_rows = together_context_rows_for_scope(&response, TogetherContextScope::LocalThread);
+    let global_rows = together_context_rows_for_scope(&response, TogetherContextScope::Global);
+
+    assert_eq!(
+        local_rows
+            .iter()
+            .map(|row| (
+                together_context_row_node_id(row).to_string(),
+                row.mount_reason
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (local_ref_id.to_string(), Some(ContextMountReason::Local),),
+            (prior_ref_id.to_string(), None),
+            (
+                repo_ref_id.to_string(),
+                Some(ContextMountReason::RepoNeighbor),
+            ),
+        ]
+    );
+    assert_eq!(
+        local_rows
+            .iter()
+            .map(|row| together_context_row_node_id(row).to_string())
+            .collect::<Vec<_>>(),
+        global_rows
+            .iter()
+            .map(|row| together_context_row_node_id(row).to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn together_context_view_is_browse_only_and_ignores_scope_toggle() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
+    chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
+
+    chat.show_together_context_view(
+        Some("planning".to_string()),
+        rooted_context_query(
+            Some(thread_id),
+            None,
+            None,
+            vec![repo_context_node(
+                "ctx:file:.codex/context/overview.md",
+                RepoMemoryKind::Concept,
+                "Planning Overview",
+                Some("plan"),
+                ".codex/context/overview.md",
+                vec![thread_id],
+                (vec![], vec![]),
+            )],
+            vec![mounted_edge(
+                &context_anchor_id(Some(thread_id)),
+                "ctx:file:.codex/context/overview.md",
+                ContextMountReason::RepoNeighbor,
+            )],
+        ),
+        TogetherContextScope::Global,
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(rx.try_recv().is_err(), "browse view should not select rows");
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+    assert!(
+        rx.try_recv().is_err(),
+        "unified view should not toggle scope"
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+    assert!(
+        rx.try_recv().is_err(),
+        "browse view should not trigger handoff"
+    );
+}
+
+#[tokio::test]
+async fn together_handoff_view_emits_selection_and_handoff_events() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
+    chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
+
+    chat.show_together_context_view_with_selection(
+        Some("planning".to_string()),
+        rooted_context_query(
+            Some(thread_id),
+            None,
+            None,
+            vec![repo_context_node(
+                "ctx:file:.codex/context/overview.md",
+                RepoMemoryKind::Concept,
+                "Planning Overview",
+                Some("plan"),
+                ".codex/context/overview.md",
+                vec![thread_id],
+                (vec![], vec![]),
+            )],
+            vec![mounted_edge(
+                &context_anchor_id(Some(thread_id)),
+                "ctx:file:.codex/context/overview.md",
+                ContextMountReason::RepoNeighbor,
+            )],
+        ),
+        TogetherContextScope::Global,
+        TogetherContextViewSelection {
+            mode: TogetherContextViewMode::Handoff,
+            selected_ref_ids: HashSet::new(),
+            handoff_goal: Some("Inspect the latest planning context.".to_string()),
+            handoff_loading_prompt: None,
+            handoff_targets: vec![
+                TogetherHandoffTarget {
+                    connection_id: "11111111-0000-0000-0000-000000000000".to_string(),
+                    actor_id: "weisintai@local".to_string(),
+                    display_name: Some("Self".to_string()),
+                    actor_kind: TogetherActorKind::Human,
+                    agent_role: None,
+                    membership_role: Some(TogetherRole::Owner),
+                    is_self: true,
+                },
+                TogetherHandoffTarget {
+                    connection_id: "22222222-0000-0000-0000-000000000000".to_string(),
+                    actor_id: "lobster-worker@local".to_string(),
+                    display_name: Some("Lobster Worker".to_string()),
+                    actor_kind: TogetherActorKind::Agent,
+                    agent_role: Some("research".to_string()),
+                    membership_role: Some(TogetherRole::Member),
+                    is_self: false,
+                },
+            ],
+            selected_handoff_target_idx: 1,
+            focused_handoff_pane: TogetherHandoffPane::Context,
+        },
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_matches!(
+        rx.try_recv().expect("expected toggle event"),
+        AppEvent::ToggleTogetherContextSelection { actual_idx: 0 }
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_matches!(
+        rx.try_recv().expect("expected handoff pane toggle event"),
+        AppEvent::ToggleTogetherHandoffPane
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+    assert_matches!(
+        rx.try_recv().expect("expected handoff event"),
+        AppEvent::PlanTogetherContextHandoff { actual_idx: 0 }
+    );
+}
+
+#[tokio::test]
+async fn together_handoff_target_pane_uses_arrows_to_cycle_targets() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
+    chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
+
+    chat.show_together_context_view_with_selection(
+        Some("planning".to_string()),
+        rooted_context_query(
+            Some(thread_id),
+            None,
+            None,
+            vec![repo_context_node(
+                "ctx:file:.codex/context/overview.md",
+                RepoMemoryKind::Concept,
+                "Planning Overview",
+                Some("plan"),
+                ".codex/context/overview.md",
+                vec![thread_id],
+                (vec![], vec![]),
+            )],
+            vec![mounted_edge(
+                &context_anchor_id(Some(thread_id)),
+                "ctx:file:.codex/context/overview.md",
+                ContextMountReason::RepoNeighbor,
+            )],
+        ),
+        TogetherContextScope::Global,
+        TogetherContextViewSelection {
+            mode: TogetherContextViewMode::Handoff,
+            selected_ref_ids: HashSet::new(),
+            handoff_goal: Some("Inspect the latest planning context.".to_string()),
+            handoff_loading_prompt: None,
+            handoff_targets: vec![
+                TogetherHandoffTarget {
+                    connection_id: "11111111-0000-0000-0000-000000000000".to_string(),
+                    actor_id: "weisintai@local".to_string(),
+                    display_name: Some("Self".to_string()),
+                    actor_kind: TogetherActorKind::Human,
+                    agent_role: None,
+                    membership_role: Some(TogetherRole::Owner),
+                    is_self: true,
+                },
+                TogetherHandoffTarget {
+                    connection_id: "22222222-0000-0000-0000-000000000000".to_string(),
+                    actor_id: "lobster-worker@local".to_string(),
+                    display_name: Some("Lobster Worker".to_string()),
+                    actor_kind: TogetherActorKind::Agent,
+                    agent_role: Some("research".to_string()),
+                    membership_role: Some(TogetherRole::Member),
+                    is_self: false,
+                },
+            ],
+            selected_handoff_target_idx: 1,
+            focused_handoff_pane: TogetherHandoffPane::Targets,
+        },
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert_matches!(
+        rx.try_recv().expect("expected handoff target cycle event"),
+        AppEvent::CycleTogetherHandoffTarget { reverse: true }
+    );
+}
+
+#[tokio::test]
+async fn empty_together_handoff_prompt_still_opens_handoff_selection() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.show_together_handoff_prompt(None, None);
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_matches!(
+        rx.try_recv().expect("expected handoff command"),
+        AppEvent::RunTogetherCommand { args } if args == "handoff"
+    );
+}
+
+#[tokio::test]
+async fn targeted_together_handoff_prompt_preserves_actor_prefix_when_empty() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.show_together_handoff_prompt(
+        Some("member@local".to_string()),
+        Some("member@local".to_string()),
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_matches!(
+        rx.try_recv().expect("expected targeted handoff command"),
+        AppEvent::RunTogetherCommand { args } if args == "handoff > member@local"
+    );
+}
+
+#[test]
+fn together_handoff_loading_prompt_snapshot() {
+    let prompt = together_handoff_loading_prompt(
+        Some("Keep the files that determine how context is tracked."),
+        &[
+            "Read context-graph/src/lib.rs".to_string(),
+            "Read tui/src/chatwidget.rs".to_string(),
+            "Search: Search results in lib.rs".to_string(),
+        ],
+    );
+
+    assert_snapshot!("together_handoff_loading_prompt", prompt);
+}
+
+#[test]
+fn together_handoff_targets_from_members_includes_humans_and_prefers_remote_agents() {
+    let local_actor_id = local_together_actor_id();
+    let (targets, selected_idx) = together_handoff_targets_from_members(
+        Some(&[
+            ConnectedMember {
+                connection_id: "11111111-0000-0000-0000-000000000000".to_string(),
+                email: local_actor_id.clone(),
+                role: TogetherRole::Owner,
+                display_name: Some("Self".to_string()),
+                actor_kind: TogetherActorKind::Human,
+                agent_role: None,
+            },
+            ConnectedMember {
+                connection_id: "22222222-0000-0000-0000-000000000000".to_string(),
+                email: "lobster-worker@local".to_string(),
+                role: TogetherRole::Member,
+                display_name: Some("Lobster Worker".to_string()),
+                actor_kind: TogetherActorKind::Agent,
+                agent_role: Some("research".to_string()),
+            },
+            ConnectedMember {
+                connection_id: "33333333-0000-0000-0000-000000000000".to_string(),
+                email: "teammate@local".to_string(),
+                role: TogetherRole::Member,
+                display_name: Some("Teammate".to_string()),
+                actor_kind: TogetherActorKind::Human,
+                agent_role: None,
+            },
+        ]),
+        Some("11111111-0000-0000-0000-000000000000"),
+    );
+
+    assert_eq!(targets.len(), 3);
+    assert_eq!(
+        targets[0].connection_id,
+        "11111111-0000-0000-0000-000000000000".to_string()
+    );
+    assert_eq!(targets[0].actor_id, local_actor_id);
+    assert!(targets[0].is_self);
+    assert_eq!(
+        targets[1].connection_id,
+        "22222222-0000-0000-0000-000000000000".to_string()
+    );
+    assert_eq!(targets[1].actor_id, "lobster-worker@local".to_string());
+    assert_eq!(targets[1].agent_role, Some("research".to_string()));
+    assert_eq!(
+        targets[2].connection_id,
+        "33333333-0000-0000-0000-000000000000".to_string()
+    );
+    assert_eq!(targets[2].actor_id, "teammate@local".to_string());
+    assert_eq!(targets[2].actor_kind, TogetherActorKind::Human);
+    assert_eq!(selected_idx, 1);
+}
+
+#[test]
+fn together_handoff_targets_from_members_falls_back_to_first_remote_target() {
+    let local_actor_id = local_together_actor_id();
+    let (targets, selected_idx) = together_handoff_targets_from_members(
+        Some(&[
+            ConnectedMember {
+                connection_id: "11111111-0000-0000-0000-000000000000".to_string(),
+                email: local_actor_id,
+                role: TogetherRole::Owner,
+                display_name: Some("Self".to_string()),
+                actor_kind: TogetherActorKind::Human,
+                agent_role: None,
+            },
+            ConnectedMember {
+                connection_id: "33333333-0000-0000-0000-000000000000".to_string(),
+                email: "teammate@local".to_string(),
+                role: TogetherRole::Member,
+                display_name: Some("Teammate".to_string()),
+                actor_kind: TogetherActorKind::Human,
+                agent_role: None,
+            },
+        ]),
+        Some("11111111-0000-0000-0000-000000000000"),
+    );
+
+    assert_eq!(targets.len(), 2);
+    assert_eq!(targets[1].actor_id, "teammate@local".to_string());
+    assert_eq!(selected_idx, 1);
+}
+
+#[test]
+fn together_handoff_targets_from_members_keep_other_sessions_for_same_actor() {
+    let local_actor_id = local_together_actor_id();
+    let (targets, selected_idx) = together_handoff_targets_from_members(
+        Some(&[
+            ConnectedMember {
+                connection_id: "11111111-0000-0000-0000-000000000000".to_string(),
+                email: local_actor_id.clone(),
+                role: TogetherRole::Owner,
+                display_name: Some("Self".to_string()),
+                actor_kind: TogetherActorKind::Human,
+                agent_role: None,
+            },
+            ConnectedMember {
+                connection_id: "44444444-0000-0000-0000-000000000000".to_string(),
+                email: local_actor_id.clone(),
+                role: TogetherRole::Owner,
+                display_name: Some("Self".to_string()),
+                actor_kind: TogetherActorKind::Human,
+                agent_role: None,
+            },
+        ]),
+        Some("11111111-0000-0000-0000-000000000000"),
+    );
+
+    assert_eq!(targets.len(), 2);
+    assert!(targets[0].is_self);
+    assert_eq!(targets[1].actor_id, local_actor_id);
+    assert_eq!(
+        targets[1].connection_id,
+        "44444444-0000-0000-0000-000000000000".to_string()
+    );
+    assert!(!targets[1].is_self);
+    assert_eq!(selected_idx, 1);
+}
+
+#[test]
+fn together_handoff_targets_from_members_keep_same_actor_sessions_without_connection_id() {
+    let local_actor_id = local_together_actor_id();
+    let (targets, selected_idx) = together_handoff_targets_from_members(
+        Some(&[
+            ConnectedMember {
+                connection_id: "11111111-0000-0000-0000-000000000000".to_string(),
+                email: local_actor_id.clone(),
+                role: TogetherRole::Owner,
+                display_name: Some("Self".to_string()),
+                actor_kind: TogetherActorKind::Human,
+                agent_role: None,
+            },
+            ConnectedMember {
+                connection_id: "44444444-0000-0000-0000-000000000000".to_string(),
+                email: local_actor_id.clone(),
+                role: TogetherRole::Owner,
+                display_name: Some("Self".to_string()),
+                actor_kind: TogetherActorKind::Human,
+                agent_role: None,
+            },
+        ]),
+        None,
+    );
+
+    assert_eq!(targets.len(), 2);
+    assert!(targets[0].is_self);
+    assert_eq!(targets[0].connection_id, "local".to_string());
+    assert_eq!(targets[1].actor_id, local_actor_id);
+    assert_eq!(
+        targets[1].connection_id,
+        "44444444-0000-0000-0000-000000000000".to_string()
+    );
+    assert!(!targets[1].is_self);
+    assert_eq!(selected_idx, 1);
+}
+
+#[test]
+fn together_handoff_selection_request_uses_default_goal_without_custom_instructions() {
+    let thread_id = "thread-1";
+    let anchor_id = context_anchor_id(Some(thread_id));
+    let file_ref_id = "ctx:file:context-graph";
+    let repo_ref_id = "ctx:file:.codex/context/overview.md";
+    let response = rooted_context_query(
+        Some(thread_id),
+        None,
+        None,
+        vec![
+            thread_context_node(
+                file_ref_id,
+                ThreadArtifactKind::FileRead,
+                "Read context-graph/src/lib.rs",
+                Some("file"),
+                Some("file/context-graph"),
+                Some("context-graph/src/lib.rs"),
+                thread_id,
+            ),
+            repo_context_node(
+                repo_ref_id,
+                RepoMemoryKind::Concept,
+                "Planning Overview",
+                Some("overview"),
+                ".codex/context/overview.md",
+                vec![thread_id],
+                (vec![file_ref_id], vec!["context-graph/src/lib.rs"]),
+            ),
+        ],
+        vec![
+            mounted_edge(&anchor_id, file_ref_id, ContextMountReason::Local),
+            related_edge(file_ref_id, repo_ref_id, "source_ref"),
+        ],
+    );
+
+    let request = together_handoff_selection_request(&response, None);
+
+    assert_eq!(
+        request,
+        codex_core::HandoffSelectionRequest {
+            prompt: "\
+Prepare a Codex handoff from the anchored context tree below.
+Goal: Continue the current task in another Codex thread.
+Choose the smallest useful subset of candidate ref_ids, usually 2 to 4 nodes.
+Prefer [file] nodes whenever the goal is about inspecting, changing, or improving specific files.
+Only include [insight] or [rules] nodes when they materially affect the work. Skip redundant search-result nodes when the relevant file node is already selected.
+Write a short loading prompt for the receiving agent. It should tell the agent to inspect /context from the anchor, continue the goal, and avoid repeating raw context verbatim.
+Candidates:
+- ◯ [file] Read file/context-graph :: ctx:file:context-graph
+- ╰─⏣ [insight] Planning Overview :: ctx:file:.codex/context/overview.md"
+                .to_string(),
+            allowed_ref_ids: vec![file_ref_id.to_string(), repo_ref_id.to_string()],
+            max_selected_ref_ids: 4,
+        }
+    );
+}
+
+#[test]
+fn together_is_contextual_replay_text_skips_chained_context_payloads() {
+    let chained = "# AGENTS.md instructions for /tmp\n\n<INSTRUCTIONS>\nbody\n</INSTRUCTIONS><environment_context>\n<body>\n</environment_context>";
+
+    assert!(together_is_contextual_replay_text(chained));
+}
+
+#[tokio::test]
+async fn together_context_action_ref_ids_returns_all_selected_refs() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let thread_id = "thread-1";
+    let anchor_id = context_anchor_id(Some(thread_id));
+    let repo_ref_id = "ctx:file:.codex/context/overview.md";
+    let thread_ref_id = "ctx:thread-insight:thread-1:plan-1";
+
+    chat.show_together_context_view(
+        Some("planning".to_string()),
+        rooted_context_query(
+            Some(thread_id),
+            None,
+            None,
+            vec![
+                repo_context_node(
+                    repo_ref_id,
+                    RepoMemoryKind::Concept,
+                    "Planning Overview",
+                    Some("plan"),
+                    ".codex/context/overview.md",
+                    vec![thread_id],
+                    (vec![], vec![]),
+                ),
+                thread_context_node(
+                    thread_ref_id,
+                    ThreadArtifactKind::Plan,
+                    "planning sync",
+                    Some("owner=owner@example.com"),
+                    Some("insight/plan-1"),
+                    Some("Thread: thread-1"),
+                    thread_id,
+                ),
+            ],
+            vec![
+                mounted_edge(&anchor_id, repo_ref_id, ContextMountReason::RepoNeighbor),
+                mounted_edge(&anchor_id, thread_ref_id, ContextMountReason::Local),
+            ],
+        ),
+        TogetherContextScope::Global,
+    );
+
+    chat.toggle_together_context_selection(0);
+    chat.toggle_together_context_selection(1);
+
+    let mut selected_ref_ids = chat.together_context_action_ref_ids(1);
+    selected_ref_ids.sort();
+    assert_eq!(
+        selected_ref_ids,
+        vec![repo_ref_id.to_string(), thread_ref_id.to_string()]
+    );
+}
+
+#[tokio::test]
+async fn together_context_source_thread_id_prefers_current_anchor_thread() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let current_thread_id = "thread-1";
+    let prior_thread_id = "thread-0";
+    let anchor_id = context_anchor_id(Some(current_thread_id));
+    let thread_ref_id = "ctx:thread-insight:thread-0:plan-1";
+
+    chat.show_together_context_view(
+        Some("planning".to_string()),
+        rooted_context_query(
+            Some(current_thread_id),
+            Some(prior_thread_id),
+            Some(ContextPrecursorKind::Handoff),
+            vec![
+                repo_context_node(
+                    "ctx:file:.codex/context/overview.md",
+                    RepoMemoryKind::Concept,
+                    "Planning Overview",
+                    Some("plan"),
+                    ".codex/context/overview.md",
+                    vec![current_thread_id],
+                    (vec![], vec![]),
+                ),
+                thread_context_node(
+                    thread_ref_id,
+                    ThreadArtifactKind::Plan,
+                    "planning sync",
+                    Some("owner=owner@example.com"),
+                    Some("insight/plan-1"),
+                    Some("Thread: thread-0"),
+                    prior_thread_id,
+                ),
+            ],
+            vec![
+                mounted_edge(
+                    &anchor_id,
+                    "ctx:file:.codex/context/overview.md",
+                    ContextMountReason::RepoNeighbor,
+                ),
+                mounted_edge(&anchor_id, thread_ref_id, ContextMountReason::HandoffSeed),
+            ],
+        ),
+        TogetherContextScope::Global,
+    );
+
+    assert_eq!(
+        chat.together_context_source_thread_id(1).as_deref(),
+        Some(current_thread_id)
+    );
+
+    chat.toggle_together_context_selection(1);
+
+    assert_eq!(
+        chat.together_context_source_thread_id(0).as_deref(),
+        Some(current_thread_id)
+    );
+}
+
+#[test]
+fn strip_context_tokens_from_submission_removes_bound_tokens_and_rebases_other_elements() {
+    let context_token = "[ctx: Planning Overview]";
+    let mention_token = "$file";
+    let original_text = format!("Investigate expiry\n{context_token}\n{mention_token}");
+    let context_start = "Investigate expiry\n".len();
+    let mention_start = context_start + context_token.len() + 1;
+    let original_elements = vec![
+        TextElement::new(
+            (context_start..context_start + context_token.len()).into(),
+            Some(context_token.to_string()),
+        ),
+        TextElement::new(
+            (mention_start..mention_start + mention_token.len()).into(),
+            Some(mention_token.to_string()),
+        ),
+    ];
+
+    let (stripped_text, stripped_elements) = strip_context_tokens_from_submission(
+        original_text,
+        original_elements,
+        &[ContextBinding {
+            context_ref: ContextRef {
+                ref_id: "ctx:file:.codex/context/overview.md".to_string(),
+                kind: ContextKind::RepoContextFile,
+                display_label: "Planning Overview".to_string(),
+                source_thread_id: None,
+                repo_context_id: Some(".codex/context/overview.md".to_string()),
+                git_branch: Some("rewrite-codex-2gether-v2".to_string()),
+                stale_state: Some(ContextStaleState::Fresh),
+            },
+        }],
+    );
+
+    assert_eq!(stripped_text, "Investigate expiry\n\n$file".to_string());
+    assert_eq!(
+        stripped_elements,
+        vec![TextElement::new(
+            ("Investigate expiry\n\n".len().."Investigate expiry\n\n$file".len()).into(),
+            Some(mention_token.to_string()),
+        )]
+    );
+}
+
+#[test]
+fn together_server_health_matches_expected_build_identity() {
+    let matching = TogetherHealthzResponse {
+        ok: true,
+        version: Some("0.0.0".to_string()),
+        commit: Some("abc123".to_string()),
+    };
+    let wrong_commit = TogetherHealthzResponse {
+        ok: true,
+        version: Some("0.0.0".to_string()),
+        commit: Some("def456".to_string()),
+    };
+
+    assert!(together_server_health_matches(
+        &matching,
+        "0.0.0",
+        Some("abc123")
+    ));
+    assert!(!together_server_health_matches(
+        &wrong_commit,
+        "0.0.0",
+        Some("abc123")
+    ));
+    assert!(together_server_health_matches(&matching, "0.0.0", None));
+}
+
+#[test]
+fn missing_ngrok_error_is_actionable() {
+    let err = ngrok_http_launch_error(8788, std::io::Error::from(std::io::ErrorKind::NotFound));
+
+    assert_eq!(
+        err.to_string(),
+        "`/host` requires `ngrok` on your PATH to expose the local together server on port 8788; install ngrok, authenticate it, and retry"
     );
 }
 
@@ -1861,17 +3217,25 @@ fn together_status_hint_includes_server_build_identity() {
             role: TogetherRole::Member,
             connected_members: vec![
                 ConnectedMember {
+                    connection_id: "11111111-0000-0000-0000-000000000000".to_string(),
                     email: "zanechee@local".to_string(),
                     role: TogetherRole::Owner,
+                    display_name: Some("Zane Chee".to_string()),
+                    actor_kind: TogetherActorKind::Human,
+                    agent_role: None,
                 },
                 ConnectedMember {
+                    connection_id: "22222222-0000-0000-0000-000000000000".to_string(),
                     email: "weisintai@local".to_string(),
                     role: TogetherRole::Member,
+                    display_name: Some("Wei Sin".to_string()),
+                    actor_kind: TogetherActorKind::Agent,
+                    agent_role: Some("research".to_string()),
                 },
             ],
         },
         "wss://example.ngrok-free.app/ws",
-        "zanechee@local (owner), weisintai@local (member)",
+        "zanechee@local, weisintai@local",
     );
 
     assert_snapshot!("together_status_hint_with_build_identity", hint);
@@ -4997,6 +6361,7 @@ async fn slash_copy_does_not_return_stale_output_after_thread_rollback() {
 }
 
 #[tokio::test]
+#[serial_test::serial(together_status)]
 async fn slash_exit_requests_exit() {
     let _guard = TogetherStatusGuard::set("disconnected");
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
@@ -5007,50 +6372,19 @@ async fn slash_exit_requests_exit() {
 }
 
 #[test]
-fn together_join_handshake_lines_include_right_side_joined_member_label() {
-    let local = "alice@example.com";
-    let joined = "new.member@example.com";
-    let members = vec![
-        ConnectedMember {
-            email: local.to_string(),
-            role: TogetherRole::Owner,
-        },
-        ConnectedMember {
-            email: joined.to_string(),
-            role: TogetherRole::Member,
-        },
-    ];
-    let lines = together_join_handshake_lines(local, joined, &members);
-    let rendered = lines_to_single_string(&lines);
+#[serial_test::serial(together_status)]
+fn together_exit_command_stops_for_hosts() {
+    let _guard = TogetherStatusGuard::set("together host:srv_123");
 
-    assert!(rendered.contains("handshake"));
-    assert!(rendered.contains("alice@example.com  <->  new.member@example.com"));
-    assert!(!rendered.contains("(left)"));
-    assert!(!rendered.contains("(right)"));
+    assert_eq!(together_exit_command(), Some("stop"));
 }
 
 #[test]
-fn together_join_handshake_lines_render_selected_variant_rows() {
-    let local = "alice@example.com";
-    let joined = "friend@example.com";
-    let members = vec![
-        ConnectedMember {
-            email: local.to_string(),
-            role: TogetherRole::Owner,
-        },
-        ConnectedMember {
-            email: joined.to_string(),
-            role: TogetherRole::Member,
-        },
-    ];
-    let variant = together_join_handshake_variant(joined);
-    let lines = together_join_handshake_lines(local, joined, &members);
-    let rendered = lines_to_single_string(&lines);
+#[serial_test::serial(together_status)]
+fn together_exit_command_leaves_for_members() {
+    let _guard = TogetherStatusGuard::set("together server:srv_123");
 
-    for row in variant {
-        let row_text = format!("{}{}{}", row.left, row.middle, row.right);
-        assert!(rendered.contains(&row_text));
-    }
+    assert_eq!(together_exit_command(), Some("leave"));
 }
 
 #[tokio::test]
@@ -5133,26 +6467,6 @@ async fn slash_fork_requests_current_fork() {
     chat.dispatch_command(SlashCommand::Fork);
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::ForkCurrentSession));
-}
-
-#[tokio::test]
-async fn read_only_together_checkout_f_requests_fork() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
-    chat.set_together_checkout_mode(false, "owner@example.com");
-
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
-
-    assert_matches!(rx.try_recv(), Ok(AppEvent::ForkCurrentSession));
-}
-
-#[tokio::test]
-async fn read_only_together_checkout_escape_requests_exit() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
-    chat.set_together_checkout_mode(false, "owner@example.com");
-
-    chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-
-    assert_matches!(rx.try_recv(), Ok(AppEvent::ExitReadOnlyTogetherCheckout));
 }
 
 #[tokio::test]
@@ -8870,41 +10184,4 @@ async fn review_queues_user_messages_snapshot() {
     })
     .unwrap();
     assert_snapshot!(term.backend().vt100().screen().contents());
-}
-
-#[test]
-fn render_lineage_tree_includes_ancestors_and_marks_focused_thread() {
-    let response = TogetherHistoryLineageResponse {
-        root: "thread-child".to_string(),
-        nodes: vec![
-            LineageNode {
-                thread_id: "thread-parent".to_string(),
-                owner_email: "owner@example.com".to_string(),
-            },
-            LineageNode {
-                thread_id: "thread-child".to_string(),
-                owner_email: "alice@example.com".to_string(),
-            },
-            LineageNode {
-                thread_id: "thread-grandchild".to_string(),
-                owner_email: "bob@example.com".to_string(),
-            },
-        ],
-        edges: vec![
-            LineageEdge {
-                parent_thread_id: "thread-parent".to_string(),
-                child_thread_id: "thread-child".to_string(),
-                actor_email: "alice@example.com".to_string(),
-                created_at: "2026-03-08T10:00:00Z".to_string(),
-            },
-            LineageEdge {
-                parent_thread_id: "thread-child".to_string(),
-                child_thread_id: "thread-grandchild".to_string(),
-                actor_email: "bob@example.com".to_string(),
-                created_at: "2026-03-08T11:00:00Z".to_string(),
-            },
-        ],
-    };
-
-    assert_snapshot!(render_lineage_tree(&response));
 }

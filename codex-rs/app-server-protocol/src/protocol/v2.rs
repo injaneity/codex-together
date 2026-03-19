@@ -19,6 +19,8 @@ use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode as CoreSandboxMode;
 use codex_protocol::config_types::Verbosity;
 use codex_protocol::config_types::WebSearchMode;
+use codex_protocol::context_graph::ContextGraphToolOperation;
+use codex_protocol::context_graph::ContextGraphToolScope;
 use codex_protocol::items::AgentMessageContent as CoreAgentMessageContent;
 use codex_protocol::items::TurnItem as CoreTurnItem;
 use codex_protocol::mcp::Resource as McpResource;
@@ -1824,6 +1826,11 @@ pub struct ThreadStartParams {
     #[experimental("thread/start.persistFullHistory")]
     #[serde(default)]
     pub persist_extended_history: bool,
+    /// If true, eagerly materialize the rollout file before replying so the
+    /// returned path can be consumed immediately.
+    #[experimental("thread/start.materializeRolloutPath")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub materialize_rollout_path: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]
@@ -3184,6 +3191,18 @@ pub enum ThreadItem {
     },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
+    ContextGraphQuery {
+        id: String,
+        operation: ContextGraphQueryOperation,
+        scope: ContextGraphQueryScope,
+        query: Option<String>,
+        ref_ids: Vec<String>,
+        result_ref_ids: Vec<String>,
+        summary: Option<String>,
+        success: bool,
+    },
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
     CollabAgentToolCall {
         /// Unique identifier for this collab tool call.
         id: String,
@@ -3233,6 +3252,7 @@ impl ThreadItem {
             | ThreadItem::FileChange { id, .. }
             | ThreadItem::McpToolCall { id, .. }
             | ThreadItem::DynamicToolCall { id, .. }
+            | ThreadItem::ContextGraphQuery { id, .. }
             | ThreadItem::CollabAgentToolCall { id, .. }
             | ThreadItem::WebSearch { id, .. }
             | ThreadItem::ImageView { id, .. }
@@ -3420,6 +3440,44 @@ pub enum DynamicToolCallStatus {
     InProgress,
     Completed,
     Failed,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum ContextGraphQueryOperation {
+    Search,
+    Neighbors,
+    Open,
+    Hotspots,
+}
+
+impl From<ContextGraphToolOperation> for ContextGraphQueryOperation {
+    fn from(value: ContextGraphToolOperation) -> Self {
+        match value {
+            ContextGraphToolOperation::Search => Self::Search,
+            ContextGraphToolOperation::Neighbors => Self::Neighbors,
+            ContextGraphToolOperation::Open => Self::Open,
+            ContextGraphToolOperation::Hotspots => Self::Hotspots,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum ContextGraphQueryScope {
+    Local,
+    Global,
+}
+
+impl From<ContextGraphToolScope> for ContextGraphQueryScope {
+    fn from(value: ContextGraphToolScope) -> Self {
+        match value {
+            ContextGraphToolScope::Local => Self::Local,
+            ContextGraphToolScope::Global => Self::Global,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]

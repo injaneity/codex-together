@@ -45,6 +45,7 @@ use crate::bottom_pane::CancellationEvent;
 use crate::bottom_pane::bottom_pane_view::BottomPaneView;
 use crate::bottom_pane::popup_consts::MAX_POPUP_ROWS;
 use crate::bottom_pane::scroll_state::ScrollState;
+use crate::bottom_pane::selection_popup_common::SingleLineRowRenderOptions;
 use crate::bottom_pane::selection_popup_common::render_rows_single_line;
 use crate::key_hint;
 use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
@@ -574,6 +575,7 @@ impl Renderable for MultiSelectPicker {
                 &self.state,
                 render_area.height as usize,
                 "no matches",
+                SingleLineRowRenderOptions::default(),
             );
         }
 

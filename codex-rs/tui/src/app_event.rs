@@ -16,16 +16,14 @@ use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::RateLimitSnapshot;
-use codex_protocol::protocol::RolloutItem;
-use codex_together_protocol::TogetherHistoryLineageResponse;
-use codex_together_protocol::TogetherReplayMessage;
-use codex_together_protocol::TogetherServerInfoResponse;
-use codex_together_protocol::TogetherThreadSummary;
+use codex_together_protocol::ContextQueryResponse;
+use codex_together_protocol::ContextResolveBundleResponse;
+use codex_together_protocol::ContextSearchResult;
+use codex_together_protocol::HandoffAssignedNotification;
 use codex_utils_approval_presets::ApprovalPreset;
 
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::StatusLineItem;
-use crate::bottom_pane::TogetherPresenceState;
 use crate::history_cell::HistoryCell;
 
 use codex_core::features::Feature;
@@ -413,56 +411,108 @@ pub(crate) enum AppEvent {
     /// Open the custom prompt option from the review popup.
     OpenReviewCustomPrompt,
 
-    /// Execute a parsed `/together` command.
+    /// Execute a parsed collaboration command.
     RunTogetherCommand {
         args: String,
     },
 
-    /// Open an interactive shared-threads list for together operations.
-    OpenTogetherThreadsView {
-        threads: Vec<TogetherThreadSummary>,
+    /// Sync the long-lived Together listener to the current connection status.
+    SyncTogetherSession,
+
+    /// Long-lived Together listener connected and registered a targetable session.
+    TogetherSessionConnected {
+        endpoint: String,
+        connection_id: String,
     },
 
-    /// Refresh the shared-threads list when that picker is currently open.
-    RefreshTogetherThreadsViewIfActive {
-        threads: Vec<TogetherThreadSummary>,
-    },
-
-    /// Open an interactive lineage list for together history operations.
-    OpenTogetherHistoryView {
-        lineage: TogetherHistoryLineageResponse,
-    },
-
-    /// Open Together Center with the latest server info (if connected).
-    OpenTogetherCenterView {
-        server_info: Option<TogetherServerInfoResponse>,
-    },
-
-    /// Background together presence refresh event for Together Center updates.
-    TogetherPresenceUpdated {
-        server_info: Option<TogetherServerInfoResponse>,
-        state: TogetherPresenceState,
-    },
-
-    /// Dismiss the currently active bottom-pane modal/popup view, if any.
-    DismissBottomPaneView,
-
-    /// Replay a checked-out together thread using the same UI replay flow as resume.
-    ReplayTogetherThread {
-        thread_id: String,
-        messages: Vec<TogetherReplayMessage>,
-    },
-
-    /// Try to switch the active thread to a together checkout/fork target.
-    ResumeTogetherThread {
-        thread_id: String,
-        history: Option<Vec<RolloutItem>>,
-        writable: bool,
+    /// Remote collaboration host stopped for the current Together session.
+    TogetherHostStopped {
+        endpoint: String,
+        server_id: String,
         owner_email: String,
     },
 
-    /// Leave the current read-only together checkout and return to the prior local session.
-    ExitReadOnlyTogetherCheckout,
+    /// A remote collaborator assigned a handoff to this client.
+    TogetherHandoffAssigned {
+        endpoint: String,
+        notification: HandoffAssignedNotification,
+    },
+
+    /// Async search request for `##` composer context attach.
+    StartTogetherComposerContextSearch {
+        query: String,
+    },
+
+    /// Async search results for `##` composer context attach.
+    TogetherComposerContextSearchResult {
+        query: String,
+        results: Vec<ContextSearchResult>,
+    },
+
+    /// Resolve bound `[ctx: ...]` refs before submitting a user message.
+    TogetherContextBundleResolved {
+        response: ContextResolveBundleResponse,
+    },
+
+    /// Failed to resolve bound `[ctx: ...]` refs before submit.
+    TogetherContextBundleResolveFailed {
+        error: String,
+    },
+
+    /// Open the collaboration context picker with the latest search results.
+    OpenTogetherContextView {
+        query: Option<String>,
+        query_response: ContextQueryResponse,
+        scope: crate::chatwidget::TogetherContextScope,
+        mode: crate::chatwidget::TogetherContextViewMode,
+        selected_ref_ids: Vec<String>,
+        handoff_goal: Option<String>,
+        handoff_loading_prompt: Option<String>,
+    },
+
+    OpenTogetherHandoffPrompt {
+        target_actor_id: Option<String>,
+        target_display_name: Option<String>,
+    },
+
+    OpenTogetherHandoffTargetPicker {
+        candidates: Vec<crate::chatwidget::TogetherHandoffTargetCandidate>,
+    },
+
+    /// Ask the live source thread to preselect handoff nodes from the anchored tree.
+    PrepareTogetherHandoffView {
+        query_response: ContextQueryResponse,
+        handoff_goal: Option<String>,
+        target_actor_id: Option<String>,
+        target_display_name: Option<String>,
+    },
+
+    TogetherHandoffViewPrepared {
+        query_response: ContextQueryResponse,
+        handoff_goal: Option<String>,
+        target_actor_id: Option<String>,
+        target_display_name: Option<String>,
+        selected_ref_ids: Vec<String>,
+        handoff_loading_prompt: Option<String>,
+    },
+
+    /// Toggle whether the selected collaboration context row is selected.
+    ToggleTogetherContextSelection {
+        actual_idx: usize,
+    },
+
+    /// Cycle the active handoff recipient in the collaboration picker.
+    CycleTogetherHandoffTarget {
+        reverse: bool,
+    },
+
+    /// Switch which pane owns keyboard navigation in the handoff picker.
+    ToggleTogetherHandoffPane,
+
+    /// Plan and commit a fresh-thread handoff from the selected context rows.
+    PlanTogetherContextHandoff {
+        actual_idx: usize,
+    },
 
     /// Submit a user message with an explicit collaboration mask.
     SubmitUserMessageWithMode {

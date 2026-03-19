@@ -12,11 +12,17 @@ use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ExternalEditorState;
+use crate::chatwidget::TogetherHandoffTarget;
+use crate::chatwidget::active_together_session_endpoint;
 use crate::chatwidget::commit_together_handoff_plan;
+use crate::chatwidget::listen_to_together_session;
 use crate::chatwidget::plan_together_context_handoff;
 use crate::chatwidget::search_together_context;
+use crate::chatwidget::set_together_disconnected;
 use crate::chatwidget::together_handoff_loading_prompt;
 use crate::chatwidget::together_handoff_selection_request;
+use crate::chatwidget::together_handoff_targets_from_members;
+use crate::chatwidget::try_fetch_together_server_info;
 use crate::cwd_prompt::CwdPromptAction;
 use crate::diff_render::DiffSummary;
 use crate::exec_command::strip_bash_lc_and_escape;
@@ -92,6 +98,7 @@ use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SkillErrorInfo;
 use codex_protocol::protocol::TokenUsage;
+use codex_together_protocol::HandoffAssignedNotification;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
@@ -701,6 +708,9 @@ pub(crate) struct App {
 
     thread_event_channels: HashMap<ThreadId, ThreadEventChannel>,
     thread_event_listener_tasks: HashMap<ThreadId, JoinHandle<()>>,
+    together_session_listener_task: Option<JoinHandle<()>>,
+    together_session_listener_endpoint: Option<String>,
+    together_session_connection_id: Option<String>,
     agent_picker_threads: HashMap<ThreadId, AgentPickerThreadEntry>,
     active_thread_id: Option<ThreadId>,
     active_thread_rx: Option<mpsc::Receiver<Event>>,
@@ -731,6 +741,68 @@ fn normalize_harness_overrides_for_cwd(
     }
     overrides.additional_writable_roots = normalized;
     Ok(overrides)
+}
+
+fn assigned_handoff_loading_prompt(goal: Option<&str>) -> String {
+    if let Some(goal) = goal.map(str::trim).filter(|goal| !goal.is_empty()) {
+        format!(
+            "Continue the assigned handoff.\n\nGoal: {goal}\n\nThis addressed handoff thread is already open. Review /context, then continue the task."
+        )
+    } else {
+        "Continue the assigned handoff.\n\nThis addressed handoff thread is already open. Review /context, then continue the task.".to_string()
+    }
+}
+
+fn assigned_handoff_status_lines(
+    notification: &HandoffAssignedNotification,
+    cwd_warning: Option<&str>,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(vec![
+        "• ".dim(),
+        "Handoff received".cyan().bold(),
+    ])];
+    lines.push(Line::from(vec![
+        "  From: ".dim(),
+        notification.source_actor_id.clone().cyan().bold(),
+    ]));
+    lines.push(Line::from(vec![
+        "  Thread: ".dim(),
+        notification.thread_id.clone().into(),
+    ]));
+    lines.push(Line::from(vec![
+        "  Source thread: ".dim(),
+        notification.source_thread_id.clone().into(),
+    ]));
+    if let Some(goal) = notification
+        .goal
+        .as_deref()
+        .map(str::trim)
+        .filter(|goal| !goal.is_empty())
+    {
+        lines.push(Line::from(vec!["  Goal: ".dim(), goal.to_string().into()]));
+    }
+    lines.push(Line::from("  This is the addressed handoff thread.".dim()));
+    lines.push(Line::from(
+        "  Review /context to inspect the mounted handoff context.".dim(),
+    ));
+    if let Some(cwd_warning) = cwd_warning {
+        lines.push(Line::from(vec![
+            "  Note: ".dim(),
+            cwd_warning.to_string().italic(),
+        ]));
+    }
+    lines.push(Line::from(
+        "  A loading prompt has been prepared in the composer.".dim(),
+    ));
+    lines
+}
+
+struct TogetherHandoffCommitRequest {
+    plan_id: String,
+    draft_text: String,
+    handoff_goal: Option<String>,
+    handoff_target: Option<TogetherHandoffTarget>,
+    selected_node_count: usize,
 }
 
 impl App {
@@ -774,23 +846,136 @@ impl App {
             .map_err(Into::into)
     }
 
-    async fn commit_remote_together_handoff(
+    fn sync_together_session_listener(&mut self) {
+        let next_endpoint = active_together_session_endpoint();
+        let listener_is_current = self
+            .together_session_listener_task
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+            && self.together_session_listener_endpoint.as_ref() == next_endpoint.as_ref();
+        if listener_is_current {
+            return;
+        }
+
+        if let Some(handle) = self.together_session_listener_task.take() {
+            handle.abort();
+        }
+        self.together_session_connection_id = None;
+        self.together_session_listener_endpoint = next_endpoint.clone();
+        self.together_session_listener_task = next_endpoint.map(|endpoint| {
+            let tx = self.app_event_tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    match listen_to_together_session(endpoint.clone(), tx.clone()).await {
+                        Ok(()) => break,
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                endpoint = %endpoint,
+                                "together session listener disconnected"
+                            );
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                    }
+                }
+            })
+        });
+    }
+
+    async fn open_assigned_handoff(
         &mut self,
         tui: &mut tui::Tui,
-        plan_id: String,
-        draft_text: String,
-        handoff_goal: Option<String>,
-        selected_node_count: usize,
-        target_actor_id: Option<String>,
+        notification: HandoffAssignedNotification,
+    ) {
+        let mut handoff_config = self.config.clone();
+        let mut cwd_warning = None;
+        if let Some(sender_cwd) = notification
+            .cwd
+            .as_deref()
+            .map(PathBuf::from)
+            .filter(|sender_cwd| crate::cwds_differ(&self.config.cwd, sender_cwd))
+        {
+            if sender_cwd.exists() {
+                match self.rebuild_config_for_cwd(sender_cwd.clone()).await {
+                    Ok(config) => handoff_config = config,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            cwd = %sender_cwd.display(),
+                            "failed to rebuild config for assigned handoff cwd; using current cwd"
+                        );
+                        cwd_warning = Some(format!(
+                            "Sender cwd {} could not be opened locally; using current cwd {}.",
+                            sender_cwd.display(),
+                            self.config.cwd.display()
+                        ));
+                    }
+                }
+            } else {
+                cwd_warning = Some(format!(
+                    "Sender cwd {} is not available locally; using current cwd {}.",
+                    sender_cwd.display(),
+                    self.config.cwd.display()
+                ));
+            }
+        }
+        self.apply_runtime_policy_overrides(&mut handoff_config);
+
+        let loading_prompt = assigned_handoff_loading_prompt(notification.goal.as_deref());
+        let rollout_path = PathBuf::from(&notification.rollout_path);
+
+        match self
+            .server
+            .resume_thread_from_rollout(
+                handoff_config.clone(),
+                rollout_path,
+                self.auth_manager.clone(),
+            )
+            .await
+        {
+            Ok(resumed) => {
+                self.shutdown_current_thread().await;
+                self.config = handoff_config;
+                tui.set_notification_method(self.config.tui_notification_method);
+                self.file_search.update_search_dir(self.config.cwd.clone());
+                let init =
+                    self.chatwidget_init_for_forked_or_resumed_thread(tui, self.config.clone());
+                self.chat_widget =
+                    ChatWidget::new_from_existing(init, resumed.thread, resumed.session_configured);
+                self.reset_thread_event_state();
+                self.reset_backtrack_state();
+                self.chat_widget
+                    .set_composer_text(loading_prompt, Vec::new(), Vec::new());
+                self.chat_widget
+                    .add_plain_history_lines(assigned_handoff_status_lines(
+                        &notification,
+                        cwd_warning.as_deref(),
+                    ));
+            }
+            Err(err) => self.chat_widget.add_error_message(format!(
+                "Failed to open assigned handoff thread {} from {}: {err}",
+                notification.thread_id, notification.source_actor_id
+            )),
+        }
+    }
+
+    async fn commit_together_handoff(
+        &mut self,
+        tui: &mut tui::Tui,
+        handoff: TogetherHandoffCommitRequest,
     ) {
         let response = match commit_together_handoff_plan(
-            plan_id,
+            handoff.plan_id,
+            handoff
+                .handoff_target
+                .as_ref()
+                .and_then(|target| (!target.is_self).then(|| target.connection_id.clone())),
             self.config.cwd.clone(),
             self.chat_widget.current_model().to_string(),
             self.config.permissions.approval_policy.value(),
             self.config.permissions.sandbox_policy.get().clone(),
         )
-        .await
+            .await
         {
             Ok(response) => response,
             Err(err) => {
@@ -799,31 +984,45 @@ impl App {
                 return;
             }
         };
-        if let Some(target_actor_id) = target_actor_id {
-            let node_label = if selected_node_count == 1 {
+        if let Some(target) = handoff
+            .handoff_target
+            .as_ref()
+            .filter(|target| !target.is_self)
+        {
+            let node_label = if handoff.selected_node_count == 1 {
                 "1 mounted node".to_string()
             } else {
-                format!("{selected_node_count} mounted nodes")
+                format!("{} mounted nodes", handoff.selected_node_count)
             };
+            let target_title = target
+                .display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|display_name| !display_name.is_empty())
+                .unwrap_or(target.actor_id.as_str())
+                .to_string();
             let mut lines = vec![Line::from(vec!["• ".dim(), "Handoff sent".cyan().bold()])];
             lines.push(Line::from(vec![
-                "  Sent ".into(),
-                node_label.into(),
-                " to ".into(),
-                target_actor_id.into(),
-                ".".into(),
+                "  Thread: ".dim(),
+                response.thread_id.clone().into(),
             ]));
-            if let Some(goal) = handoff_goal
+            lines.push(Line::from(vec![
+                "  Target: ".dim(),
+                target_title.cyan().bold(),
+            ]));
+            lines.push(Line::from(vec!["  Context: ".dim(), node_label.into()]));
+            if let Some(goal) = handoff
+                .handoff_goal
                 .as_deref()
                 .map(str::trim)
                 .filter(|goal| !goal.is_empty())
             {
                 lines.push(Line::from(vec!["  Goal: ".dim(), goal.to_string().into()]));
             }
-            lines.push(Line::from(vec![
-                "  Thread: ".dim(),
-                response.thread_id.into(),
-            ]));
+            lines.push(Line::from(
+                "  The current client stayed on the source thread while the recipient was notified."
+                    .dim(),
+            ));
             self.chat_widget.add_plain_history_lines(lines);
             return;
         }
@@ -892,11 +1091,48 @@ impl App {
                     ChatWidget::new_from_existing(init, resumed.thread, resumed.session_configured);
                 self.reset_thread_event_state();
                 self.reset_backtrack_state();
-                if !draft_text.trim().is_empty() {
+                if !handoff.draft_text.trim().is_empty() {
                     self.chat_widget
-                        .set_composer_text(draft_text, Vec::new(), Vec::new());
+                        .set_composer_text(handoff.draft_text, Vec::new(), Vec::new());
                 }
-                self.show_local_handoff_ready_message(selected_node_count, handoff_goal.as_deref());
+                let node_label = if handoff.selected_node_count == 1 {
+                    "1 mounted node".to_string()
+                } else {
+                    format!("{} mounted nodes", handoff.selected_node_count)
+                };
+                let mut lines = vec![Line::from(vec!["• ".dim(), "Handoff ready".cyan().bold()])];
+                lines.push(Line::from(vec![
+                    "  Review ".into(),
+                    "/context".cyan(),
+                    " to inspect ".into(),
+                    node_label.into(),
+                    " from the source thread.".into(),
+                ]));
+                if let Some(goal) = handoff
+                    .handoff_goal
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|goal| !goal.is_empty())
+                {
+                    lines.push(Line::from(vec!["  Goal: ".dim(), goal.to_string().into()]));
+                }
+                if let Some(target) = handoff.handoff_target.as_ref() {
+                    let target_title = target
+                        .display_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|display_name| !display_name.is_empty())
+                        .unwrap_or(target.actor_id.as_str())
+                        .to_string();
+                    lines.push(Line::from(vec![
+                        "  Target: ".dim(),
+                        target_title.cyan().bold(),
+                    ]));
+                }
+                lines.push(Line::from(
+                    "  A loading prompt has been prepared in the composer.".dim(),
+                ));
+                self.chat_widget.add_plain_history_lines(lines);
             }
             Err(err) => {
                 let path_display = rollout_path.display();
@@ -1003,36 +1239,23 @@ impl App {
         self.chat_widget.add_plain_history_lines(lines);
     }
 
-    fn prepare_together_handoff_view(
+    async fn prepare_together_handoff_view(
         &mut self,
         query_response: codex_together_protocol::ContextQueryResponse,
         handoff_goal: Option<String>,
-        target_actor_id: Option<String>,
-        target_display_name: Option<String>,
     ) {
-        self.chat_widget.add_info_message(
-            "Selecting handoff context.".to_string(),
-            Some(
-                "Using gpt-5.1-codex-mini low to preselect the most relevant mounted nodes."
-                    .to_string(),
-            ),
+        let scope = crate::chatwidget::TogetherContextScope::default_for(
+            query_response.anchor.current_thread_id.as_deref(),
         );
+        let mut selected_ref_ids = Vec::new();
+        let mut handoff_loading_prompt = None;
 
-        let app_event_tx = self.app_event_tx.clone();
-        let server = self.server.clone();
-        tokio::spawn(async move {
-            let mut selected_ref_ids = Vec::new();
-            let mut handoff_loading_prompt = None;
-
-            if let Some(source_thread_id) = query_response.anchor.current_thread_id.clone()
-                && let Ok(thread_id) = ThreadId::from_string(source_thread_id.as_str())
-            {
-                match server.get_thread(thread_id).await {
+        if let Some(source_thread_id) = query_response.anchor.current_thread_id.clone() {
+            if let Ok(thread_id) = ThreadId::from_string(source_thread_id.as_str()) {
+                match self.server.get_thread(thread_id).await {
                     Ok(thread) => {
-                        let request = together_handoff_selection_request(
-                            &query_response,
-                            handoff_goal.as_deref(),
-                        );
+                        let request =
+                            together_handoff_selection_request(&query_response, handoff_goal.as_deref());
                         match thread.select_handoff_context(request).await {
                             Ok(selection) => {
                                 selected_ref_ids = selection.selected_ref_ids;
@@ -1041,7 +1264,7 @@ impl App {
                             Err(err) => {
                                 tracing::warn!(
                                     error = %err,
-                                    "model-assisted handoff selection failed"
+                                    "model-assisted handoff selection failed; falling back to server recommendations"
                                 );
                             }
                         }
@@ -1055,15 +1278,47 @@ impl App {
                 }
             }
 
-            app_event_tx.send(AppEvent::TogetherHandoffViewPrepared {
-                query_response,
+            if selected_ref_ids.is_empty() {
+                match plan_together_context_handoff(
+                    Some(source_thread_id),
+                    Vec::new(),
+                    handoff_goal.clone(),
+                    true,
+                )
+                .await
+                {
+                    Ok(plan) => selected_ref_ids = plan.selected_node_ids,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "fallback handoff preview failed after model-assisted selection"
+                        );
+                    }
+                }
+            }
+        }
+
+        let server_info = try_fetch_together_server_info().await;
+        let (handoff_targets, selected_handoff_target_idx) = together_handoff_targets_from_members(
+            server_info
+                .as_ref()
+                .map(|response| response.connected_members.as_slice()),
+            self.together_session_connection_id.as_deref(),
+        );
+
+        self.chat_widget.show_together_context_view_with_selection(
+            None,
+            query_response,
+            scope,
+            crate::chatwidget::TogetherContextViewSelection {
+                mode: crate::chatwidget::TogetherContextViewMode::Handoff,
+                selected_ref_ids: selected_ref_ids.into_iter().collect(),
                 handoff_goal,
-                target_actor_id,
-                target_display_name,
-                selected_ref_ids,
                 handoff_loading_prompt,
-            });
-        });
+                handoff_targets,
+                selected_handoff_target_idx,
+            },
+        );
     }
 
     async fn plan_together_context_handoff(&mut self, tui: &mut tui::Tui, actual_idx: usize) {
@@ -1086,46 +1341,35 @@ impl App {
                 .add_error_message("No collaboration context is selected.".to_string());
             return;
         }
-        let handoff_goal = self.chat_widget.together_context_handoff_goal();
-        let target_actor_id = self.chat_widget.together_context_handoff_target_actor_id();
-        let selected_node_labels = self.chat_widget.together_context_selected_node_labels();
-        let draft_text = self
-            .chat_widget
-            .together_context_handoff_loading_prompt()
-            .filter(|prompt| !prompt.trim().is_empty())
-            .unwrap_or_else(|| {
-                together_handoff_loading_prompt(handoff_goal.as_deref(), &selected_node_labels)
-            });
-
-        if target_actor_id.is_none() {
-            self.commit_local_together_handoff(
-                tui,
-                source_thread_id,
-                selected_ref_ids,
-                draft_text,
-                handoff_goal,
-            )
-            .await;
-            return;
-        }
 
         match plan_together_context_handoff(
             Some(source_thread_id),
             selected_ref_ids,
-            handoff_goal.clone(),
-            target_actor_id.clone(),
+            self.chat_widget.together_context_handoff_goal(),
             false,
         )
         .await
         {
             Ok(plan) => {
-                self.commit_remote_together_handoff(
+                let handoff_target = self.chat_widget.together_context_selected_handoff_target();
+                let draft_text = self
+                    .chat_widget
+                    .together_context_handoff_loading_prompt()
+                    .filter(|prompt| !prompt.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        let selected_node_labels =
+                            self.chat_widget.together_context_selected_node_labels();
+                        together_handoff_loading_prompt(plan.goal.as_deref(), &selected_node_labels)
+                    });
+                self.commit_together_handoff(
                     tui,
-                    plan.plan_id,
-                    draft_text,
-                    plan.goal,
-                    plan.selected_node_ids.len(),
-                    target_actor_id,
+                    TogetherHandoffCommitRequest {
+                        plan_id: plan.plan_id,
+                        draft_text,
+                        handoff_goal: plan.goal,
+                        handoff_target,
+                        selected_node_count: plan.selected_node_ids.len(),
+                    },
                 )
                 .await;
             }
@@ -2135,6 +2379,9 @@ impl App {
             windows_sandbox: WindowsSandboxState::default(),
             thread_event_channels: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
+            together_session_listener_task: None,
+            together_session_listener_endpoint: None,
+            together_session_connection_id: None,
             agent_picker_threads: HashMap::new(),
             active_thread_id: None,
             active_thread_rx: None,
@@ -2142,6 +2389,7 @@ impl App {
             primary_session_configured: None,
             pending_primary_events: VecDeque::new(),
         };
+        app.sync_together_session_listener();
 
         // On startup, if Agent mode (workspace-write) or ReadOnly is active, warn about world-writable dirs on Windows.
         #[cfg(target_os = "windows")]
@@ -2251,6 +2499,9 @@ impl App {
                 AppRunControl::Exit(reason) => break reason,
             }
         };
+        if let Some(handle) = app.together_session_listener_task.take() {
+            handle.abort();
+        }
         tui.terminal.clear()?;
         Ok(AppExitInfo {
             token_usage: app.token_usage(),
@@ -3467,6 +3718,40 @@ impl App {
             AppEvent::RunTogetherCommand { args } => {
                 self.chat_widget.run_together_command(args);
             }
+            AppEvent::SyncTogetherSession => {
+                self.sync_together_session_listener();
+            }
+            AppEvent::TogetherSessionConnected {
+                endpoint,
+                connection_id,
+            } => {
+                if active_together_session_endpoint().as_deref() == Some(endpoint.as_str()) {
+                    self.together_session_connection_id = Some(connection_id);
+                }
+            }
+            AppEvent::TogetherHostStopped {
+                endpoint,
+                server_id,
+                owner_email,
+            } => {
+                if active_together_session_endpoint().as_deref() == Some(endpoint.as_str()) {
+                    set_together_disconnected();
+                    self.together_session_connection_id = None;
+                    self.sync_together_session_listener();
+                    self.chat_widget.add_info_message(
+                        format!("Collaboration host {server_id} stopped."),
+                        Some(format!("Owner: {owner_email}")),
+                    );
+                }
+            }
+            AppEvent::TogetherHandoffAssigned {
+                endpoint,
+                notification,
+            } => {
+                if active_together_session_endpoint().as_deref() == Some(endpoint.as_str()) {
+                    self.open_assigned_handoff(tui, notification).await;
+                }
+            }
             AppEvent::StartTogetherComposerContextSearch { query } => {
                 self.start_together_composer_context_search(query);
             }
@@ -3500,8 +3785,8 @@ impl App {
                         selected_ref_ids: selected_ref_ids.into_iter().collect(),
                         handoff_goal,
                         handoff_loading_prompt,
-                        target_actor_id: None,
-                        target_display_name: None,
+                        handoff_targets: Vec::new(),
+                        selected_handoff_target_idx: 0,
                     },
                 );
             }
@@ -3519,23 +3804,17 @@ impl App {
             AppEvent::PrepareTogetherHandoffView {
                 query_response,
                 handoff_goal,
-                target_actor_id,
-                target_display_name,
+                ..
             } => {
-                self.prepare_together_handoff_view(
-                    query_response,
-                    handoff_goal,
-                    target_actor_id,
-                    target_display_name,
-                );
+                self.prepare_together_handoff_view(query_response, handoff_goal)
+                    .await;
             }
             AppEvent::TogetherHandoffViewPrepared {
                 query_response,
                 handoff_goal,
-                target_actor_id,
-                target_display_name,
                 selected_ref_ids,
                 handoff_loading_prompt,
+                ..
             } => {
                 let scope = crate::chatwidget::TogetherContextScope::default_for(
                     query_response.anchor.current_thread_id.as_deref(),
@@ -3549,14 +3828,17 @@ impl App {
                         selected_ref_ids: selected_ref_ids.into_iter().collect(),
                         handoff_goal,
                         handoff_loading_prompt,
-                        target_actor_id,
-                        target_display_name,
+                        handoff_targets: Vec::new(),
+                        selected_handoff_target_idx: 0,
                     },
                 );
             }
             AppEvent::ToggleTogetherContextSelection { actual_idx } => {
                 self.chat_widget
                     .toggle_together_context_selection(actual_idx);
+            }
+            AppEvent::CycleTogetherHandoffTarget { reverse } => {
+                self.chat_widget.cycle_together_handoff_target(reverse);
             }
             AppEvent::PlanTogetherContextHandoff { actual_idx } => {
                 self.plan_together_context_handoff(tui, actual_idx).await;
@@ -4129,6 +4411,7 @@ mod tests {
     use codex_protocol::protocol::UserMessageEvent;
     use codex_protocol::user_input::TextElement;
     use codex_protocol::user_input::UserInput;
+    use codex_together_protocol::HandoffAssignedNotification;
     use crossterm::event::KeyModifiers;
     use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
@@ -4138,6 +4421,70 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use tempfile::tempdir;
     use tokio::time;
+
+    fn lines_to_string(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn sample_assigned_handoff_notification() -> HandoffAssignedNotification {
+        HandoffAssignedNotification {
+            thread_id: "thread_target".to_string(),
+            source_thread_id: "thread_source".to_string(),
+            source_actor_id: "alice@example.com".to_string(),
+            target_actor_id: "codex-agent@example.com".to_string(),
+            target_connection_id: "session-target".to_string(),
+            goal: Some("Fix Together handoff delivery".to_string()),
+            cwd: Some("/repo/feature".to_string()),
+            rollout_path: "/repo/.codex/sessions/thread_target.jsonl".to_string(),
+        }
+    }
+
+    #[test]
+    fn assigned_handoff_loading_prompt_snapshot() {
+        assert_snapshot!(
+                                    assigned_handoff_loading_prompt(Some("Fix Together handoff delivery")),
+                                    @r"
+Continue the assigned handoff.
+
+Goal: Fix Together handoff delivery
+
+This addressed handoff thread is already open. Review /context, then continue the task.
+"
+                                );
+    }
+
+    #[test]
+    fn assigned_handoff_status_lines_snapshot() {
+        let notification = sample_assigned_handoff_notification();
+        assert_snapshot!(
+                                    lines_to_string(&assigned_handoff_status_lines(
+                                        &notification,
+                                        Some(
+                                            "Sender cwd /repo/feature is not available locally; using current cwd /Users/test/project."
+                                        )
+                                    )),
+                                    @r"
+• Handoff received
+  From: alice@example.com
+  Thread: thread_target
+  Source thread: thread_source
+  Goal: Fix Together handoff delivery
+  This is the addressed handoff thread.
+  Review /context to inspect the mounted handoff context.
+  Note: Sender cwd /repo/feature is not available locally; using current cwd /Users/test/project.
+  A loading prompt has been prepared in the composer.
+"
+                                );
+    }
 
     #[test]
     fn normalize_harness_overrides_resolves_relative_add_dirs() -> Result<()> {
@@ -4925,6 +5272,9 @@ mod tests {
             windows_sandbox: WindowsSandboxState::default(),
             thread_event_channels: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
+            together_session_listener_task: None,
+            together_session_listener_endpoint: None,
+            together_session_connection_id: None,
             agent_picker_threads: HashMap::new(),
             active_thread_id: None,
             active_thread_rx: None,
@@ -4985,6 +5335,9 @@ mod tests {
                 windows_sandbox: WindowsSandboxState::default(),
                 thread_event_channels: HashMap::new(),
                 thread_event_listener_tasks: HashMap::new(),
+                together_session_listener_task: None,
+                together_session_listener_endpoint: None,
+                together_session_connection_id: None,
                 agent_picker_threads: HashMap::new(),
                 active_thread_id: None,
                 active_thread_rx: None,

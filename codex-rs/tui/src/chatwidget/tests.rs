@@ -2778,6 +2778,43 @@ fn together_handoff_targets_from_members_keep_other_sessions_for_same_actor() {
 }
 
 #[test]
+fn together_handoff_targets_from_members_keep_same_actor_sessions_without_connection_id() {
+    let local_actor_id = local_together_actor_id();
+    let (targets, selected_idx) = together_handoff_targets_from_members(
+        Some(&[
+            ConnectedMember {
+                connection_id: "11111111-0000-0000-0000-000000000000".to_string(),
+                email: local_actor_id.clone(),
+                role: TogetherRole::Owner,
+                display_name: Some("Self".to_string()),
+                actor_kind: TogetherActorKind::Human,
+                agent_role: None,
+            },
+            ConnectedMember {
+                connection_id: "44444444-0000-0000-0000-000000000000".to_string(),
+                email: local_actor_id.clone(),
+                role: TogetherRole::Owner,
+                display_name: Some("Self".to_string()),
+                actor_kind: TogetherActorKind::Human,
+                agent_role: None,
+            },
+        ]),
+        None,
+    );
+
+    assert_eq!(targets.len(), 2);
+    assert!(targets[0].is_self);
+    assert_eq!(targets[0].connection_id, "local".to_string());
+    assert_eq!(targets[1].actor_id, local_actor_id);
+    assert_eq!(
+        targets[1].connection_id,
+        "44444444-0000-0000-0000-000000000000".to_string()
+    );
+    assert!(!targets[1].is_self);
+    assert_eq!(selected_idx, 1);
+}
+
+#[test]
 fn together_handoff_selection_request_uses_default_goal_without_custom_instructions() {
     let thread_id = "thread-1";
     let anchor_id = context_anchor_id(Some(thread_id));

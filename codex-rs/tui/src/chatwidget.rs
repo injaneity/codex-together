@@ -10848,12 +10848,18 @@ pub(crate) fn together_handoff_targets_from_members(
         }
     }];
     if let Some(members) = connected_members {
+        let mut skipped_local_actor_placeholder = false;
         let mut remote_targets = members
             .iter()
             .filter(|member| {
-                local_connection_id.map_or(member.email != local_actor_id, |local_connection_id| {
-                    member.connection_id != local_connection_id
-                })
+                if let Some(local_connection_id) = local_connection_id {
+                    return member.connection_id != local_connection_id;
+                }
+                if member.email == local_actor_id && !skipped_local_actor_placeholder {
+                    skipped_local_actor_placeholder = true;
+                    return false;
+                }
+                true
             })
             .map(|member| TogetherHandoffTarget {
                 connection_id: member.connection_id.clone(),

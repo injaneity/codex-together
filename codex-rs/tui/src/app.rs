@@ -48,6 +48,9 @@ use crate::tui;
 use crate::tui::TuiEvent;
 use crate::update_action::UpdateAction;
 use crate::version::CODEX_CLI_VERSION;
+use chrono::Datelike;
+use chrono::Local;
+use chrono::Utc;
 use codex_ansi_escape::ansi_escape_line;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_core::AuthManager;
@@ -56,6 +59,7 @@ use codex_core::CodexAuth;
 use codex_core::NewThread;
 use codex_core::ThreadContextMount;
 use codex_core::ThreadContextMountKind;
+use codex_core::SESSIONS_SUBDIR;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -88,11 +92,12 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::FinalOutput;
+#[cfg(test)]
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::ListSkillsResponseEvent;
 use codex_protocol::protocol::Op;
-#[cfg(test)]
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
@@ -102,6 +107,7 @@ use codex_together_protocol::HandoffAssignedNotification;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
+use color_eyre::eyre::eyre;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
@@ -797,6 +803,58 @@ fn assigned_handoff_status_lines(
     lines
 }
 
+async fn write_assigned_handoff_rollout(
+    codex_home: &Path,
+    expected_thread_id: ThreadId,
+    history: &[RolloutItem],
+) -> Result<PathBuf> {
+    let Some(actual_thread_id) = history.iter().find_map(|item| match item {
+        RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.id),
+        _ => None,
+    }) else {
+        return Err(eyre!(
+            "assigned handoff rollout is missing session metadata for thread {expected_thread_id}"
+        ));
+    };
+    if actual_thread_id != expected_thread_id {
+        return Err(eyre!(
+            "assigned handoff rollout thread mismatch: expected {expected_thread_id}, got {actual_thread_id}"
+        ));
+    }
+
+    let timestamp = Local::now();
+    let mut dir = codex_home.join(SESSIONS_SUBDIR);
+    dir.push(timestamp.year().to_string());
+    dir.push(format!("{:02}", timestamp.month()));
+    dir.push(format!("{:02}", timestamp.day()));
+
+    let date_str = timestamp.format("%Y-%m-%dT%H-%M-%S").to_string();
+    let rollout_path = dir.join(format!("rollout-{date_str}-{actual_thread_id}.jsonl"));
+    let line_timestamp = Utc::now().to_rfc3339();
+
+    let mut serialized = String::new();
+    for item in history {
+        let line = RolloutLine {
+            timestamp: line_timestamp.clone(),
+            item: item.clone(),
+        };
+        serialized.push_str(
+            &serde_json::to_string(&line)
+                .wrap_err("failed to serialize assigned handoff rollout item")?,
+        );
+        serialized.push('\n');
+    }
+
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .wrap_err_with(|| format!("failed to create {}", dir.display()))?;
+    tokio::fs::write(&rollout_path, serialized)
+        .await
+        .wrap_err_with(|| format!("failed to write {}", rollout_path.display()))?;
+
+    Ok(rollout_path)
+}
+
 struct TogetherHandoffCommitRequest {
     plan_id: String,
     draft_text: String,
@@ -931,15 +989,40 @@ impl App {
                 return;
             }
         };
+        let expected_thread_id = match ThreadId::from_string(notification.thread_id.as_str()) {
+            Ok(thread_id) => thread_id,
+            Err(err) => {
+                self.chat_widget.add_error_message(format!(
+                    "Assigned handoff thread id {} is invalid: {err}",
+                    notification.thread_id
+                ));
+                return;
+            }
+        };
+        let rollout_path = match write_assigned_handoff_rollout(
+            handoff_config.codex_home.as_path(),
+            expected_thread_id,
+            &history,
+        )
+        .await
+        {
+            Ok(path) => path,
+            Err(err) => {
+                self.chat_widget.add_error_message(format!(
+                    "Failed to prepare assigned handoff thread {} locally: {err}",
+                    notification.thread_id
+                ));
+                return;
+            }
+        };
         let loading_prompt = assigned_handoff_loading_prompt(notification.goal.as_deref());
 
         match self
             .server
-            .resume_thread_with_history(
+            .resume_thread_from_rollout(
                 handoff_config.clone(),
-                InitialHistory::Forked(history),
+                rollout_path,
                 self.auth_manager.clone(),
-                false,
             )
             .await
         {
@@ -4403,6 +4486,7 @@ mod tests {
     use crate::history_cell::UserHistoryCell;
     use crate::history_cell::new_session_info;
     use codex_core::CodexAuth;
+    use codex_core::RolloutRecorder;
     use codex_core::config::ConfigBuilder;
     use codex_core::config::ConfigOverrides;
     use codex_core::config::types::ModelAvailabilityNuxConfig;
@@ -4414,9 +4498,12 @@ mod tests {
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::Event;
     use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::InitialHistory;
     use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::SandboxPolicy;
     use codex_protocol::protocol::SessionConfiguredEvent;
+    use codex_protocol::protocol::SessionMeta;
+    use codex_protocol::protocol::SessionMetaLine;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::ThreadRolledBackEvent;
     use codex_protocol::protocol::UserMessageEvent;
@@ -4459,31 +4546,66 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn write_assigned_handoff_rollout_preserves_thread_id() {
+        let temp = tempdir().expect("tempdir");
+        let thread_id =
+            ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").expect("thread id");
+        let history = vec![RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                id: thread_id,
+                cwd: temp.path().join("workspace"),
+                ..SessionMeta::default()
+            },
+            git: None,
+        })];
+
+        let rollout_path = write_assigned_handoff_rollout(temp.path(), thread_id, &history)
+            .await
+            .expect("write rollout");
+        let resumed = RolloutRecorder::get_rollout_history(&rollout_path)
+            .await
+            .expect("load rollout history");
+
+        let InitialHistory::Resumed(resumed) = resumed else {
+            panic!("expected resumed history");
+        };
+        assert_eq!(resumed.conversation_id, thread_id);
+        assert_eq!(resumed.history.len(), 1);
+        let Some(resumed_thread_id) = resumed.history.iter().find_map(|item| match item {
+            RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.id),
+            _ => None,
+        }) else {
+            panic!("expected session meta");
+        };
+        assert_eq!(resumed_thread_id, thread_id);
+    }
+
     #[test]
     fn assigned_handoff_loading_prompt_snapshot() {
         assert_snapshot!(
-                                            assigned_handoff_loading_prompt(Some("Fix Together handoff delivery")),
-                                            @r"
+                                                                    assigned_handoff_loading_prompt(Some("Fix Together handoff delivery")),
+                                                                    @r"
 Continue the assigned handoff.
 
 Goal: Fix Together handoff delivery
 
 This addressed handoff thread is already open. Review /context, then continue the task.
 "
-                                        );
+                                                                );
     }
 
     #[test]
     fn assigned_handoff_status_lines_snapshot() {
         let notification = sample_assigned_handoff_notification();
         assert_snapshot!(
-                                            lines_to_string(&assigned_handoff_status_lines(
-                                                &notification,
-                                                Some(
-                                                    "Sender cwd /repo/feature is not available locally; using current cwd /Users/test/project."
-                                                )
-                                            )),
-                                            @r"
+                                                                    lines_to_string(&assigned_handoff_status_lines(
+                                                                        &notification,
+                                                                        Some(
+                                                                            "Sender cwd /repo/feature is not available locally; using current cwd /Users/test/project."
+                                                                        )
+                                                                    )),
+                                                                    @r"
 • Handoff received
   From: alice@example.com
   Thread: thread_target
@@ -4494,7 +4616,7 @@ This addressed handoff thread is already open. Review /context, then continue th
   Note: Sender cwd /repo/feature is not available locally; using current cwd /Users/test/project.
   A loading prompt has been prepared in the composer.
 "
-                                        );
+                                                                );
     }
 
     #[test]

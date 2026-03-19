@@ -506,6 +506,9 @@ pub(crate) enum AppEvent {
         reverse: bool,
     },
 
+    /// Switch which pane owns keyboard navigation in the handoff picker.
+    ToggleTogetherHandoffPane,
+
     /// Plan and commit a fresh-thread handoff from the selected context rows.
     PlanTogetherContextHandoff {
         actual_idx: usize,

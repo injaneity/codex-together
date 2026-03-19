@@ -57,9 +57,9 @@ use codex_core::AuthManager;
 use codex_core::CodexAuth;
 #[cfg(test)]
 use codex_core::NewThread;
+use codex_core::SESSIONS_SUBDIR;
 use codex_core::ThreadContextMount;
 use codex_core::ThreadContextMountKind;
-use codex_core::SESSIONS_SUBDIR;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -1049,7 +1049,7 @@ impl App {
             self.config.permissions.approval_policy.value(),
             self.config.permissions.sandbox_policy.get().clone(),
         )
-            .await
+        .await
         {
             Ok(response) => response,
             Err(err) => {
@@ -1329,8 +1329,10 @@ impl App {
             if let Ok(thread_id) = ThreadId::from_string(source_thread_id.as_str()) {
                 match self.server.get_thread(thread_id).await {
                     Ok(thread) => {
-                        let request =
-                            together_handoff_selection_request(&query_response, handoff_goal.as_deref());
+                        let request = together_handoff_selection_request(
+                            &query_response,
+                            handoff_goal.as_deref(),
+                        );
                         match thread.select_handoff_context(request).await {
                             Ok(selection) => {
                                 selected_ref_ids = selection.selected_ref_ids;
@@ -1358,6 +1360,7 @@ impl App {
                     Some(source_thread_id),
                     Vec::new(),
                     handoff_goal.clone(),
+                    None,
                     true,
                 )
                 .await
@@ -1392,6 +1395,7 @@ impl App {
                 handoff_loading_prompt,
                 handoff_targets,
                 selected_handoff_target_idx,
+                focused_handoff_pane: crate::chatwidget::TogetherHandoffPane::Context,
             },
         );
     }
@@ -1416,17 +1420,22 @@ impl App {
                 .add_error_message("No collaboration context is selected.".to_string());
             return;
         }
+        let handoff_target = self.chat_widget.together_context_selected_handoff_target();
+        let target_actor_id = handoff_target
+            .as_ref()
+            .filter(|target| !target.is_self)
+            .map(|target| target.actor_id.clone());
 
         match plan_together_context_handoff(
             Some(source_thread_id),
             selected_ref_ids,
             self.chat_widget.together_context_handoff_goal(),
+            target_actor_id,
             false,
         )
         .await
         {
             Ok(plan) => {
-                let handoff_target = self.chat_widget.together_context_selected_handoff_target();
                 let draft_text = self
                     .chat_widget
                     .together_context_handoff_loading_prompt()
@@ -3862,6 +3871,7 @@ impl App {
                         handoff_loading_prompt,
                         handoff_targets: Vec::new(),
                         selected_handoff_target_idx: 0,
+                        focused_handoff_pane: crate::chatwidget::TogetherHandoffPane::Context,
                     },
                 );
             }
@@ -3905,6 +3915,7 @@ impl App {
                         handoff_loading_prompt,
                         handoff_targets: Vec::new(),
                         selected_handoff_target_idx: 0,
+                        focused_handoff_pane: crate::chatwidget::TogetherHandoffPane::Context,
                     },
                 );
             }
@@ -3914,6 +3925,9 @@ impl App {
             }
             AppEvent::CycleTogetherHandoffTarget { reverse } => {
                 self.chat_widget.cycle_together_handoff_target(reverse);
+            }
+            AppEvent::ToggleTogetherHandoffPane => {
+                self.chat_widget.toggle_together_handoff_pane();
             }
             AppEvent::PlanTogetherContextHandoff { actual_idx } => {
                 self.plan_together_context_handoff(tui, actual_idx).await;
@@ -4565,28 +4579,28 @@ mod tests {
     #[test]
     fn assigned_handoff_loading_prompt_snapshot() {
         assert_snapshot!(
-                                                                                    assigned_handoff_loading_prompt(Some("Fix Together handoff delivery")),
-                                                                                    @r"
+                                                                                                                    assigned_handoff_loading_prompt(Some("Fix Together handoff delivery")),
+                                                                                                                    @r"
 Continue the assigned handoff.
 
 Goal: Fix Together handoff delivery
 
 This addressed handoff thread is already open. Review /context, then continue the task.
 "
-                                                                                );
+                                                                                                                );
     }
 
     #[test]
     fn assigned_handoff_status_lines_snapshot() {
         let notification = sample_assigned_handoff_notification();
         assert_snapshot!(
-                                                                                    lines_to_string(&assigned_handoff_status_lines(
-                                                                                        &notification,
-                                                                                        Some(
-                                                                                            "Sender cwd /repo/feature is not available locally; using current cwd /Users/test/project."
-                                                                                        )
-                                                                                    )),
-                                                                                    @r"
+                                                                                                                    lines_to_string(&assigned_handoff_status_lines(
+                                                                                                                        &notification,
+                                                                                                                        Some(
+                                                                                                                            "Sender cwd /repo/feature is not available locally; using current cwd /Users/test/project."
+                                                                                                                        )
+                                                                                                                    )),
+                                                                                                                    @r"
 • Handoff received
   From: alice@example.com
   Thread: thread_target
@@ -4597,7 +4611,7 @@ This addressed handoff thread is already open. Review /context, then continue th
   Note: Sender cwd /repo/feature is not available locally; using current cwd /Users/test/project.
   A loading prompt has been prepared in the composer.
 "
-                                                                                );
+                                                                                                                );
     }
 
     #[test]

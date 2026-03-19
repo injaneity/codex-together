@@ -2161,6 +2161,7 @@ async fn together_handoff_view_snapshot() {
                 },
             ],
             selected_handoff_target_idx: 1,
+            focused_handoff_pane: TogetherHandoffPane::Context,
         },
     );
 
@@ -2212,6 +2213,73 @@ async fn together_context_message_insight_snapshot() {
         .draw(|f| chat.render(f.area(), f.buffer_mut()))
         .expect("draw context view");
     assert_snapshot!("together_context_message_insight", terminal.backend());
+}
+
+#[tokio::test]
+async fn together_handoff_scroll_hint_snapshot() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
+    chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
+
+    let anchor_id = context_anchor_id(Some(thread_id));
+    let nodes = (0..12)
+        .map(|idx| {
+            repo_context_node(
+                &format!("ctx:file:.codex/context/note-{idx}.md"),
+                RepoMemoryKind::Concept,
+                &format!("Planning note {idx}"),
+                Some("plan"),
+                &format!(".codex/context/note-{idx}.md"),
+                vec![thread_id],
+                (vec![], vec![]),
+            )
+        })
+        .collect();
+    let edges = (0..12)
+        .map(|idx| {
+            mounted_edge(
+                &anchor_id,
+                &format!("ctx:file:.codex/context/note-{idx}.md"),
+                ContextMountReason::RepoNeighbor,
+            )
+        })
+        .collect();
+
+    chat.show_together_context_view_with_selection(
+        Some("planning".to_string()),
+        rooted_context_query(Some(thread_id), None, None, nodes, edges),
+        TogetherContextScope::Global,
+        TogetherContextViewSelection {
+            mode: TogetherContextViewMode::Handoff,
+            selected_ref_ids: HashSet::new(),
+            handoff_goal: Some("Inspect the latest planning context.".to_string()),
+            handoff_loading_prompt: None,
+            handoff_targets: vec![TogetherHandoffTarget {
+                connection_id: "11111111-0000-0000-0000-000000000000".to_string(),
+                actor_id: "weisintai@local".to_string(),
+                display_name: Some("Self".to_string()),
+                actor_kind: TogetherActorKind::Human,
+                agent_role: None,
+                membership_role: Some(TogetherRole::Owner),
+                is_self: true,
+            }],
+            selected_handoff_target_idx: 0,
+            focused_handoff_pane: TogetherHandoffPane::Context,
+        },
+    );
+
+    for _ in 0..5 {
+        chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    }
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 14)).expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw handoff view with scroll");
+    assert_snapshot!("together_handoff_scroll_hint", terminal.backend());
 }
 
 #[tokio::test]
@@ -2591,6 +2659,7 @@ async fn together_handoff_view_emits_selection_and_handoff_events() {
                 },
             ],
             selected_handoff_target_idx: 1,
+            focused_handoff_pane: TogetherHandoffPane::Context,
         },
     );
 
@@ -2600,16 +2669,81 @@ async fn together_handoff_view_emits_selection_and_handoff_events() {
         AppEvent::ToggleTogetherContextSelection { actual_idx: 0 }
     );
 
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     assert_matches!(
-        rx.try_recv().expect("expected handoff target cycle event"),
-        AppEvent::CycleTogetherHandoffTarget { reverse: false }
+        rx.try_recv().expect("expected handoff pane toggle event"),
+        AppEvent::ToggleTogetherHandoffPane
     );
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
     assert_matches!(
         rx.try_recv().expect("expected handoff event"),
         AppEvent::PlanTogetherContextHandoff { actual_idx: 0 }
+    );
+}
+
+#[tokio::test]
+async fn together_handoff_target_pane_uses_arrows_to_cycle_targets() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let thread_id = "019cf3a8-0cf0-7eb1-b748-738284242df8";
+    chat.thread_id = Some(ThreadId::from_string(thread_id).expect("valid thread id"));
+
+    chat.show_together_context_view_with_selection(
+        Some("planning".to_string()),
+        rooted_context_query(
+            Some(thread_id),
+            None,
+            None,
+            vec![repo_context_node(
+                "ctx:file:.codex/context/overview.md",
+                RepoMemoryKind::Concept,
+                "Planning Overview",
+                Some("plan"),
+                ".codex/context/overview.md",
+                vec![thread_id],
+                (vec![], vec![]),
+            )],
+            vec![mounted_edge(
+                &context_anchor_id(Some(thread_id)),
+                "ctx:file:.codex/context/overview.md",
+                ContextMountReason::RepoNeighbor,
+            )],
+        ),
+        TogetherContextScope::Global,
+        TogetherContextViewSelection {
+            mode: TogetherContextViewMode::Handoff,
+            selected_ref_ids: HashSet::new(),
+            handoff_goal: Some("Inspect the latest planning context.".to_string()),
+            handoff_loading_prompt: None,
+            handoff_targets: vec![
+                TogetherHandoffTarget {
+                    connection_id: "11111111-0000-0000-0000-000000000000".to_string(),
+                    actor_id: "weisintai@local".to_string(),
+                    display_name: Some("Self".to_string()),
+                    actor_kind: TogetherActorKind::Human,
+                    agent_role: None,
+                    membership_role: Some(TogetherRole::Owner),
+                    is_self: true,
+                },
+                TogetherHandoffTarget {
+                    connection_id: "22222222-0000-0000-0000-000000000000".to_string(),
+                    actor_id: "lobster-worker@local".to_string(),
+                    display_name: Some("Lobster Worker".to_string()),
+                    actor_kind: TogetherActorKind::Agent,
+                    agent_role: Some("research".to_string()),
+                    membership_role: Some(TogetherRole::Member),
+                    is_self: false,
+                },
+            ],
+            selected_handoff_target_idx: 1,
+            focused_handoff_pane: TogetherHandoffPane::Targets,
+        },
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert_matches!(
+        rx.try_recv().expect("expected handoff target cycle event"),
+        AppEvent::CycleTogetherHandoffTarget { reverse: true }
     );
 }
 

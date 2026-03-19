@@ -3444,7 +3444,7 @@ fn thread_context_mount_from_persisted(mount: PersistedThreadContextMount) -> Th
         precursor_kind: ContextPrecursorKind::from(mount.precursor_kind),
         goal: mount.goal,
         seed_ref_ids: mount.seed_ref_ids,
-        actor_id: mount.actor_id,
+        target_actor_id: mount.actor_id,
     }
 }
 

@@ -53,8 +53,6 @@ use crate::version::CODEX_CLI_VERSION;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_backend_client::Client as BackendClient;
 use codex_chatgpt::connectors;
-use codex_core::LocalContextQueryInput;
-use codex_core::build_local_context_query;
 use codex_core::config::Config;
 use codex_core::config::Constrained;
 use codex_core::config::ConstraintResult;
@@ -224,6 +222,7 @@ use crate::bottom_pane::InputResult;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::MentionBinding;
 use crate::bottom_pane::QUIT_SHORTCUT_TIMEOUT;
+use crate::bottom_pane::ScrollHintMode;
 use crate::bottom_pane::SelectionAction;
 use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
@@ -294,7 +293,6 @@ use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_together_client::decode_invite;
 use codex_together_client::status_env_key;
@@ -8334,6 +8332,7 @@ impl ChatWidget {
             handoff_loading_prompt: selection.handoff_loading_prompt,
             handoff_targets: selection.handoff_targets,
             selected_handoff_target_idx: selection.selected_handoff_target_idx,
+            focused_handoff_pane: selection.focused_handoff_pane,
         }));
         self.together_context_view_state = Some(Arc::clone(&state));
         let params = self.together_context_view_params(
@@ -8413,6 +8412,24 @@ impl ChatWidget {
         let state = self.together_context_view_state.as_ref()?;
         let state = lock_together_context_view_state(state);
         state.handoff_loading_prompt.clone()
+    }
+
+    pub(crate) fn toggle_together_handoff_pane(&mut self) {
+        let Some(state) = self.together_context_view_state.as_ref() else {
+            return;
+        };
+        let mut state = lock_together_context_view_state(state);
+        if !matches!(state.mode, TogetherContextViewMode::Handoff)
+            || state.handoff_targets.is_empty()
+        {
+            return;
+        }
+        state.focused_handoff_pane = match state.focused_handoff_pane {
+            TogetherHandoffPane::Context => TogetherHandoffPane::Targets,
+            TogetherHandoffPane::Targets => TogetherHandoffPane::Context,
+        };
+        drop(state);
+        self.refresh_together_context_view();
     }
 
     pub(crate) fn cycle_together_handoff_target(&mut self, reverse: bool) {
@@ -8554,6 +8571,7 @@ impl ChatWidget {
             handoff_goal,
             handoff_targets,
             selected_handoff_target,
+            focused_handoff_pane,
         ) = {
             let state = lock_together_context_view_state(&state);
             let selected_handoff_target = state
@@ -8571,6 +8589,7 @@ impl ChatWidget {
                 state.handoff_goal.clone(),
                 state.handoff_targets.clone(),
                 selected_handoff_target,
+                state.focused_handoff_pane,
             )
         };
         let header = together_context_header(mode, query, handoff_goal);
@@ -8609,10 +8628,14 @@ impl ChatWidget {
                     SelectionItem {
                         name: together_context_row_name(&row),
                         name_prefix_spans: together_context_graph_prefix_spans(
-                            &row, mode, is_marked, false,
+                            &row,
+                            false,
+                            matches!(focused_handoff_pane, TogetherHandoffPane::Context),
                         ),
                         selected_name_prefix_spans: together_context_graph_prefix_spans(
-                            &row, mode, is_marked, true,
+                            &row,
+                            true,
+                            matches!(focused_handoff_pane, TogetherHandoffPane::Context),
                         ),
                         category_tag: together_context_is_hotspot(&row.node)
                             .then_some("*".to_string()),
@@ -8639,7 +8662,7 @@ impl ChatWidget {
             title: None,
             subtitle: None,
             footer_note: together_context_footer_hint(mode, selected_handoff_target.as_ref()),
-            footer_hint: Some(together_context_commands_line(mode)),
+            footer_hint: Some(together_context_commands_line(mode, focused_handoff_pane)),
             footer_right: Some(together_context_legend_line()),
             items,
             is_searchable: true,
@@ -8648,13 +8671,15 @@ impl ChatWidget {
             single_line_rows: true,
             show_entry_prefix: false,
             selected_row_style: Some(Style::default().bg(Color::DarkGray)),
-            show_selected_suffix_cursor: true,
+            show_selected_suffix_cursor: false,
+            scroll_hint_mode: ScrollHintMode::Counts,
             header: Box::new(header),
             initial_selected_idx,
             side_content: Box::new(together_handoff_targets_sidebar(
                 mode,
                 &handoff_targets,
                 selected_handoff_target.as_ref(),
+                focused_handoff_pane,
             )),
             side_content_width: if matches!(mode, TogetherContextViewMode::Handoff)
                 && !handoff_targets.is_empty()
@@ -8674,7 +8699,83 @@ impl ChatWidget {
                 mode,
                 &handoff_targets,
                 selected_handoff_target.as_ref(),
+                focused_handoff_pane,
             ))),
+            on_key_event: Some(Box::new({
+                let state = Arc::clone(&state);
+                move |key_event, _actual_idx, tx: &AppEventSender| {
+                    if !matches!(mode, TogetherContextViewMode::Handoff) {
+                        return false;
+                    }
+                    let state = lock_together_context_view_state(&state);
+                    let has_targets = !state.handoff_targets.is_empty();
+                    let focused_handoff_pane = state.focused_handoff_pane;
+                    drop(state);
+                    match key_event {
+                        KeyEvent {
+                            code: KeyCode::Tab,
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        }
+                        | KeyEvent {
+                            code: KeyCode::BackTab,
+                            ..
+                        } if has_targets => {
+                            tx.send(AppEvent::ToggleTogetherHandoffPane);
+                            true
+                        }
+                        KeyEvent {
+                            code: KeyCode::Left,
+                            ..
+                        } if has_targets
+                            && matches!(focused_handoff_pane, TogetherHandoffPane::Targets) =>
+                        {
+                            tx.send(AppEvent::ToggleTogetherHandoffPane);
+                            true
+                        }
+                        KeyEvent {
+                            code: KeyCode::Right,
+                            ..
+                        } if has_targets
+                            && matches!(focused_handoff_pane, TogetherHandoffPane::Context) =>
+                        {
+                            tx.send(AppEvent::ToggleTogetherHandoffPane);
+                            true
+                        }
+                        KeyEvent {
+                            code: KeyCode::Up, ..
+                        }
+                        | KeyEvent {
+                            code: KeyCode::Char('k'),
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } if matches!(focused_handoff_pane, TogetherHandoffPane::Targets) => {
+                            tx.send(AppEvent::CycleTogetherHandoffTarget { reverse: true });
+                            true
+                        }
+                        KeyEvent {
+                            code: KeyCode::Down,
+                            ..
+                        }
+                        | KeyEvent {
+                            code: KeyCode::Char('j'),
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } if matches!(focused_handoff_pane, TogetherHandoffPane::Targets) => {
+                            tx.send(AppEvent::CycleTogetherHandoffTarget { reverse: false });
+                            true
+                        }
+                        KeyEvent {
+                            code: KeyCode::Enter,
+                            ..
+                        } if matches!(focused_handoff_pane, TogetherHandoffPane::Targets) => {
+                            tx.send(AppEvent::ToggleTogetherHandoffPane);
+                            true
+                        }
+                        _ => false,
+                    }
+                }
+            })),
             on_selection_changed: Some(Box::new(move |idx, _tx| {
                 if let Ok(mut state) = state.lock() {
                     state.selected_actual_idx = idx;
@@ -8682,14 +8783,6 @@ impl ChatWidget {
             })),
             on_char_key: Some(Box::new(
                 move |pressed, actual_idx, tx: &AppEventSender| match pressed {
-                    't' if matches!(mode, TogetherContextViewMode::Handoff) => {
-                        tx.send(AppEvent::CycleTogetherHandoffTarget { reverse: false });
-                        true
-                    }
-                    'T' if matches!(mode, TogetherContextViewMode::Handoff) => {
-                        tx.send(AppEvent::CycleTogetherHandoffTarget { reverse: true });
-                        true
-                    }
                     'h' | 'H' if matches!(mode, TogetherContextViewMode::Handoff) => {
                         tx.send(AppEvent::PlanTogetherContextHandoff { actual_idx });
                         true
@@ -8920,6 +9013,12 @@ pub(crate) enum TogetherContextViewMode {
     Handoff,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TogetherHandoffPane {
+    Context,
+    Targets,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TogetherHandoffTarget {
     pub(crate) connection_id: String,
@@ -8939,6 +9038,7 @@ pub(crate) struct TogetherContextViewSelection {
     pub(crate) handoff_loading_prompt: Option<String>,
     pub(crate) handoff_targets: Vec<TogetherHandoffTarget>,
     pub(crate) selected_handoff_target_idx: usize,
+    pub(crate) focused_handoff_pane: TogetherHandoffPane,
 }
 
 impl Default for TogetherContextViewSelection {
@@ -8950,6 +9050,7 @@ impl Default for TogetherContextViewSelection {
             handoff_loading_prompt: None,
             handoff_targets: Vec::new(),
             selected_handoff_target_idx: 0,
+            focused_handoff_pane: TogetherHandoffPane::Context,
         }
     }
 }
@@ -8967,6 +9068,7 @@ struct TogetherContextViewState {
     handoff_loading_prompt: Option<String>,
     handoff_targets: Vec<TogetherHandoffTarget>,
     selected_handoff_target_idx: usize,
+    focused_handoff_pane: TogetherHandoffPane,
 }
 
 impl Default for TogetherContextViewState {
@@ -8996,6 +9098,7 @@ impl Default for TogetherContextViewState {
             handoff_loading_prompt: None,
             handoff_targets: Vec::new(),
             selected_handoff_target_idx: 0,
+            focused_handoff_pane: TogetherHandoffPane::Context,
         }
     }
 }
@@ -9115,20 +9218,31 @@ fn together_context_empty_state_item(has_thread_context: bool) -> SelectionItem 
     }
 }
 
-fn together_context_commands_line(mode: TogetherContextViewMode) -> Line<'static> {
+fn together_context_commands_line(
+    mode: TogetherContextViewMode,
+    focused_handoff_pane: TogetherHandoffPane,
+) -> Line<'static> {
     let mut spans = Vec::new();
     if matches!(mode, TogetherContextViewMode::Handoff) {
-        spans.extend([
-            "enter".cyan(),
-            " toggle".dim(),
-            " | ".dim(),
-            "t".cyan(),
-            " target".dim(),
-            " | ".dim(),
-            "h".cyan(),
-            " handoff".dim(),
-            " | ".dim(),
-        ]);
+        match focused_handoff_pane {
+            TogetherHandoffPane::Context => spans.extend([
+                "enter".cyan(),
+                " toggle".dim(),
+                " | ".dim(),
+                "tab".cyan(),
+                " switch view".dim(),
+                " | ".dim(),
+            ]),
+            TogetherHandoffPane::Targets => spans.extend([
+                "↑↓".cyan(),
+                " target".dim(),
+                " | ".dim(),
+                "tab".cyan(),
+                " switch view".dim(),
+                " | ".dim(),
+            ]),
+        }
+        spans.extend(["h".cyan(), " handoff".dim(), " | ".dim()]);
     }
     spans.extend(["esc".cyan(), " close".dim()]);
     Line::from(spans)
@@ -9152,6 +9266,7 @@ fn together_handoff_targets_sidebar(
     mode: TogetherContextViewMode,
     targets: &[TogetherHandoffTarget],
     selected_target: Option<&TogetherHandoffTarget>,
+    focused_handoff_pane: TogetherHandoffPane,
 ) -> ColumnRenderable<'static> {
     if !matches!(mode, TogetherContextViewMode::Handoff) || targets.is_empty() {
         return ColumnRenderable::new();
@@ -9165,12 +9280,20 @@ fn together_handoff_targets_sidebar(
             .unwrap_or(false);
         sidebar.push(Line::from(vec![
             if is_selected {
-                "› ".cyan()
+                if matches!(focused_handoff_pane, TogetherHandoffPane::Targets) {
+                    "› ".cyan()
+                } else {
+                    "› ".dim()
+                }
             } else {
                 "  ".into()
             },
             if is_selected {
-                together_handoff_target_title(target).cyan().bold()
+                if matches!(focused_handoff_pane, TogetherHandoffPane::Targets) {
+                    together_handoff_target_title(target).cyan().bold()
+                } else {
+                    together_handoff_target_title(target).bold()
+                }
             } else {
                 together_handoff_target_title(target).into()
             },
@@ -9440,9 +9563,8 @@ fn together_context_collect_tree_rows(
 
 fn together_context_graph_prefix_spans(
     row: &TogetherContextTreeRow,
-    _mode: TogetherContextViewMode,
-    is_marked: bool,
-    is_hovered: bool,
+    is_selected: bool,
+    is_active: bool,
 ) -> Vec<Span<'static>> {
     let tree_style = together_context_tree_style(&row.node);
     let mut spans = Vec::new();
@@ -9461,7 +9583,8 @@ fn together_context_graph_prefix_spans(
         });
     }
     spans.extend(together_context_selection_prefix_spans(
-        is_marked, is_hovered,
+        is_selected,
+        is_active,
     ));
     spans.push(Span::styled(
         format!("{} ", together_context_marker_text(&row.node)),
@@ -9590,10 +9713,18 @@ fn together_context_tree_style(node: &ContextQueryNode) -> Style {
 }
 
 fn together_context_selection_prefix_spans(
-    _is_marked: bool,
-    _is_hovered: bool,
+    is_selected: bool,
+    is_active: bool,
 ) -> Vec<Span<'static>> {
-    Vec::new()
+    vec![if is_selected {
+        if is_active {
+            "› ".cyan()
+        } else {
+            "› ".dim()
+        }
+    } else {
+        "  ".into()
+    }]
 }
 
 fn together_context_tag(node: &ContextQueryNode) -> TogetherContextTag {
@@ -10615,6 +10746,7 @@ pub(crate) async fn plan_together_context_handoff(
     source_thread_id: Option<String>,
     selected_ref_ids: Vec<String>,
     goal: Option<String>,
+    target_actor_id: Option<String>,
     preview_only: bool,
 ) -> anyhow::Result<HandoffPlanResponse> {
     let endpoint = current_together_endpoint();
@@ -10626,6 +10758,7 @@ pub(crate) async fn plan_together_context_handoff(
                 source_thread_id,
                 selected_ref_ids,
                 goal,
+                target_actor_id,
                 preview_only,
             },
         )

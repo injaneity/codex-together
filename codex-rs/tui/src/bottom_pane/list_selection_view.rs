@@ -68,6 +68,13 @@ impl Default for SideContentWidth {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ScrollHintMode {
+    #[default]
+    Basic,
+    Counts,
+}
+
 /// Returns the popup content width after subtracting the shared menu-surface
 /// horizontal inset (2 columns on each side).
 pub(crate) fn popup_content_width(total_width: u16) -> u16 {
@@ -103,6 +110,13 @@ pub(crate) type SelectionAction = Box<dyn Fn(&AppEventSender) + Send + Sync>;
 /// returns `true` when the key was consumed.
 pub(crate) type OnSelectionCharKeyCallback =
     Option<Box<dyn Fn(char, usize, &AppEventSender) -> bool + Send + Sync>>;
+
+/// Callback for arbitrary key actions while the list is open.
+///
+/// Receives `(key_event, selected_item_actual_index, app_event_tx)` and
+/// returns `true` when the key was consumed.
+pub(crate) type OnSelectionKeyCallback =
+    Option<Box<dyn Fn(&KeyEvent, Option<usize>, &AppEventSender) -> bool + Send + Sync>>;
 
 /// Callback invoked whenever the highlighted item changes (arrow keys, search
 /// filter, number-key jump).  Receives the *actual* index into the unfiltered
@@ -170,6 +184,7 @@ pub(crate) struct SelectionViewParams {
     pub show_entry_prefix: bool,
     pub selected_row_style: Option<Style>,
     pub show_selected_suffix_cursor: bool,
+    pub scroll_hint_mode: ScrollHintMode,
     pub header: Box<dyn Renderable>,
     pub initial_selected_idx: Option<usize>,
 
@@ -205,6 +220,10 @@ pub(crate) struct SelectionViewParams {
     /// Optional callback to handle single-character key actions (for example
     /// `f` for fork in together thread lists).
     pub on_char_key: OnSelectionCharKeyCallback,
+
+    /// Optional callback to intercept arbitrary key events before the list's
+    /// default navigation and selection handling runs.
+    pub on_key_event: OnSelectionKeyCallback,
 }
 
 impl Default for SelectionViewParams {
@@ -224,6 +243,7 @@ impl Default for SelectionViewParams {
             show_entry_prefix: true,
             selected_row_style: None,
             show_selected_suffix_cursor: true,
+            scroll_hint_mode: ScrollHintMode::default(),
             header: Box::new(()),
             initial_selected_idx: None,
             side_content: Box::new(()),
@@ -235,6 +255,7 @@ impl Default for SelectionViewParams {
             on_cancel: None,
             on_selection_footer_hint: None,
             on_char_key: None,
+            on_key_event: None,
         }
     }
 }
@@ -261,6 +282,7 @@ pub(crate) struct ListSelectionView {
     show_entry_prefix: bool,
     selected_row_style: Option<Style>,
     show_selected_suffix_cursor: bool,
+    scroll_hint_mode: ScrollHintMode,
     filtered_indices: Vec<usize>,
     last_selected_actual_idx: Option<usize>,
     header: Box<dyn Renderable>,
@@ -282,6 +304,9 @@ pub(crate) struct ListSelectionView {
 
     /// Optional callback for custom single-character key actions.
     on_char_key: OnSelectionCharKeyCallback,
+
+    /// Optional callback for arbitrary key handling.
+    on_key_event: OnSelectionKeyCallback,
 }
 
 impl ListSelectionView {
@@ -324,6 +349,7 @@ impl ListSelectionView {
             show_entry_prefix: params.show_entry_prefix,
             selected_row_style: params.selected_row_style,
             show_selected_suffix_cursor: params.show_selected_suffix_cursor,
+            scroll_hint_mode: params.scroll_hint_mode,
             filtered_indices: Vec::new(),
             last_selected_actual_idx: None,
             header,
@@ -337,6 +363,7 @@ impl ListSelectionView {
             on_cancel: params.on_cancel,
             on_selection_footer_hint: params.on_selection_footer_hint,
             on_char_key: params.on_char_key,
+            on_key_event: params.on_key_event,
         };
         s.apply_filter();
         s
@@ -519,8 +546,11 @@ impl ListSelectionView {
     fn scroll_footer_hint(&self) -> Option<Line<'static>> {
         let len = self.visible_len();
         let visible_rows = Self::max_visible_rows(len);
-        let hidden_above = self.state.scroll_top > 0;
-        let hidden_below = self.state.scroll_top.saturating_add(visible_rows) < len;
+        let hidden_above_count = self.state.scroll_top;
+        let hidden_below_count =
+            len.saturating_sub(self.state.scroll_top.saturating_add(visible_rows));
+        let hidden_above = hidden_above_count > 0;
+        let hidden_below = hidden_below_count > 0;
         if !hidden_above && !hidden_below {
             return None;
         }
@@ -528,14 +558,24 @@ impl ListSelectionView {
         let mut spans = Vec::new();
         if hidden_above {
             spans.push("↑".dim());
-            spans.push(" more above".dim());
+            match self.scroll_hint_mode {
+                ScrollHintMode::Basic => spans.push(" more above".dim()),
+                ScrollHintMode::Counts => {
+                    spans.push(format!(" {hidden_above_count} more above").dim());
+                }
+            }
         }
         if hidden_above && hidden_below {
             spans.push(" | ".dim());
         }
         if hidden_below {
             spans.push("↓".dim());
-            spans.push(" more below".dim());
+            match self.scroll_hint_mode {
+                ScrollHintMode::Basic => spans.push(" more below".dim()),
+                ScrollHintMode::Counts => {
+                    spans.push(format!(" {hidden_below_count} more below").dim());
+                }
+            }
         }
         Some(Line::from(spans))
     }
@@ -713,6 +753,12 @@ impl ListSelectionView {
 
 impl BottomPaneView for ListSelectionView {
     fn handle_key_event(&mut self, key_event: KeyEvent) {
+        if let Some(cb) = &self.on_key_event
+            && cb(&key_event, self.selected_actual_idx(), &self.app_event_tx)
+        {
+            return;
+        }
+
         if let KeyEvent {
             code: KeyCode::Char(c),
             modifiers,

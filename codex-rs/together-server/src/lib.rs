@@ -63,6 +63,7 @@ use codex_core::git_info::get_head_commit_hash;
 use codex_core::read_thread_context_mount_for_thread_id;
 use codex_core::write_thread_context_mount;
 use codex_protocol::protocol::InitialHistory;
+use codex_protocol::protocol::RolloutItem;
 use codex_state::StateRuntime;
 use codex_state::TogetherClientMode as StateTogetherClientMode;
 use codex_state::TogetherClientSession as StateTogetherClientSession;
@@ -116,6 +117,7 @@ use codex_together_protocol::METHOD_SESSION_JOIN;
 use codex_together_protocol::METHOD_SESSION_LEAVE;
 use codex_together_protocol::METHOD_THREAD_LIST;
 use codex_together_protocol::METHOD_THREAD_READ;
+use codex_together_protocol::METHOD_THREAD_READ_ROLLOUT;
 use codex_together_protocol::METHOD_TOGETHER_AUTH;
 use codex_together_protocol::MemoryPromoteParams;
 use codex_together_protocol::MemoryPromoteResponse;
@@ -125,6 +127,7 @@ use codex_together_protocol::ThreadListParams;
 use codex_together_protocol::ThreadListResponse;
 use codex_together_protocol::ThreadReadParams;
 use codex_together_protocol::ThreadReadResponse;
+use codex_together_protocol::ThreadReadRolloutResponse;
 use codex_together_protocol::ThreadSummary;
 use codex_together_protocol::TogetherActorKind;
 use codex_together_protocol::TogetherAuthRequest;
@@ -451,6 +454,7 @@ async fn handle_request(
         METHOD_CONTEXT_RESOLVE_BUNDLE => context_resolve_bundle(state, ctx, req).await,
         METHOD_MEMORY_PROMOTE => memory_promote(state, ctx, req).await,
         METHOD_THREAD_READ => thread_read(state, ctx, req).await,
+        METHOD_THREAD_READ_ROLLOUT => thread_read_rollout(state, ctx, req).await,
         METHOD_THREAD_LIST => thread_list(state, ctx, req).await,
         METHOD_HANDOFF_PLAN => handoff_plan(state, ctx, req).await,
         METHOD_HANDOFF_COMMIT => handoff_commit(state, connection_id, ctx, req).await,
@@ -939,6 +943,33 @@ async fn thread_read(
     };
 
     JsonRpcResponse::ok(req.id, ThreadReadResponse { thread })
+        .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
+}
+
+async fn thread_read_rollout(
+    _state: &AppState,
+    _ctx: &ConnectionContext,
+    req: JsonRpcRequest,
+) -> JsonRpcResponse {
+    let payload: ThreadReadParams = match serde_json::from_value(req.params) {
+        Ok(p) => p,
+        Err(_) => return rpc_error(req.id, -32602, "invalid params"),
+    };
+
+    let history = match load_thread_rollout_history(&payload.thread_id).await {
+        Ok(Some(history)) => history,
+        Ok(None) => return rpc_error(req.id, -32602, "unknown thread"),
+        Err(err) => {
+            warn!(
+                error = %err,
+                thread_id = %payload.thread_id,
+                "failed to load together thread rollout"
+            );
+            return rpc_error(req.id, -32603, "failed to load thread rollout");
+        }
+    };
+
+    JsonRpcResponse::ok(req.id, ThreadReadRolloutResponse { history })
         .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
 }
 
@@ -2212,6 +2243,29 @@ async fn load_thread_from_rollout(
     load_thread_from_rollout_at(codex_home.as_path(), thread_id, repo_root).await
 }
 
+async fn load_thread_rollout_history(thread_id: &str) -> Result<Option<Vec<RolloutItem>>> {
+    let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
+    load_thread_rollout_history_at(codex_home.as_path(), thread_id).await
+}
+
+async fn load_thread_rollout_history_at(
+    codex_home: &Path,
+    thread_id: &str,
+) -> Result<Option<Vec<RolloutItem>>> {
+    let Some(rollout_path) = find_thread_path_by_id_str(codex_home, thread_id).await? else {
+        return Ok(None);
+    };
+    let history = match RolloutRecorder::get_rollout_history(rollout_path.as_path())
+        .await
+        .with_context(|| format!("failed to load rollout `{}`", rollout_path.display()))?
+    {
+        InitialHistory::New => Vec::new(),
+        InitialHistory::Resumed(history) => history.history,
+        InitialHistory::Forked(history) => history,
+    };
+    Ok(Some(history))
+}
+
 async fn load_thread_from_rollout_at(
     codex_home: &Path,
     thread_id: &str,
@@ -2220,14 +2274,9 @@ async fn load_thread_from_rollout_at(
     let Some(rollout_path) = find_thread_path_by_id_str(codex_home, thread_id).await? else {
         return Ok(None);
     };
-    let items = match RolloutRecorder::get_rollout_history(rollout_path.as_path())
-        .await
-        .with_context(|| format!("failed to load rollout `{}`", rollout_path.display()))?
-    {
-        InitialHistory::New => Vec::new(),
-        InitialHistory::Resumed(history) => history.history,
-        InitialHistory::Forked(history) => history,
-    };
+    let items = load_thread_rollout_history_at(codex_home, thread_id)
+        .await?
+        .unwrap_or_default();
     let turns = build_turns_from_rollout_items(&items);
     let updated_at = std::fs::metadata(&rollout_path)
         .ok()

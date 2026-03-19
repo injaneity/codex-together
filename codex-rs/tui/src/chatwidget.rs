@@ -124,6 +124,7 @@ use codex_protocol::protocol::PatchApplyBeginEvent;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
+use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SkillMetadata as ProtocolSkillMetadata;
 use codex_protocol::protocol::StreamErrorEvent;
 use codex_protocol::protocol::TerminalInteractionEvent;
@@ -8439,6 +8440,14 @@ impl ChatWidget {
             .selected_handoff_target_idx
             .min(state.handoff_targets.len().saturating_sub(1));
         state.handoff_targets.get(idx).cloned()
+    }
+
+    pub(crate) fn dismiss_together_context_view(&mut self) {
+        self.together_context_view_state = None;
+        let _ = self
+            .bottom_pane
+            .dismiss_view_if_active(TOGETHER_CONTEXT_SELECTION_VIEW_ID);
+        self.request_redraw();
     }
 
     pub(crate) fn together_context_selected_node_labels(&self) -> Vec<String> {

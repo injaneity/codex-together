@@ -15,6 +15,7 @@ use crate::chatwidget::ExternalEditorState;
 use crate::chatwidget::TogetherHandoffTarget;
 use crate::chatwidget::active_together_session_endpoint;
 use crate::chatwidget::commit_together_handoff_plan;
+use crate::chatwidget::fetch_together_thread_rollout;
 use crate::chatwidget::listen_to_together_session;
 use crate::chatwidget::plan_together_context_handoff;
 use crate::chatwidget::search_together_context;
@@ -87,7 +88,6 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::FinalOutput;
-#[cfg(test)]
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::ListSkillsResponseEvent;
 use codex_protocol::protocol::Op;
@@ -921,15 +921,25 @@ impl App {
         }
         self.apply_runtime_policy_overrides(&mut handoff_config);
 
+        let history = match fetch_together_thread_rollout(notification.thread_id.clone()).await {
+            Ok(history) => history,
+            Err(err) => {
+                self.chat_widget.add_error_message(format!(
+                    "Failed to load assigned handoff thread {} from the collaboration host: {err}",
+                    notification.thread_id
+                ));
+                return;
+            }
+        };
         let loading_prompt = assigned_handoff_loading_prompt(notification.goal.as_deref());
-        let rollout_path = PathBuf::from(&notification.rollout_path);
 
         match self
             .server
-            .resume_thread_from_rollout(
+            .resume_thread_with_history(
                 handoff_config.clone(),
-                rollout_path,
+                InitialHistory::Forked(history),
                 self.auth_manager.clone(),
+                false,
             )
             .await
         {
@@ -1023,6 +1033,7 @@ impl App {
                 "  The current client stayed on the source thread while the recipient was notified."
                     .dim(),
             ));
+            self.chat_widget.dismiss_together_context_view();
             self.chat_widget.add_plain_history_lines(lines);
             return;
         }
@@ -4451,28 +4462,28 @@ mod tests {
     #[test]
     fn assigned_handoff_loading_prompt_snapshot() {
         assert_snapshot!(
-                                    assigned_handoff_loading_prompt(Some("Fix Together handoff delivery")),
-                                    @r"
+                                            assigned_handoff_loading_prompt(Some("Fix Together handoff delivery")),
+                                            @r"
 Continue the assigned handoff.
 
 Goal: Fix Together handoff delivery
 
 This addressed handoff thread is already open. Review /context, then continue the task.
 "
-                                );
+                                        );
     }
 
     #[test]
     fn assigned_handoff_status_lines_snapshot() {
         let notification = sample_assigned_handoff_notification();
         assert_snapshot!(
-                                    lines_to_string(&assigned_handoff_status_lines(
-                                        &notification,
-                                        Some(
-                                            "Sender cwd /repo/feature is not available locally; using current cwd /Users/test/project."
-                                        )
-                                    )),
-                                    @r"
+                                            lines_to_string(&assigned_handoff_status_lines(
+                                                &notification,
+                                                Some(
+                                                    "Sender cwd /repo/feature is not available locally; using current cwd /Users/test/project."
+                                                )
+                                            )),
+                                            @r"
 • Handoff received
   From: alice@example.com
   Thread: thread_target
@@ -4483,7 +4494,7 @@ This addressed handoff thread is already open. Review /context, then continue th
   Note: Sender cwd /repo/feature is not available locally; using current cwd /Users/test/project.
   A loading prompt has been prepared in the composer.
 "
-                                );
+                                        );
     }
 
     #[test]

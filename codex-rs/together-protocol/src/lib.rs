@@ -1,4 +1,5 @@
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SandboxPolicy;
 use serde::Deserialize;
 use serde::Serialize;
@@ -29,6 +30,7 @@ pub const METHOD_MEMORY_PROMOTE: &str = "memory/promote";
 pub const METHOD_THREAD_START: &str = "thread/start";
 pub const METHOD_THREAD_APPEND_ITEMS: &str = "thread/appendItems";
 pub const METHOD_THREAD_READ: &str = "thread/read";
+pub const METHOD_THREAD_READ_ROLLOUT: &str = "thread/readRollout";
 pub const METHOD_THREAD_LIST: &str = "thread/list";
 
 pub const NOTIFY_HOST_STOPPED: &str = "host/stopped";
@@ -696,6 +698,12 @@ pub struct ThreadReadParams {
 #[serde(rename_all = "camelCase")]
 pub struct ThreadReadResponse {
     pub thread: ThreadSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadReadRolloutResponse {
+    pub history: Vec<RolloutItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

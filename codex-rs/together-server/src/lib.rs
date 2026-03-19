@@ -88,6 +88,7 @@ use codex_together_protocol::ContextWriteCommitResponse;
 use codex_together_protocol::ContextWriteFilePlan;
 use codex_together_protocol::ContextWritePlanParams;
 use codex_together_protocol::ContextWritePlanResponse;
+use codex_together_protocol::HandoffAssignedNotification;
 use codex_together_protocol::HandoffCommitParams;
 use codex_together_protocol::HandoffCommitResponse;
 use codex_together_protocol::HandoffPlanParams;
@@ -118,12 +119,14 @@ use codex_together_protocol::METHOD_THREAD_READ;
 use codex_together_protocol::METHOD_TOGETHER_AUTH;
 use codex_together_protocol::MemoryPromoteParams;
 use codex_together_protocol::MemoryPromoteResponse;
+use codex_together_protocol::NOTIFY_HANDOFF_ASSIGNED;
 use codex_together_protocol::NOTIFY_HOST_STOPPED;
 use codex_together_protocol::ThreadListParams;
 use codex_together_protocol::ThreadListResponse;
 use codex_together_protocol::ThreadReadParams;
 use codex_together_protocol::ThreadReadResponse;
 use codex_together_protocol::ThreadSummary;
+use codex_together_protocol::TogetherActorKind;
 use codex_together_protocol::TogetherAuthRequest;
 use codex_together_protocol::TogetherAuthResponse;
 use codex_together_protocol::TogetherJoinRequest;
@@ -185,6 +188,10 @@ struct ServerState {
 struct ConnectionEntry {
     tx: mpsc::UnboundedSender<String>,
     email: Option<String>,
+    display_name: Option<String>,
+    actor_kind: TogetherActorKind,
+    agent_role: Option<String>,
+    advertise_session: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -202,7 +209,7 @@ struct ThreadContextMount {
     precursor_kind: ContextPrecursorKind,
     goal: Option<String>,
     seed_ref_ids: Vec<String>,
-    actor_id: Option<String>,
+    target_actor_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -338,6 +345,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             ConnectionEntry {
                 tx,
                 email: Some(actor_id.clone()),
+                display_name: None,
+                actor_kind: TogetherActorKind::Human,
+                agent_role: None,
+                advertise_session: false,
             },
         );
     }
@@ -442,7 +453,7 @@ async fn handle_request(
         METHOD_THREAD_READ => thread_read(state, ctx, req).await,
         METHOD_THREAD_LIST => thread_list(state, ctx, req).await,
         METHOD_HANDOFF_PLAN => handoff_plan(state, ctx, req).await,
-        METHOD_HANDOFF_COMMIT => handoff_commit(state, req).await,
+        METHOD_HANDOFF_COMMIT => handoff_commit(state, connection_id, ctx, req).await,
         METHOD_CONTEXT_WRITE_PLAN => context_write_plan(state, ctx, req).await,
         METHOD_CONTEXT_WRITE_COMMIT => context_write_commit(state, req).await,
         _ => rpc_error(req.id, -32601, "method not found"),
@@ -463,9 +474,25 @@ async fn together_auth(
     let canonical_email = non_empty_string(payload.email)
         .or_else(|| ctx.email.clone())
         .unwrap_or_else(|| default_actor_id(connection_id));
+    let display_name = payload.display_name.and_then(non_empty_string);
+    let agent_role = payload.agent_role.and_then(non_empty_string);
+    let actor_kind = payload.actor_kind.unwrap_or(if agent_role.is_some() {
+        TogetherActorKind::Agent
+    } else {
+        TogetherActorKind::Human
+    });
 
     ctx.email = Some(canonical_email.clone());
-    set_connection_email(state, connection_id, Some(canonical_email.clone())).await;
+    set_connection_identity(
+        state,
+        connection_id,
+        Some(canonical_email.clone()),
+        display_name,
+        actor_kind,
+        agent_role,
+        payload.advertise_session,
+    )
+    .await;
 
     let guard = state.inner.lock().await;
     let (server_id, owner_email, role) = if let Some(hosted) = &guard.hosted {
@@ -482,6 +509,7 @@ async fn together_auth(
     JsonRpcResponse::ok(
         req.id,
         TogetherAuthResponse {
+            connection_id: connection_id.to_string(),
             role,
             server_id,
             owner_email,
@@ -668,18 +696,7 @@ async fn together_server_info(
         }
     };
 
-    let mut connected_members = Vec::with_capacity(hosted.members.len());
-    for member in &hosted.members {
-        connected_members.push(ConnectedMember {
-            email: member.clone(),
-            role: if member == &hosted.owner_email {
-                TogetherRole::Owner
-            } else {
-                TogetherRole::Member
-            },
-        });
-    }
-    connected_members.sort_by(|a, b| a.email.cmp(&b.email));
+    let connected_members = connected_members(hosted, &guard.connections);
     let commit = together_build_commit().await;
 
     JsonRpcResponse::ok(
@@ -1204,11 +1221,33 @@ async fn handoff_plan(
     .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
 }
 
-async fn handoff_commit(state: &AppState, req: JsonRpcRequest) -> JsonRpcResponse {
+async fn handoff_commit(
+    state: &AppState,
+    connection_id: Uuid,
+    ctx: &ConnectionContext,
+    req: JsonRpcRequest,
+) -> JsonRpcResponse {
     let payload: HandoffCommitParams = match serde_json::from_value(req.params) {
         Ok(p) => p,
         Err(_) => return rpc_error(req.id, -32602, "invalid params"),
     };
+    let source_actor_id = ctx
+        .email
+        .clone()
+        .unwrap_or_else(|| "guest@local".to_string());
+    let target_connection_id = payload
+        .target_connection_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|connection_id| !connection_id.is_empty())
+        .map(ToOwned::to_owned);
+    if payload.target_connection_id.is_some() && target_connection_id.is_none() {
+        return rpc_error(
+            req.id.clone(),
+            -32602,
+            "handoff target must be a currently connected session",
+        );
+    }
 
     let pending = {
         let guard = state.inner.lock().await;
@@ -1217,6 +1256,51 @@ async fn handoff_commit(state: &AppState, req: JsonRpcRequest) -> JsonRpcRespons
             None => return rpc_error(req.id, -32602, "unknown handoff plan"),
         }
     };
+    let mut target_actor_id = None;
+    if let Some(target_connection_id) = target_connection_id.as_deref() {
+        let target_connection_uuid = match Uuid::parse_str(target_connection_id) {
+            Ok(connection_uuid) => connection_uuid,
+            Err(_) => {
+                return rpc_error(
+                    req.id.clone(),
+                    -32602,
+                    "handoff target must be a currently connected session",
+                );
+            }
+        };
+        let guard = state.inner.lock().await;
+        let Some(hosted) = guard.hosted.as_ref() else {
+            return rpc_error(
+                req.id.clone(),
+                RPC_ERR_NOT_CONNECTED,
+                "TOGETHER_NOT_CONNECTED",
+            );
+        };
+        let Some(target_entry) = guard.connections.get(&target_connection_uuid) else {
+            return rpc_error(
+                req.id.clone(),
+                -32602,
+                "handoff target must be a currently connected session",
+            );
+        };
+        let Some(target_email) = target_entry.email.as_deref() else {
+            return rpc_error(
+                req.id.clone(),
+                -32602,
+                "handoff target must be a currently connected session",
+            );
+        };
+        if !target_entry.advertise_session || member_role(hosted, target_email).is_none() {
+            return rpc_error(
+                req.id.clone(),
+                -32602,
+                "handoff target must be a currently connected session",
+            );
+        }
+        if target_connection_uuid != connection_id {
+            target_actor_id = Some(target_email.to_string());
+        }
+    }
 
     let mut bridge = state.app_server.lock().await;
     let cwd = match payload.cwd {
@@ -1250,6 +1334,20 @@ async fn handoff_commit(state: &AppState, req: JsonRpcRequest) -> JsonRpcRespons
         Ok(response) => response,
         Err(err) => return app_server_error_response(req.id, err),
     };
+    let remote_rollout_path = if target_actor_id.is_some() {
+        match started.thread.path.as_ref() {
+            Some(path) => Some(path.display().to_string()),
+            None => {
+                return rpc_error(
+                    req.id,
+                    -32603,
+                    "remote handoff rollout was not materialized",
+                );
+            }
+        }
+    } else {
+        None
+    };
 
     {
         let mut guard = state.inner.lock().await;
@@ -1260,9 +1358,31 @@ async fn handoff_commit(state: &AppState, req: JsonRpcRequest) -> JsonRpcRespons
                 precursor_kind: ContextPrecursorKind::Handoff,
                 goal: pending.goal.clone(),
                 seed_ref_ids: pending.selected_ref_ids.clone(),
-                actor_id: pending.target_actor_id.clone(),
+                target_actor_id: target_actor_id.clone(),
             },
         );
+        if let (Some(target_connection_id), Some(target_actor_id), Some(rollout_path)) = (
+            target_connection_id.as_deref(),
+            target_actor_id.as_deref(),
+            remote_rollout_path.as_deref(),
+        ) {
+            notify_connection(
+                &guard,
+                target_connection_id,
+                NOTIFY_HANDOFF_ASSIGNED,
+                serde_json::to_value(HandoffAssignedNotification {
+                    thread_id: started.thread.id.clone(),
+                    source_thread_id: pending.source_thread_id.clone(),
+                    source_actor_id: source_actor_id.clone(),
+                    target_actor_id: target_actor_id.to_string(),
+                    target_connection_id: target_connection_id.to_string(),
+                    goal: pending.goal.clone(),
+                    cwd: Some(started.cwd.display().to_string()),
+                    rollout_path: rollout_path.to_string(),
+                })
+                .unwrap_or(Value::Null),
+            );
+        }
         guard.handoff_plans.remove(&payload.plan_id);
     }
     if let Some(rollout_path) = started.thread.path.as_deref() {
@@ -1291,6 +1411,8 @@ async fn handoff_commit(state: &AppState, req: JsonRpcRequest) -> JsonRpcRespons
         HandoffCommitResponse {
             thread_id: started.thread.id.clone(),
             source_thread_id: pending.source_thread_id,
+            target_actor_id,
+            target_connection_id,
             rollout_path: started
                 .thread
                 .path
@@ -1388,7 +1510,16 @@ async fn together_leave(
     };
 
     ctx.email = None;
-    set_connection_email(state, connection_id, None).await;
+    set_connection_identity(
+        state,
+        connection_id,
+        None,
+        None,
+        TogetherActorKind::Human,
+        None,
+        false,
+    )
+    .await;
 
     JsonRpcResponse::ok(req.id, TogetherLeaveResponse { left: true })
         .unwrap_or_else(|_| rpc_error(Value::Null, -32603, "serialization failed"))
@@ -1409,10 +1540,59 @@ fn default_actor_id(connection_id: Uuid) -> String {
     format!("anon+{}@local", &short[..12])
 }
 
-async fn set_connection_email(state: &AppState, connection_id: Uuid, email: Option<String>) {
+fn connected_members(
+    hosted: &HostedServer,
+    connections: &HashMap<Uuid, ConnectionEntry>,
+) -> Vec<ConnectedMember> {
+    let mut connected_members = connections
+        .iter()
+        .filter_map(|(connection_id, entry)| {
+            if !entry.advertise_session {
+                return None;
+            }
+            let email = entry.email.as_deref()?;
+            let role = member_role(hosted, email)?;
+            Some(ConnectedMember {
+                connection_id: connection_id.to_string(),
+                email: email.to_string(),
+                role,
+                display_name: entry.display_name.clone(),
+                actor_kind: entry.actor_kind,
+                agent_role: entry.agent_role.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    connected_members.sort_by(|left, right| {
+        (
+            !matches!(left.actor_kind, TogetherActorKind::Agent),
+            &left.email,
+            &left.connection_id,
+        )
+            .cmp(&(
+                !matches!(right.actor_kind, TogetherActorKind::Agent),
+                &right.email,
+                &right.connection_id,
+            ))
+    });
+    connected_members
+}
+
+async fn set_connection_identity(
+    state: &AppState,
+    connection_id: Uuid,
+    email: Option<String>,
+    display_name: Option<String>,
+    actor_kind: TogetherActorKind,
+    agent_role: Option<String>,
+    advertise_session: bool,
+) {
     let mut guard = state.inner.lock().await;
     if let Some(entry) = guard.connections.get_mut(&connection_id) {
         entry.email = email;
+        entry.display_name = display_name;
+        entry.actor_kind = actor_kind;
+        entry.agent_role = agent_role;
+        entry.advertise_session = advertise_session;
     }
 }
 
@@ -1489,6 +1669,23 @@ fn broadcast_notification(state: &ServerState, method: &str, params: Value) {
         for entry in state.connections.values() {
             let _ = entry.tx.send(text.clone());
         }
+    }
+}
+
+fn notify_connection(state: &ServerState, connection_id: &str, method: &str, params: Value) {
+    let Ok(connection_id) = Uuid::parse_str(connection_id) else {
+        return;
+    };
+    let note = JsonRpcNotification {
+        jsonrpc: "2.0".to_string(),
+        method: method.to_string(),
+        params,
+    };
+
+    if let Ok(text) = serde_json::to_string(&note)
+        && let Some(entry) = state.connections.get(&connection_id)
+    {
+        let _ = entry.tx.send(text);
     }
 }
 
@@ -3151,6 +3348,9 @@ fn apply_thread_context_mount_to_query_params(
     if effective_payload.goal.is_none() {
         effective_payload.goal = mount.goal.clone();
     }
+    if effective_payload.actor_id.is_none() {
+        effective_payload.actor_id = mount.target_actor_id.clone();
+    }
     let mut seen = effective_payload
         .seed_ref_ids
         .iter()
@@ -3171,11 +3371,12 @@ fn thread_summary_from_app_thread(
     thread_context_mount: Option<&ThreadContextMount>,
 ) -> ThreadSummary {
     let repo_root = get_git_repo_root(&thread.cwd).unwrap_or_else(|| thread.cwd.clone());
+    let actor_id = thread
+        .agent_nickname
+        .or_else(|| thread_context_mount.and_then(|mount| mount.target_actor_id.clone()));
     ThreadSummary {
         thread_id: thread.id,
-        actor_id: thread_context_mount
-            .and_then(|mount| mount.actor_id.clone())
-            .or(thread.agent_nickname),
+        actor_id,
         title: thread.name.and_then(non_empty_string),
         preview: non_empty_string(thread.preview),
         repo_root: Some(repo_root.display().to_string()),
@@ -4047,10 +4248,13 @@ fn is_pid_running(_pid: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::ConnectionEntry;
+    use super::HostedServer;
     use super::MemoryPromotePlan;
     use super::ThreadContextMount;
     use super::apply_thread_context_mount_to_query_params;
     use super::build_context_graph;
+    use super::connected_members;
     use super::context_focus_thread_ids_for_query;
     use super::context_graph_artifact_paths;
     use super::handoff_promotion_ref_ids;
@@ -4085,9 +4289,14 @@ mod tests {
     use codex_together_protocol::ContextQueryParams;
     use codex_together_protocol::ContextThreadNode;
     use codex_together_protocol::ThreadArtifactKind;
+    use codex_together_protocol::TogetherActorKind;
+    use codex_together_protocol::TogetherRole;
     use std::collections::HashMap;
+    use std::collections::HashSet;
     use std::path::Path;
     use std::path::PathBuf;
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
 
     #[test]
     fn repo_context_documents_parse_frontmatter_and_body() {
@@ -4696,16 +4905,36 @@ mod tests {
                 precursor_kind: ContextPrecursorKind::Handoff,
                 goal: Some("Investigate the mounted context.".to_string()),
                 seed_ref_ids: vec!["ctx:thread-insight:thread-1:plan-1".to_string()],
-                actor_id: None,
+                target_actor_id: Some("lobster-worker@local".to_string()),
             }),
         );
 
+        assert_eq!(summary.actor_id, Some("lobster-worker".to_string()));
         assert_eq!(
             summary.goal,
             Some("Investigate the mounted context.".to_string())
         );
         assert_eq!(summary.precursor_thread_id, Some("thread-1".to_string()));
         assert_eq!(summary.precursor_kind, Some(ContextPrecursorKind::Handoff));
+    }
+
+    #[test]
+    fn thread_summary_from_mount_target_actor_when_thread_has_no_agent_nickname() {
+        let mut thread = sample_thread("thread-3", Some("handoff target"), Some("main"));
+        thread.agent_nickname = None;
+
+        let summary = thread_summary_from_app_thread(
+            thread,
+            Some(&ThreadContextMount {
+                precursor_thread_id: "thread-2".to_string(),
+                precursor_kind: ContextPrecursorKind::Handoff,
+                goal: Some("Continue the investigation.".to_string()),
+                seed_ref_ids: vec!["ctx:thread-insight:thread-2:plan-1".to_string()],
+                target_actor_id: Some("review-bot@local".to_string()),
+            }),
+        );
+
+        assert_eq!(summary.actor_id, Some("review-bot@local".to_string()));
     }
 
     #[test]
@@ -4734,7 +4963,7 @@ mod tests {
                         "ctx:thread-insight:thread-prev:plan-1".to_string(),
                         "ctx:thread-insight:thread-current:plan-1".to_string(),
                     ],
-                    actor_id: None,
+                    target_actor_id: Some("review-bot@local".to_string()),
                 },
             )]),
             None,
@@ -4746,7 +4975,7 @@ mod tests {
                 current_thread_id: Some("thread-current".to_string()),
                 precursor_thread_id: Some("thread-prev".to_string()),
                 precursor_kind: Some(ContextPrecursorKind::Handoff),
-                actor_id: None,
+                actor_id: Some("review-bot@local".to_string()),
                 repo_root: None,
                 git_branch: None,
                 goal: Some("Follow up on the previous thread.".to_string()),
@@ -4758,6 +4987,76 @@ mod tests {
                 limit: None,
             }
         );
+    }
+
+    #[test]
+    fn connected_members_only_include_live_connections_with_actor_metadata() {
+        let hosted = HostedServer {
+            server_id: "srv_123".to_string(),
+            owner_email: "owner@local".to_string(),
+            public_base_url: "https://example.ngrok-free.app".to_string(),
+            members: HashSet::from([
+                "owner@local".to_string(),
+                "lobster-worker@local".to_string(),
+                "offline-agent@local".to_string(),
+            ]),
+        };
+        let (owner_tx, _owner_rx) = mpsc::unbounded_channel();
+        let (agent_tx, _agent_rx) = mpsc::unbounded_channel();
+        let (transient_tx, _transient_rx) = mpsc::unbounded_channel();
+        let connections = HashMap::from([
+            (
+                Uuid::nil(),
+                ConnectionEntry {
+                    tx: owner_tx,
+                    email: Some("owner@local".to_string()),
+                    display_name: Some("Owner".to_string()),
+                    actor_kind: TogetherActorKind::Human,
+                    agent_role: None,
+                    advertise_session: true,
+                },
+            ),
+            (
+                Uuid::from_u128(1),
+                ConnectionEntry {
+                    tx: agent_tx,
+                    email: Some("lobster-worker@local".to_string()),
+                    display_name: Some("Lobster Worker".to_string()),
+                    actor_kind: TogetherActorKind::Agent,
+                    agent_role: Some("research".to_string()),
+                    advertise_session: true,
+                },
+            ),
+            (
+                Uuid::from_u128(2),
+                ConnectionEntry {
+                    tx: transient_tx,
+                    email: Some("lobster-worker@local".to_string()),
+                    display_name: Some("Transient worker".to_string()),
+                    actor_kind: TogetherActorKind::Agent,
+                    agent_role: Some("research".to_string()),
+                    advertise_session: false,
+                },
+            ),
+        ]);
+
+        let connected = connected_members(&hosted, &connections);
+
+        assert_eq!(connected.len(), 2);
+        assert_eq!(connected[0].connection_id, Uuid::from_u128(1).to_string());
+        assert_eq!(connected[0].email, "lobster-worker@local".to_string());
+        assert_eq!(
+            connected[0].display_name,
+            Some("Lobster Worker".to_string())
+        );
+        assert_eq!(connected[0].actor_kind, TogetherActorKind::Agent);
+        assert_eq!(connected[0].agent_role, Some("research".to_string()));
+        assert_eq!(connected[0].role, TogetherRole::Member);
+        assert_eq!(connected[1].connection_id, Uuid::nil().to_string());
+        assert_eq!(connected[1].email, "owner@local".to_string());
+        assert_eq!(connected[1].display_name, Some("Owner".to_string()));
+        assert_eq!(connected[1].actor_kind, TogetherActorKind::Human);
+        assert_eq!(connected[1].role, TogetherRole::Owner);
     }
 
     #[test]

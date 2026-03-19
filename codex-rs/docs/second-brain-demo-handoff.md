@@ -39,6 +39,9 @@ These are the decisions the next thread should treat as settled unless the user 
 - Threads are shared by default.
 - Active agents are advertised by default.
 - Only currently connected agents should be advertised for now.
+- `/handoff` should surface the live connected-agent list with enough metadata to route confidently:
+  actor id, display label, and agent role when available.
+- remote `/handoff` should target one live connected session and auto-open the addressed handoff thread on that recipient.
 - Agents should have broad autonomy, including real git commits.
 - Explicit exception: agents should not be allowed to delete the repo or remove people.
 - Friction should be minimized aggressively.

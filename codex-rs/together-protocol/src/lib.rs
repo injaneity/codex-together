@@ -1,4 +1,5 @@
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SandboxPolicy;
 use serde::Deserialize;
 use serde::Serialize;
@@ -29,9 +30,11 @@ pub const METHOD_MEMORY_PROMOTE: &str = "memory/promote";
 pub const METHOD_THREAD_START: &str = "thread/start";
 pub const METHOD_THREAD_APPEND_ITEMS: &str = "thread/appendItems";
 pub const METHOD_THREAD_READ: &str = "thread/read";
+pub const METHOD_THREAD_READ_ROLLOUT: &str = "thread/readRollout";
 pub const METHOD_THREAD_LIST: &str = "thread/list";
 
 pub const NOTIFY_HOST_STOPPED: &str = "host/stopped";
+pub const NOTIFY_HANDOFF_ASSIGNED: &str = "handoff/assigned";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
@@ -106,15 +109,32 @@ pub enum TogetherClientMode {
     Member,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TogetherActorKind {
+    #[default]
+    Human,
+    Agent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TogetherAuthRequest {
     pub email: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub actor_kind: Option<TogetherActorKind>,
+    #[serde(default)]
+    pub agent_role: Option<String>,
+    #[serde(default)]
+    pub advertise_session: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TogetherAuthResponse {
+    pub connection_id: String,
     pub role: TogetherRole,
     pub server_id: String,
     pub owner_email: String,
@@ -144,11 +164,18 @@ pub struct HostStopResponse {
     pub stopped: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectedMember {
+    pub connection_id: String,
     pub email: String,
     pub role: TogetherRole,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub actor_kind: TogetherActorKind,
+    #[serde(default)]
+    pub agent_role: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -552,6 +579,8 @@ pub struct HandoffPlanResponse {
 pub struct HandoffCommitParams {
     pub plan_id: String,
     #[serde(default)]
+    pub target_connection_id: Option<String>,
+    #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
@@ -567,8 +596,27 @@ pub struct HandoffCommitResponse {
     pub thread_id: String,
     pub source_thread_id: String,
     #[serde(default)]
+    pub target_actor_id: Option<String>,
+    #[serde(default)]
+    pub target_connection_id: Option<String>,
+    #[serde(default)]
     pub rollout_path: Option<String>,
     pub cwd: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffAssignedNotification {
+    pub thread_id: String,
+    pub source_thread_id: String,
+    pub source_actor_id: String,
+    pub target_actor_id: String,
+    pub target_connection_id: String,
+    #[serde(default)]
+    pub goal: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    pub rollout_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -650,6 +698,12 @@ pub struct ThreadReadParams {
 #[serde(rename_all = "camelCase")]
 pub struct ThreadReadResponse {
     pub thread: ThreadSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadReadRolloutResponse {
+    pub history: Vec<RolloutItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -815,6 +869,7 @@ impl TogetherError {
 
 #[cfg(test)]
 mod tests {
+    use super::ConnectedMember;
     use super::ContextEdgeType;
     use super::ContextMountReason;
     use super::ContextPrecursorKind;
@@ -824,6 +879,7 @@ mod tests {
     use super::ContextQueryResponse;
     use super::ContextRepoNode;
     use super::ContextThreadNode;
+    use super::HandoffAssignedNotification;
     use super::MemoryPromoteParams;
     use super::RepoMemoryKind;
     use super::ThreadAppendItem;
@@ -831,6 +887,9 @@ mod tests {
     use super::ThreadArtifactKind;
     use super::ThreadGraphQueryOperation;
     use super::ThreadGraphQueryScope;
+    use super::TogetherActorKind;
+    use super::TogetherAuthRequest;
+    use super::TogetherRole;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -946,5 +1005,61 @@ mod tests {
                 ]
             })
         );
+    }
+
+    #[test]
+    fn together_auth_request_round_trips_actor_metadata() {
+        let request = TogetherAuthRequest {
+            email: "lobster-worker@local".to_string(),
+            display_name: Some("Lobster Worker".to_string()),
+            actor_kind: Some(TogetherActorKind::Agent),
+            agent_role: Some("research".to_string()),
+            advertise_session: true,
+        };
+
+        let json = serde_json::to_string(&request).expect("serialize auth request");
+        let round_trip =
+            serde_json::from_str::<TogetherAuthRequest>(&json).expect("deserialize auth request");
+
+        assert_eq!(round_trip, request);
+    }
+
+    #[test]
+    fn connected_member_round_trips_live_actor_metadata() {
+        let member = ConnectedMember {
+            connection_id: "6d6ae1c6-5c40-4fe7-80e9-44f4f92cb865".to_string(),
+            email: "lobster-worker@local".to_string(),
+            role: TogetherRole::Member,
+            display_name: Some("Lobster Worker".to_string()),
+            actor_kind: TogetherActorKind::Agent,
+            agent_role: Some("research".to_string()),
+        };
+
+        let json = serde_json::to_string(&member).expect("serialize connected member");
+        let round_trip =
+            serde_json::from_str::<ConnectedMember>(&json).expect("deserialize connected member");
+
+        assert_eq!(round_trip, member);
+    }
+
+    #[test]
+    fn handoff_assigned_notification_round_trips_rollout_payload() {
+        let notification = HandoffAssignedNotification {
+            thread_id: "thread-2".to_string(),
+            source_thread_id: "thread-1".to_string(),
+            source_actor_id: "sender@local".to_string(),
+            target_actor_id: "recipient@local".to_string(),
+            target_connection_id: "6d6ae1c6-5c40-4fe7-80e9-44f4f92cb865".to_string(),
+            goal: Some("Continue the bug investigation.".to_string()),
+            cwd: Some("/tmp/repo".to_string()),
+            rollout_path: "/tmp/repo/.codex/sessions/thread-2.jsonl".to_string(),
+        };
+
+        let json =
+            serde_json::to_string(&notification).expect("serialize handoff assigned notification");
+        let round_trip = serde_json::from_str::<HandoffAssignedNotification>(&json)
+            .expect("deserialize handoff assigned notification");
+
+        assert_eq!(round_trip, notification);
     }
 }

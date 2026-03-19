@@ -19,6 +19,7 @@ use codex_protocol::protocol::RateLimitSnapshot;
 use codex_together_protocol::ContextQueryResponse;
 use codex_together_protocol::ContextResolveBundleResponse;
 use codex_together_protocol::ContextSearchResult;
+use codex_together_protocol::HandoffAssignedNotification;
 use codex_utils_approval_presets::ApprovalPreset;
 
 use crate::bottom_pane::ApprovalRequest;
@@ -415,6 +416,28 @@ pub(crate) enum AppEvent {
         args: String,
     },
 
+    /// Sync the long-lived Together listener to the current connection status.
+    SyncTogetherSession,
+
+    /// Long-lived Together listener connected and registered a targetable session.
+    TogetherSessionConnected {
+        endpoint: String,
+        connection_id: String,
+    },
+
+    /// Remote collaboration host stopped for the current Together session.
+    TogetherHostStopped {
+        endpoint: String,
+        server_id: String,
+        owner_email: String,
+    },
+
+    /// A remote collaborator assigned a handoff to this client.
+    TogetherHandoffAssigned {
+        endpoint: String,
+        notification: HandoffAssignedNotification,
+    },
+
     /// Async search request for `##` composer context attach.
     StartTogetherComposerContextSearch {
         query: String,
@@ -477,6 +500,14 @@ pub(crate) enum AppEvent {
     ToggleTogetherContextSelection {
         actual_idx: usize,
     },
+
+    /// Cycle the active handoff recipient in the collaboration picker.
+    CycleTogetherHandoffTarget {
+        reverse: bool,
+    },
+
+    /// Switch which pane owns keyboard navigation in the handoff picker.
+    ToggleTogetherHandoffPane,
 
     /// Plan and commit a fresh-thread handoff from the selected context rows.
     PlanTogetherContextHandoff {

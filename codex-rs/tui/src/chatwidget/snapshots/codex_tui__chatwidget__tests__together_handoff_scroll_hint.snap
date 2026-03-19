@@ -1,0 +1,18 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: terminal.backend()
+---
+"                                                                                                                        "
+"                                                                                                                        "
+"  Filter anchored context                                                       Handoff Targets                         "
+"    ⏣ [insight] Planning note 0                                                 › Self                                  "
+"    ⏣ [insight] Planning note 1                                                   self · weisintai@local · session 111  "
+"    ⏣ [insight] Planning note 2                                                                                         "
+"    ⏣ [insight] Planning note 3                                                                                         "
+"    ⏣ [insight] Planning note 4                                                                                         "
+"  › ⏣ [insight] Planning note 5                                                                                         "
+"    ⏣ [insight] Planning note 6                                                                                         "
+"    ⏣ [insight] Planning note 7                                                                                         "
+"                                                                                                                        "
+"  Target: Self · self · Host · session 11111111                                                                         "
+"  enter toggle | tab switch view | h handoff | esc close | ↓ 4 more below                  ◯ thread  ⏣ repo  * hotspot  "

@@ -53,8 +53,6 @@ use crate::version::CODEX_CLI_VERSION;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_backend_client::Client as BackendClient;
 use codex_chatgpt::connectors;
-use codex_core::LocalContextQueryInput;
-use codex_core::build_local_context_query;
 use codex_core::config::Config;
 use codex_core::config::Constrained;
 use codex_core::config::ConstraintResult;
@@ -124,6 +122,7 @@ use codex_protocol::protocol::PatchApplyBeginEvent;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
+use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SkillMetadata as ProtocolSkillMetadata;
 use codex_protocol::protocol::StreamErrorEvent;
 use codex_protocol::protocol::TerminalInteractionEvent;
@@ -223,6 +222,7 @@ use crate::bottom_pane::InputResult;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::MentionBinding;
 use crate::bottom_pane::QUIT_SHORTCUT_TIMEOUT;
+use crate::bottom_pane::ScrollHintMode;
 use crate::bottom_pane::SelectionAction;
 use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
@@ -296,8 +296,10 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_together_client::decode_invite;
 use codex_together_client::status_env_key;
+use codex_together_protocol::ConnectedMember;
 use codex_together_protocol::ContextMountReason;
 use codex_together_protocol::ContextQueryNode;
+use codex_together_protocol::ContextQueryParams;
 use codex_together_protocol::ContextQueryResponse;
 use codex_together_protocol::ContextRef;
 use codex_together_protocol::ContextResolveBundleParams;
@@ -305,13 +307,16 @@ use codex_together_protocol::ContextResolveBundleResponse;
 use codex_together_protocol::ContextSearchParams;
 use codex_together_protocol::ContextSearchResponse;
 use codex_together_protocol::ContextSearchResult;
+use codex_together_protocol::HandoffAssignedNotification;
 use codex_together_protocol::HandoffCommitParams;
 use codex_together_protocol::HandoffCommitResponse;
 use codex_together_protocol::HandoffPlanParams;
 use codex_together_protocol::HandoffPlanResponse;
 use codex_together_protocol::HostStopResponse;
+use codex_together_protocol::JsonRpcNotification as TogetherJsonRpcNotification;
 use codex_together_protocol::JsonRpcRequest as TogetherJsonRpcRequest;
 use codex_together_protocol::JsonRpcResponse as TogetherJsonRpcResponse;
+use codex_together_protocol::METHOD_CONTEXT_QUERY;
 use codex_together_protocol::METHOD_CONTEXT_RESOLVE_BUNDLE;
 use codex_together_protocol::METHOD_CONTEXT_SEARCH;
 use codex_together_protocol::METHOD_HANDOFF_COMMIT;
@@ -323,10 +328,13 @@ use codex_together_protocol::METHOD_INITIALIZE;
 use codex_together_protocol::METHOD_INITIALIZED;
 use codex_together_protocol::METHOD_SESSION_JOIN;
 use codex_together_protocol::METHOD_SESSION_LEAVE;
-use codex_together_protocol::METHOD_THREAD_LIST;
+use codex_together_protocol::METHOD_THREAD_READ_ROLLOUT;
 use codex_together_protocol::METHOD_TOGETHER_AUTH;
-use codex_together_protocol::ThreadListParams;
-use codex_together_protocol::ThreadListResponse;
+use codex_together_protocol::NOTIFY_HANDOFF_ASSIGNED;
+use codex_together_protocol::NOTIFY_HOST_STOPPED;
+use codex_together_protocol::ThreadReadParams;
+use codex_together_protocol::ThreadReadRolloutResponse;
+use codex_together_protocol::TogetherActorKind;
 use codex_together_protocol::TogetherAuthRequest;
 use codex_together_protocol::TogetherJoinRequest;
 use codex_together_protocol::TogetherJoinResponse;
@@ -355,6 +363,9 @@ const TOGETHER_DEFAULT_ENDPOINT_URL: &str = "ws://127.0.0.1:8788/ws";
 const TOGETHER_ENDPOINT_ENV_KEY: &str = "CODEX_TOGETHER_ENDPOINT";
 const TOGETHER_ENDPOINT_ALIASES_ENV_KEY: &str = "CODEX_TOGETHER_ENDPOINT_ALIASES";
 const TOGETHER_ACTOR_ENV_KEY: &str = "CODEX_TOGETHER_ACTOR";
+const TOGETHER_ACTOR_DISPLAY_NAME_ENV_KEY: &str = "CODEX_TOGETHER_ACTOR_DISPLAY_NAME";
+const TOGETHER_ACTOR_KIND_ENV_KEY: &str = "CODEX_TOGETHER_ACTOR_KIND";
+const TOGETHER_ACTOR_ROLE_ENV_KEY: &str = "CODEX_TOGETHER_ACTOR_ROLE";
 const NGROK_TUNNELS_API_URL: &str = "http://127.0.0.1:4040/api/tunnels";
 // Track information about an in-flight exec command.
 struct RunningCommand {
@@ -3823,24 +3834,9 @@ impl ChatWidget {
             SlashCommand::Exit => {
                 if let Some(cmd) = together_exit_command() {
                     let current_thread_id = self.thread_id.map(|id| id.to_string());
-                    let current_rollout_path = self.current_rollout_path.clone();
-                    let current_cwd = self
-                        .current_cwd
-                        .clone()
-                        .unwrap_or_else(|| self.config.cwd.clone());
-                    let codex_home = self.config.codex_home.clone();
-                    let current_selected_ref_ids = self.together_context_selected_ref_ids();
                     let tx = self.app_event_tx.clone();
                     tokio::spawn(async move {
-                        let _ = execute_together_command(
-                            cmd.to_string(),
-                            current_thread_id,
-                            current_rollout_path,
-                            current_cwd,
-                            codex_home,
-                            current_selected_ref_ids,
-                        )
-                        .await;
+                        let _ = execute_together_command(cmd.to_string(), current_thread_id).await;
                         tx.send(AppEvent::Exit(ExitMode::ShutdownFirst));
                     });
                 } else {
@@ -8334,8 +8330,9 @@ impl ChatWidget {
             selected_ref_ids: selection.selected_ref_ids,
             handoff_goal: selection.handoff_goal,
             handoff_loading_prompt: selection.handoff_loading_prompt,
-            target_actor_id: selection.target_actor_id,
-            target_display_name: selection.target_display_name,
+            handoff_targets: selection.handoff_targets,
+            selected_handoff_target_idx: selection.selected_handoff_target_idx,
+            focused_handoff_pane: selection.focused_handoff_pane,
         }));
         self.together_context_view_state = Some(Arc::clone(&state));
         let params = self.together_context_view_params(
@@ -8405,14 +8402,6 @@ impl ChatWidget {
             .collect()
     }
 
-    pub(crate) fn together_context_selected_ref_ids(&self) -> Vec<String> {
-        let Some(state) = self.together_context_view_state.as_ref() else {
-            return Vec::new();
-        };
-        let state = lock_together_context_view_state(state);
-        state.selected_ref_ids.iter().cloned().collect()
-    }
-
     pub(crate) fn together_context_handoff_goal(&self) -> Option<String> {
         let state = self.together_context_view_state.as_ref()?;
         let state = lock_together_context_view_state(state);
@@ -8425,10 +8414,57 @@ impl ChatWidget {
         state.handoff_loading_prompt.clone()
     }
 
-    pub(crate) fn together_context_handoff_target_actor_id(&self) -> Option<String> {
+    pub(crate) fn toggle_together_handoff_pane(&mut self) {
+        let Some(state) = self.together_context_view_state.as_ref() else {
+            return;
+        };
+        let mut state = lock_together_context_view_state(state);
+        if !matches!(state.mode, TogetherContextViewMode::Handoff)
+            || state.handoff_targets.is_empty()
+        {
+            return;
+        }
+        state.focused_handoff_pane = match state.focused_handoff_pane {
+            TogetherHandoffPane::Context => TogetherHandoffPane::Targets,
+            TogetherHandoffPane::Targets => TogetherHandoffPane::Context,
+        };
+        drop(state);
+        self.refresh_together_context_view();
+    }
+
+    pub(crate) fn cycle_together_handoff_target(&mut self, reverse: bool) {
+        let Some(state) = self.together_context_view_state.as_ref() else {
+            return;
+        };
+        let mut state = lock_together_context_view_state(state);
+        if state.handoff_targets.len() <= 1 {
+            return;
+        }
+        let len = state.handoff_targets.len();
+        state.selected_handoff_target_idx = if reverse {
+            (state.selected_handoff_target_idx + len - 1) % len
+        } else {
+            (state.selected_handoff_target_idx + 1) % len
+        };
+        drop(state);
+        self.refresh_together_context_view();
+    }
+
+    pub(crate) fn together_context_selected_handoff_target(&self) -> Option<TogetherHandoffTarget> {
         let state = self.together_context_view_state.as_ref()?;
         let state = lock_together_context_view_state(state);
-        state.target_actor_id.clone()
+        let idx = state
+            .selected_handoff_target_idx
+            .min(state.handoff_targets.len().saturating_sub(1));
+        state.handoff_targets.get(idx).cloned()
+    }
+
+    pub(crate) fn dismiss_together_context_view(&mut self) {
+        self.together_context_view_state = None;
+        let _ = self
+            .bottom_pane
+            .dismiss_view_if_active(TOGETHER_CONTEXT_SELECTION_VIEW_ID);
+        self.request_redraw();
     }
 
     pub(crate) fn together_context_selected_node_labels(&self) -> Vec<String> {
@@ -8528,23 +8564,35 @@ impl ChatWidget {
         state: Arc<Mutex<TogetherContextViewState>>,
         initial_selected_idx: Option<usize>,
     ) -> SelectionViewParams {
-        let (mode, selected_ref_ids, has_thread_context, handoff_goal) = {
+        let (
+            mode,
+            selected_ref_ids,
+            has_thread_context,
+            handoff_goal,
+            handoff_targets,
+            selected_handoff_target,
+            focused_handoff_pane,
+        ) = {
             let state = lock_together_context_view_state(&state);
+            let selected_handoff_target = state
+                .handoff_targets
+                .get(
+                    state
+                        .selected_handoff_target_idx
+                        .min(state.handoff_targets.len().saturating_sub(1)),
+                )
+                .cloned();
             (
                 state.mode,
                 state.selected_ref_ids.clone(),
                 state.query_response.anchor.current_thread_id.is_some(),
                 state.handoff_goal.clone(),
+                state.handoff_targets.clone(),
+                selected_handoff_target,
+                state.focused_handoff_pane,
             )
         };
-        let target_display_name = {
-            let state = lock_together_context_view_state(&state);
-            state.target_display_name.clone()
-        };
-        let header = together_context_header(mode, query, handoff_goal, target_display_name);
-        let footer_hint = Some(together_context_commands_line(mode));
-        let footer_right = Some(together_context_legend_line());
-        let show_preview = matches!(mode, TogetherContextViewMode::Handoff);
+        let header = together_context_header(mode, query, handoff_goal);
         let items = if rows.is_empty() {
             vec![together_context_empty_state_item(has_thread_context)]
         } else {
@@ -8580,10 +8628,14 @@ impl ChatWidget {
                     SelectionItem {
                         name: together_context_row_name(&row),
                         name_prefix_spans: together_context_graph_prefix_spans(
-                            &row, mode, is_marked, false,
+                            &row,
+                            false,
+                            matches!(focused_handoff_pane, TogetherHandoffPane::Context),
                         ),
                         selected_name_prefix_spans: together_context_graph_prefix_spans(
-                            &row, mode, is_marked, true,
+                            &row,
+                            true,
+                            matches!(focused_handoff_pane, TogetherHandoffPane::Context),
                         ),
                         category_tag: together_context_is_hotspot(&row.node)
                             .then_some("*".to_string()),
@@ -8609,37 +8661,121 @@ impl ChatWidget {
             view_id: Some(TOGETHER_CONTEXT_SELECTION_VIEW_ID),
             title: None,
             subtitle: None,
-            footer_note: None,
-            footer_hint,
-            footer_right,
+            footer_note: together_context_footer_hint(mode, selected_handoff_target.as_ref()),
+            footer_hint: Some(together_context_commands_line(mode, focused_handoff_pane)),
+            footer_right: Some(together_context_legend_line()),
             items,
-            is_searchable: false,
-            search_placeholder: None,
+            is_searchable: true,
+            search_placeholder: Some(together_context_search_placeholder().to_string()),
             col_width_mode: ColumnWidthMode::AutoAllRows,
             single_line_rows: true,
             show_entry_prefix: false,
             selected_row_style: Some(Style::default().bg(Color::DarkGray)),
-            show_selected_suffix_cursor: true,
+            show_selected_suffix_cursor: false,
+            scroll_hint_mode: ScrollHintMode::Counts,
             header: Box::new(header),
             initial_selected_idx,
-            side_content: if show_preview {
-                Box::new(TogetherContextPreviewRenderable {
-                    state: state.clone(),
-                })
-            } else {
-                Box::new(())
-            },
-            side_content_width: if show_preview {
+            side_content: Box::new(together_handoff_targets_sidebar(
+                mode,
+                &handoff_targets,
+                selected_handoff_target.as_ref(),
+                focused_handoff_pane,
+            )),
+            side_content_width: if matches!(mode, TogetherContextViewMode::Handoff)
+                && !handoff_targets.is_empty()
+            {
                 SideContentWidth::Fixed(38)
             } else {
                 SideContentWidth::Fixed(0)
             },
-            side_content_min_width: if show_preview { 30 } else { 0 },
-            stacked_side_content: show_preview.then(|| {
-                Box::new(TogetherContextPreviewRenderable {
-                    state: state.clone(),
-                }) as Box<dyn Renderable>
-            }),
+            side_content_min_width: if matches!(mode, TogetherContextViewMode::Handoff)
+                && !handoff_targets.is_empty()
+            {
+                32
+            } else {
+                0
+            },
+            stacked_side_content: Some(Box::new(together_handoff_targets_sidebar(
+                mode,
+                &handoff_targets,
+                selected_handoff_target.as_ref(),
+                focused_handoff_pane,
+            ))),
+            on_key_event: Some(Box::new({
+                let state = Arc::clone(&state);
+                move |key_event, _actual_idx, tx: &AppEventSender| {
+                    if !matches!(mode, TogetherContextViewMode::Handoff) {
+                        return false;
+                    }
+                    let state = lock_together_context_view_state(&state);
+                    let has_targets = !state.handoff_targets.is_empty();
+                    let focused_handoff_pane = state.focused_handoff_pane;
+                    drop(state);
+                    match key_event {
+                        KeyEvent {
+                            code: KeyCode::Tab,
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        }
+                        | KeyEvent {
+                            code: KeyCode::BackTab,
+                            ..
+                        } if has_targets => {
+                            tx.send(AppEvent::ToggleTogetherHandoffPane);
+                            true
+                        }
+                        KeyEvent {
+                            code: KeyCode::Left,
+                            ..
+                        } if has_targets
+                            && matches!(focused_handoff_pane, TogetherHandoffPane::Targets) =>
+                        {
+                            tx.send(AppEvent::ToggleTogetherHandoffPane);
+                            true
+                        }
+                        KeyEvent {
+                            code: KeyCode::Right,
+                            ..
+                        } if has_targets
+                            && matches!(focused_handoff_pane, TogetherHandoffPane::Context) =>
+                        {
+                            tx.send(AppEvent::ToggleTogetherHandoffPane);
+                            true
+                        }
+                        KeyEvent {
+                            code: KeyCode::Up, ..
+                        }
+                        | KeyEvent {
+                            code: KeyCode::Char('k'),
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } if matches!(focused_handoff_pane, TogetherHandoffPane::Targets) => {
+                            tx.send(AppEvent::CycleTogetherHandoffTarget { reverse: true });
+                            true
+                        }
+                        KeyEvent {
+                            code: KeyCode::Down,
+                            ..
+                        }
+                        | KeyEvent {
+                            code: KeyCode::Char('j'),
+                            modifiers: KeyModifiers::NONE,
+                            ..
+                        } if matches!(focused_handoff_pane, TogetherHandoffPane::Targets) => {
+                            tx.send(AppEvent::CycleTogetherHandoffTarget { reverse: false });
+                            true
+                        }
+                        KeyEvent {
+                            code: KeyCode::Enter,
+                            ..
+                        } if matches!(focused_handoff_pane, TogetherHandoffPane::Targets) => {
+                            tx.send(AppEvent::ToggleTogetherHandoffPane);
+                            true
+                        }
+                        _ => false,
+                    }
+                }
+            })),
             on_selection_changed: Some(Box::new(move |idx, _tx| {
                 if let Ok(mut state) = state.lock() {
                     state.selected_actual_idx = idx;
@@ -8669,26 +8805,11 @@ impl ChatWidget {
         }
 
         let current_thread_id = self.thread_id.map(|id| id.to_string());
-        let current_rollout_path = self.current_rollout_path.clone();
-        let current_cwd = self
-            .current_cwd
-            .clone()
-            .unwrap_or_else(|| self.config.cwd.clone());
-        let codex_home = self.config.codex_home.clone();
-        let current_selected_ref_ids = self.together_context_selected_ref_ids();
         let tx = self.app_event_tx.clone();
         tokio::spawn(async move {
-            match execute_together_command(
-                trimmed,
-                current_thread_id.clone(),
-                current_rollout_path,
-                current_cwd,
-                codex_home,
-                current_selected_ref_ids,
-            )
-            .await
-            {
+            match execute_together_command(trimmed, current_thread_id).await {
                 Ok(output) => {
+                    tx.send(AppEvent::SyncTogetherSession);
                     tx.send(AppEvent::InsertHistoryCell(Box::new(
                         history_cell::new_info_event(output.message, output.hint),
                     )));
@@ -8716,27 +8837,13 @@ impl ChatWidget {
                             TogetherCommandFollowUp::PrepareHandoffView {
                                 query_response,
                                 handoff_goal,
-                                target_actor_id,
-                                target_display_name,
                             } => {
                                 tx.send(AppEvent::PrepareTogetherHandoffView {
                                     query_response,
                                     handoff_goal,
-                                    target_actor_id,
-                                    target_display_name,
+                                    target_actor_id: None,
+                                    target_display_name: None,
                                 });
-                            }
-                            TogetherCommandFollowUp::OpenHandoffPrompt {
-                                target_actor_id,
-                                target_display_name,
-                            } => {
-                                tx.send(AppEvent::OpenTogetherHandoffPrompt {
-                                    target_actor_id,
-                                    target_display_name,
-                                });
-                            }
-                            TogetherCommandFollowUp::OpenHandoffTargetPicker { candidates } => {
-                                tx.send(AppEvent::OpenTogetherHandoffTargetPicker { candidates });
                             }
                         }
                     }
@@ -8874,15 +8981,6 @@ enum TogetherCommandFollowUp {
     PrepareHandoffView {
         query_response: ContextQueryResponse,
         handoff_goal: Option<String>,
-        target_actor_id: Option<String>,
-        target_display_name: Option<String>,
-    },
-    OpenHandoffPrompt {
-        target_actor_id: Option<String>,
-        target_display_name: Option<String>,
-    },
-    OpenHandoffTargetPicker {
-        candidates: Vec<TogetherHandoffTargetCandidate>,
     },
 }
 
@@ -8915,14 +9013,32 @@ pub(crate) enum TogetherContextViewMode {
     Handoff,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TogetherHandoffPane {
+    Context,
+    Targets,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TogetherHandoffTarget {
+    pub(crate) connection_id: String,
+    pub(crate) actor_id: String,
+    pub(crate) display_name: Option<String>,
+    pub(crate) actor_kind: TogetherActorKind,
+    pub(crate) agent_role: Option<String>,
+    pub(crate) membership_role: Option<TogetherRole>,
+    pub(crate) is_self: bool,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TogetherContextViewSelection {
     pub(crate) mode: TogetherContextViewMode,
     pub(crate) selected_ref_ids: HashSet<String>,
     pub(crate) handoff_goal: Option<String>,
     pub(crate) handoff_loading_prompt: Option<String>,
-    pub(crate) target_actor_id: Option<String>,
-    pub(crate) target_display_name: Option<String>,
+    pub(crate) handoff_targets: Vec<TogetherHandoffTarget>,
+    pub(crate) selected_handoff_target_idx: usize,
+    pub(crate) focused_handoff_pane: TogetherHandoffPane,
 }
 
 impl Default for TogetherContextViewSelection {
@@ -8932,8 +9048,9 @@ impl Default for TogetherContextViewSelection {
             selected_ref_ids: HashSet::new(),
             handoff_goal: None,
             handoff_loading_prompt: None,
-            target_actor_id: None,
-            target_display_name: None,
+            handoff_targets: Vec::new(),
+            selected_handoff_target_idx: 0,
+            focused_handoff_pane: TogetherHandoffPane::Context,
         }
     }
 }
@@ -8949,8 +9066,9 @@ struct TogetherContextViewState {
     selected_ref_ids: HashSet<String>,
     handoff_goal: Option<String>,
     handoff_loading_prompt: Option<String>,
-    target_actor_id: Option<String>,
-    target_display_name: Option<String>,
+    handoff_targets: Vec<TogetherHandoffTarget>,
+    selected_handoff_target_idx: usize,
+    focused_handoff_pane: TogetherHandoffPane,
 }
 
 impl Default for TogetherContextViewState {
@@ -8978,37 +9096,10 @@ impl Default for TogetherContextViewState {
             selected_ref_ids: HashSet::new(),
             handoff_goal: None,
             handoff_loading_prompt: None,
-            target_actor_id: None,
-            target_display_name: None,
+            handoff_targets: Vec::new(),
+            selected_handoff_target_idx: 0,
+            focused_handoff_pane: TogetherHandoffPane::Context,
         }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct TogetherContextPreviewRenderable {
-    state: Arc<Mutex<TogetherContextViewState>>,
-}
-
-impl Renderable for TogetherContextPreviewRenderable {
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        if area.is_empty() {
-            return;
-        }
-        let state = lock_together_context_view_state(&self.state).clone();
-        Paragraph::new(together_context_preview_lines(&state))
-            .wrap(Wrap { trim: false })
-            .render(area, buf);
-    }
-
-    fn desired_height(&self, width: u16) -> u16 {
-        if width == 0 {
-            return 0;
-        }
-        let state = lock_together_context_view_state(&self.state).clone();
-        Paragraph::new(together_context_preview_lines(&state))
-            .wrap(Wrap { trim: false })
-            .line_count(width)
-            .min(usize::from(u16::MAX)) as u16
     }
 }
 
@@ -9046,9 +9137,8 @@ fn lock_together_context_view_state(
 
 fn together_context_header(
     mode: TogetherContextViewMode,
-    _query: Option<String>,
+    query: Option<String>,
     handoff_goal: Option<String>,
-    target_display_name: Option<String>,
 ) -> ColumnRenderable<'static> {
     let mut header = ColumnRenderable::new();
     header.push(Line::from(match mode {
@@ -9062,20 +9152,49 @@ fn together_context_header(
     {
         header.push(Line::from(vec!["Goal: ".dim(), goal.to_string().into()]));
     }
-    if let Some(target_display_name) = target_display_name
+    if let Some(query) = query
         .as_deref()
         .map(str::trim)
-        .filter(|target_display_name| !target_display_name.is_empty())
-        && matches!(mode, TogetherContextViewMode::Handoff)
+        .filter(|query| !query.is_empty())
     {
-        header.push(Line::from(vec![
-            "Target: ".dim(),
-            target_display_name.to_string().into(),
-        ]));
+        header.push(Line::from(format!("Filter: {query}").dim()));
     }
     header
 }
 
+fn together_context_footer_hint(
+    mode: TogetherContextViewMode,
+    target: Option<&TogetherHandoffTarget>,
+) -> Option<Line<'static>> {
+    if !matches!(mode, TogetherContextViewMode::Handoff) {
+        return None;
+    }
+    let target = target?;
+    let mut spans = vec!["Target: ".dim()];
+    spans.push(together_handoff_target_title(target).cyan().bold());
+    spans.push(" · ".dim());
+    spans.push(together_handoff_target_kind_label(target).dim());
+    if let Some(agent_role) = target
+        .agent_role
+        .as_deref()
+        .map(str::trim)
+        .filter(|agent_role| !agent_role.is_empty())
+    {
+        spans.push(" · ".dim());
+        spans.push(agent_role.to_string().dim());
+    }
+    if let Some(role) = target.membership_role {
+        spans.push(" · ".dim());
+        spans.push(together_role_label(role).dim());
+    }
+    spans.push(" · ".dim());
+    spans.push(together_handoff_target_session_label(target).dim());
+    Some(Line::from(spans))
+}
+
+fn together_context_search_placeholder() -> &'static str {
+    "Filter anchored context"
+}
 fn together_context_empty_state_item(has_thread_context: bool) -> SelectionItem {
     let (name, description) = if has_thread_context {
         (
@@ -9099,24 +9218,38 @@ fn together_context_empty_state_item(has_thread_context: bool) -> SelectionItem 
     }
 }
 
-fn together_context_commands_line(mode: TogetherContextViewMode) -> Line<'static> {
+fn together_context_commands_line(
+    mode: TogetherContextViewMode,
+    focused_handoff_pane: TogetherHandoffPane,
+) -> Line<'static> {
     let mut spans = Vec::new();
     if matches!(mode, TogetherContextViewMode::Handoff) {
-        spans.extend([
-            "enter".cyan(),
-            " select".dim(),
-            " | ".dim(),
-            "h".cyan(),
-            " handoff".dim(),
-            " | ".dim(),
-        ]);
+        match focused_handoff_pane {
+            TogetherHandoffPane::Context => spans.extend([
+                "enter".cyan(),
+                " toggle".dim(),
+                " | ".dim(),
+                "tab".cyan(),
+                " switch view".dim(),
+                " | ".dim(),
+            ]),
+            TogetherHandoffPane::Targets => spans.extend([
+                "↑↓".cyan(),
+                " target".dim(),
+                " | ".dim(),
+                "tab".cyan(),
+                " switch view".dim(),
+                " | ".dim(),
+            ]),
+        }
+        spans.extend(["h".cyan(), " handoff".dim(), " | ".dim()]);
     }
     spans.extend(["esc".cyan(), " close".dim()]);
     Line::from(spans)
 }
 
 fn together_context_legend_line() -> Line<'static> {
-    Line::from(vec![
+    let spans = vec![
         "◯".dim(),
         " thread".dim(),
         "  ".into(),
@@ -9125,45 +9258,96 @@ fn together_context_legend_line() -> Line<'static> {
         "  ".into(),
         "*".red(),
         " hotspot".dim(),
-    ])
+    ];
+    Line::from(spans)
 }
 
-fn together_context_preview_lines(state: &TogetherContextViewState) -> Vec<Line<'static>> {
-    let detail = state
-        .rows
-        .get(state.selected_actual_idx)
-        .map(|row| together_context_preview_text(row, &state.query_response.anchor))
-        .unwrap_or_else(|| "Move through the tree to inspect a node.".to_string());
-    vec![
-        Line::from("Details".bold()),
-        Line::default(),
-        Line::from(detail),
-    ]
-}
-
-fn together_context_preview_text(
-    row: &TogetherContextTreeRow,
-    anchor: &codex_together_protocol::ContextQueryAnchor,
-) -> String {
-    const MAX_PREVIEW_CHARS: usize = 180;
-
-    let detail = match &row.node {
-        ContextQueryNode::Thread(node) => node.body.as_deref().or(node.summary.as_deref()),
-        ContextQueryNode::Repo(node) => node.summary.as_deref(),
+fn together_handoff_targets_sidebar(
+    mode: TogetherContextViewMode,
+    targets: &[TogetherHandoffTarget],
+    selected_target: Option<&TogetherHandoffTarget>,
+    focused_handoff_pane: TogetherHandoffPane,
+) -> ColumnRenderable<'static> {
+    if !matches!(mode, TogetherContextViewMode::Handoff) || targets.is_empty() {
+        return ColumnRenderable::new();
     }
-    .map(str::trim)
-    .filter(|detail| !detail.is_empty())
-    .map(ToOwned::to_owned)
-    .or_else(|| together_context_row_description(row, anchor))
-    .or_else(|| {
-        together_context_node_location(&row.node)
-            .map(str::trim)
-            .filter(|location| !location.is_empty())
-            .map(ToOwned::to_owned)
-    })
-    .unwrap_or_else(|| together_context_display_name(row));
 
-    together_context_inline_excerpt(detail.as_str(), MAX_PREVIEW_CHARS)
+    let mut sidebar = ColumnRenderable::new();
+    sidebar.push(Line::from("Handoff Targets".bold()));
+    for target in targets {
+        let is_selected = selected_target
+            .map(|selected| selected.connection_id == target.connection_id)
+            .unwrap_or(false);
+        sidebar.push(Line::from(vec![
+            if is_selected {
+                if matches!(focused_handoff_pane, TogetherHandoffPane::Targets) {
+                    "› ".cyan()
+                } else {
+                    "› ".dim()
+                }
+            } else {
+                "  ".into()
+            },
+            if is_selected {
+                if matches!(focused_handoff_pane, TogetherHandoffPane::Targets) {
+                    together_handoff_target_title(target).cyan().bold()
+                } else {
+                    together_handoff_target_title(target).bold()
+                }
+            } else {
+                together_handoff_target_title(target).into()
+            },
+        ]));
+        let mut metadata = vec![
+            "  ".into(),
+            together_handoff_target_kind_label(target).dim(),
+        ];
+        if let Some(role) = target
+            .agent_role
+            .as_deref()
+            .map(str::trim)
+            .filter(|agent_role| !agent_role.is_empty())
+        {
+            metadata.push(" · ".dim());
+            metadata.push(role.to_string().dim());
+        }
+        metadata.push(" · ".dim());
+        metadata.push(target.actor_id.clone().dim());
+        metadata.push(" · ".dim());
+        metadata.push(together_handoff_target_session_label(target).dim());
+        sidebar.push(Line::from(metadata));
+    }
+    sidebar
+}
+
+fn together_handoff_target_title(target: &TogetherHandoffTarget) -> String {
+    target
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|display_name| !display_name.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| target.actor_id.clone())
+}
+
+fn together_handoff_target_kind_label(target: &TogetherHandoffTarget) -> String {
+    if target.is_self {
+        return "self".to_string();
+    }
+    match target.actor_kind {
+        TogetherActorKind::Human => "human".to_string(),
+        TogetherActorKind::Agent => "agent".to_string(),
+    }
+}
+
+fn together_handoff_target_session_label(target: &TogetherHandoffTarget) -> String {
+    let short = target
+        .connection_id
+        .split('-')
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(target.connection_id.as_str());
+    format!("session {short}")
 }
 
 fn together_context_rows_for_scope(
@@ -9379,9 +9563,8 @@ fn together_context_collect_tree_rows(
 
 fn together_context_graph_prefix_spans(
     row: &TogetherContextTreeRow,
-    _mode: TogetherContextViewMode,
-    is_marked: bool,
-    is_hovered: bool,
+    is_selected: bool,
+    is_active: bool,
 ) -> Vec<Span<'static>> {
     let tree_style = together_context_tree_style(&row.node);
     let mut spans = Vec::new();
@@ -9400,7 +9583,8 @@ fn together_context_graph_prefix_spans(
         });
     }
     spans.extend(together_context_selection_prefix_spans(
-        is_marked, is_hovered,
+        is_selected,
+        is_active,
     ));
     spans.push(Span::styled(
         format!("{} ", together_context_marker_text(&row.node)),
@@ -9529,10 +9713,18 @@ fn together_context_tree_style(node: &ContextQueryNode) -> Style {
 }
 
 fn together_context_selection_prefix_spans(
-    _is_marked: bool,
-    _is_hovered: bool,
+    is_selected: bool,
+    is_active: bool,
 ) -> Vec<Span<'static>> {
-    Vec::new()
+    vec![if is_selected {
+        if is_active {
+            "› ".cyan()
+        } else {
+            "› ".dim()
+        }
+    } else {
+        "  ".into()
+    }]
 }
 
 fn together_context_tag(node: &ContextQueryNode) -> TogetherContextTag {
@@ -9960,16 +10152,22 @@ impl TogetherRpcClient {
         Ok(())
     }
 
-    async fn authenticate(&mut self) -> anyhow::Result<()> {
-        let _: codex_together_protocol::TogetherAuthResponse = self
-            .call(
-                METHOD_TOGETHER_AUTH,
-                TogetherAuthRequest {
-                    email: local_together_actor_id(),
-                },
-            )
-            .await?;
-        Ok(())
+    async fn authenticate(
+        &mut self,
+        advertise_session: bool,
+    ) -> anyhow::Result<codex_together_protocol::TogetherAuthResponse> {
+        let actor = local_together_actor_metadata();
+        self.call(
+            METHOD_TOGETHER_AUTH,
+            TogetherAuthRequest {
+                email: actor.actor_id,
+                display_name: actor.display_name,
+                actor_kind: Some(actor.actor_kind),
+                agent_role: actor.agent_role,
+                advertise_session,
+            },
+        )
+        .await
     }
 
     async fn notify(&mut self, method: &str, params: Value) -> anyhow::Result<()> {
@@ -10063,15 +10261,51 @@ impl TogetherRpcClient {
             }
         }
     }
+
+    async fn next_notification(&mut self) -> anyhow::Result<TogetherJsonRpcNotification> {
+        loop {
+            let Some(message) = self.reader.next().await else {
+                anyhow::bail!("together server closed websocket connection");
+            };
+            let message = message.map_err(|err| {
+                anyhow::anyhow!("failed to read together websocket message: {err}")
+            })?;
+            match message {
+                WebSocketMessage::Text(text) => {
+                    let value: Value = serde_json::from_str(text.as_str()).map_err(|err| {
+                        anyhow::anyhow!("invalid together JSON-RPC payload: {err}")
+                    })?;
+                    if value.get("id").is_some() {
+                        continue;
+                    }
+                    return serde_json::from_value(value).map_err(|err| {
+                        anyhow::anyhow!("invalid together JSON-RPC notification: {err}")
+                    });
+                }
+                WebSocketMessage::Ping(payload) => {
+                    self.writer
+                        .send(WebSocketMessage::Pong(payload))
+                        .await
+                        .map_err(|err| {
+                            anyhow::anyhow!(
+                                "failed to reply to together websocket ping message: {err}"
+                            )
+                        })?;
+                }
+                WebSocketMessage::Pong(_) => {}
+                WebSocketMessage::Close(_) => {
+                    anyhow::bail!("together websocket connection closed");
+                }
+                WebSocketMessage::Binary(_) => {}
+                _ => {}
+            }
+        }
+    }
 }
 
 async fn execute_together_command(
     args: String,
     current_thread_id: Option<String>,
-    current_rollout_path: Option<PathBuf>,
-    current_cwd: PathBuf,
-    codex_home: PathBuf,
-    _current_selected_ref_ids: Vec<String>,
 ) -> anyhow::Result<TogetherCommandOutput> {
     let argv = shlex::split(&args).ok_or_else(|| {
         anyhow::anyhow!("invalid shell-like quoting in together command: `{args}`")
@@ -10247,8 +10481,7 @@ async fn execute_together_command(
                     if is_local_endpoint(&endpoint)? {
                         stop_local_together_server().await?;
                     }
-                    set_together_status(Some("disconnected".to_string()));
-                    clear_together_endpoint();
+                    set_together_disconnected();
                     Ok(TogetherCommandOutput {
                         message: "Collaboration host stopped.".to_string(),
                         hint: None,
@@ -10259,8 +10492,7 @@ async fn execute_together_command(
                     if is_local_endpoint(&endpoint)? {
                         stop_local_together_server().await?;
                     }
-                    set_together_status(Some("disconnected".to_string()));
-                    clear_together_endpoint();
+                    set_together_disconnected();
                     Ok(TogetherCommandOutput {
                         message: "Already disconnected from collaboration host.".to_string(),
                         hint: None,
@@ -10313,8 +10545,7 @@ async fn execute_together_command(
                     .await;
             match leave_result {
                 Ok(response) if response.left => {
-                    set_together_status(Some("disconnected".to_string()));
-                    clear_together_endpoint();
+                    set_together_disconnected();
                     Ok(TogetherCommandOutput {
                         message: "Left together server.".to_string(),
                         hint: None,
@@ -10325,8 +10556,7 @@ async fn execute_together_command(
                     "leave was acknowledged but the server still considers this session active; retry /leave"
                 ),
                 Err(err) if together_not_connected(&err) => {
-                    set_together_status(Some("disconnected".to_string()));
-                    clear_together_endpoint();
+                    set_together_disconnected();
                     Ok(TogetherCommandOutput {
                         message: "Already disconnected from together server.".to_string(),
                         hint: None,
@@ -10342,15 +10572,8 @@ async fn execute_together_command(
             } else {
                 Some(rest.join(" "))
             };
-            let query_response = build_local_context_query(LocalContextQueryInput {
-                codex_home,
-                cwd: current_cwd,
-                current_thread_id: current_thread_id.clone(),
-                current_rollout_path,
-                query: query.clone(),
-                limit: Some(100),
-            })
-            .await?;
+            let query_response =
+                fetch_together_context_query(query.clone(), current_thread_id.clone()).await?;
             if query_response.nodes.is_empty() {
                 return Ok(TogetherCommandOutput {
                     message: "No context graph matches found.".to_string(),
@@ -10385,57 +10608,13 @@ async fn execute_together_command(
             let Some(source_thread_id) = current_thread_id else {
                 anyhow::bail!("cannot create a handoff without an active thread");
             };
-            let (target_actor_id, goal_tokens) = match rest.split_first() {
-                Some((operator, remaining)) if operator == ">" => match remaining.split_first() {
-                    None => {
-                        let candidates =
-                            list_together_handoff_targets(Some(current_cwd.as_path())).await?;
-                        if candidates.is_empty() {
-                            anyhow::bail!("no connected agents are available for handoff");
-                        }
-                        return Ok(TogetherCommandOutput {
-                            message: "Select a handoff target.".to_string(),
-                            hint: Some(
-                                "Choose an agent, then add optional instructions.".to_string(),
-                            ),
-                            follow_up: Some(TogetherCommandFollowUp::OpenHandoffTargetPicker {
-                                candidates,
-                            }),
-                        });
-                    }
-                    Some((target_actor_id, goal_tokens)) => {
-                        (Some(target_actor_id.clone()), goal_tokens)
-                    }
-                },
-                _ => (None, rest),
-            };
-            let goal = if goal_tokens.is_empty() {
+            let goal = if rest.is_empty() {
                 None
             } else {
-                Some(goal_tokens.join(" "))
+                Some(rest.join(" "))
             };
-            if target_actor_id.is_some() && goal.is_none() {
-                return Ok(TogetherCommandOutput {
-                    message: "Add optional handoff instructions.".to_string(),
-                    hint: Some(
-                        "Press Enter on an empty prompt to use the default handoff goal."
-                            .to_string(),
-                    ),
-                    follow_up: Some(TogetherCommandFollowUp::OpenHandoffPrompt {
-                        target_actor_id: target_actor_id.clone(),
-                        target_display_name: target_actor_id.clone(),
-                    }),
-                });
-            }
-            let query_response = build_local_context_query(LocalContextQueryInput {
-                codex_home,
-                cwd: current_cwd,
-                current_thread_id: Some(source_thread_id.clone()),
-                current_rollout_path,
-                query: None,
-                limit: Some(100),
-            })
-            .await?;
+            let query_response =
+                fetch_together_context_query(None, Some(source_thread_id.clone())).await?;
 
             let hint = Some(match &goal {
                 Some(goal) => format!(
@@ -10449,8 +10628,6 @@ async fn execute_together_command(
                 follow_up: Some(TogetherCommandFollowUp::PrepareHandoffView {
                     query_response,
                     handoff_goal: goal,
-                    target_display_name: target_actor_id.clone(),
-                    target_actor_id,
                 }),
             })
         }
@@ -10460,10 +10637,7 @@ async fn execute_together_command(
             } else {
                 current_together_endpoint()
             };
-            let mut client = connect_and_auth(&endpoint).await?;
-            let response: TogetherServerInfoResponse = client
-                .call(METHOD_HOST_STATUS, serde_json::json!({}))
-                .await?;
+            let response = fetch_together_server_info(&endpoint).await?;
             remember_together_server_endpoint(&response.server_id, &response.public_base_url);
             set_together_endpoint(Some(endpoint.clone()));
             set_together_status(Some(status_label_for_role(
@@ -10513,62 +10687,59 @@ pub(crate) async fn search_together_context(
     Ok(response.data)
 }
 
-async fn list_together_handoff_targets(
-    repo_root: Option<&Path>,
-) -> anyhow::Result<Vec<TogetherHandoffTargetCandidate>> {
+pub(crate) async fn fetch_together_server_info(
+    endpoint: &str,
+) -> anyhow::Result<TogetherServerInfoResponse> {
+    let mut client = connect_and_auth(endpoint).await?;
+    client.call(METHOD_HOST_STATUS, serde_json::json!({})).await
+}
+
+pub(crate) async fn fetch_together_thread_rollout(
+    thread_id: String,
+) -> anyhow::Result<Vec<RolloutItem>> {
     let endpoint = current_together_endpoint();
     let mut client = connect_and_auth(&endpoint).await?;
-    let status: TogetherServerInfoResponse = client
-        .call(METHOD_HOST_STATUS, serde_json::json!({}))
+    let response: ThreadReadRolloutResponse = client
+        .call(METHOD_THREAD_READ_ROLLOUT, ThreadReadParams { thread_id })
         .await?;
-    let thread_list: ThreadListResponse = client
+    Ok(response.history)
+}
+
+pub(crate) async fn try_fetch_together_server_info() -> Option<TogetherServerInfoResponse> {
+    let endpoint = current_together_endpoint();
+    match fetch_together_server_info(&endpoint).await {
+        Ok(response) => Some(response),
+        Err(err) if together_not_connected(&err) => None,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to load together server info for handoff");
+            None
+        }
+    }
+}
+
+pub(crate) async fn fetch_together_context_query(
+    query: Option<String>,
+    current_thread_id: Option<String>,
+) -> anyhow::Result<ContextQueryResponse> {
+    let endpoint = current_together_endpoint();
+    let mut client = connect_and_auth(&endpoint).await?;
+    client
         .call(
-            METHOD_THREAD_LIST,
-            ThreadListParams {
-                query: None,
-                repo_root: repo_root.map(|repo_root| repo_root.display().to_string()),
-                cursor: None,
+            METHOD_CONTEXT_QUERY,
+            ContextQueryParams {
+                current_thread_id,
+                precursor_thread_id: None,
+                precursor_kind: None,
+                actor_id: None,
+                repo_root: None,
+                git_branch: None,
+                goal: None,
+                query,
+                seed_ref_ids: Vec::new(),
                 limit: Some(100),
             },
         )
-        .await?;
-    let latest_thread_by_actor_id = thread_list
-        .data
-        .into_iter()
-        .filter_map(|thread| thread.actor_id.clone().map(|actor_id| (actor_id, thread)))
-        .fold(HashMap::new(), |mut latest, (actor_id, thread)| {
-            let should_replace = latest.get(&actor_id).is_none_or(
-                |existing: &codex_together_protocol::ThreadSummary| {
-                    thread.updated_at.unwrap_or_default() >= existing.updated_at.unwrap_or_default()
-                },
-            );
-            if should_replace {
-                latest.insert(actor_id, thread);
-            }
-            latest
-        });
-
-    Ok(status
-        .connected_members
-        .into_iter()
-        .map(|member| {
-            let description = latest_thread_by_actor_id
-                .get(&member.email)
-                .and_then(|thread| {
-                    thread
-                        .goal
-                        .clone()
-                        .or(thread.title.clone())
-                        .or(thread.preview.clone())
-                })
-                .or_else(|| Some(format!("{} agent", together_role_label(member.role))));
-            TogetherHandoffTargetCandidate {
-                actor_id: member.email.clone(),
-                display_name: member.email,
-                description,
-            }
-        })
-        .collect())
+        .await
 }
 
 pub(crate) async fn plan_together_context_handoff(
@@ -10594,7 +10765,7 @@ pub(crate) async fn plan_together_context_handoff(
         .await
 }
 
-async fn resolve_together_context_bundle(
+pub(crate) async fn resolve_together_context_bundle(
     thread_id: Option<String>,
     context_refs: Vec<ContextRef>,
 ) -> anyhow::Result<ContextResolveBundleResponse> {
@@ -10614,6 +10785,7 @@ async fn resolve_together_context_bundle(
 
 pub(crate) async fn commit_together_handoff_plan(
     plan_id: String,
+    target_connection_id: Option<String>,
     cwd: PathBuf,
     model: String,
     approval_policy: AskForApproval,
@@ -10626,6 +10798,7 @@ pub(crate) async fn commit_together_handoff_plan(
             METHOD_HANDOFF_COMMIT,
             HandoffCommitParams {
                 plan_id,
+                target_connection_id,
                 cwd: Some(cwd.display().to_string()),
                 model: Some(model),
                 approval_policy: Some(approval_policy),
@@ -10641,11 +10814,69 @@ fn together_not_connected(err: &anyhow::Error) -> bool {
 }
 
 async fn connect_and_auth(endpoint: &str) -> anyhow::Result<TogetherRpcClient> {
+    Ok(connect_and_auth_with_options(endpoint, false).await?.0)
+}
+
+async fn connect_and_auth_with_options(
+    endpoint: &str,
+    advertise_session: bool,
+) -> anyhow::Result<(
+    TogetherRpcClient,
+    codex_together_protocol::TogetherAuthResponse,
+)> {
     ensure_local_together_server_running(endpoint).await?;
     let mut client = TogetherRpcClient::connect(endpoint).await?;
     client.initialize().await?;
-    client.authenticate().await?;
-    Ok(client)
+    let auth = client.authenticate(advertise_session).await?;
+    Ok((client, auth))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TogetherHostStoppedNotification {
+    server_id: String,
+    owner_email: String,
+}
+
+pub(crate) async fn listen_to_together_session(
+    endpoint: String,
+    tx: AppEventSender,
+) -> anyhow::Result<()> {
+    let (mut client, auth) = connect_and_auth_with_options(&endpoint, true).await?;
+    tx.send(AppEvent::TogetherSessionConnected {
+        endpoint: endpoint.clone(),
+        connection_id: auth.connection_id,
+    });
+    loop {
+        let notification = client.next_notification().await?;
+        match notification.method.as_str() {
+            NOTIFY_HOST_STOPPED => {
+                let payload: TogetherHostStoppedNotification =
+                    serde_json::from_value(notification.params).map_err(|err| {
+                        anyhow::anyhow!("invalid together host stopped notification payload: {err}")
+                    })?;
+                tx.send(AppEvent::TogetherHostStopped {
+                    endpoint: endpoint.clone(),
+                    server_id: payload.server_id,
+                    owner_email: payload.owner_email,
+                });
+                return Ok(());
+            }
+            NOTIFY_HANDOFF_ASSIGNED => {
+                let payload: HandoffAssignedNotification =
+                    serde_json::from_value(notification.params).map_err(|err| {
+                        anyhow::anyhow!(
+                            "invalid together handoff assigned notification payload: {err}"
+                        )
+                    })?;
+                tx.send(AppEvent::TogetherHandoffAssigned {
+                    endpoint: endpoint.clone(),
+                    notification: payload,
+                });
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -10675,6 +10906,122 @@ struct NgrokTunnel {
 struct NgrokTunnelConfig {
     #[serde(default)]
     addr: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalTogetherActorMetadata {
+    actor_id: String,
+    display_name: Option<String>,
+    actor_kind: TogetherActorKind,
+    agent_role: Option<String>,
+}
+
+fn local_together_actor_metadata() -> LocalTogetherActorMetadata {
+    let actor_id = local_together_actor_id();
+    let display_name = std::env::var(TOGETHER_ACTOR_DISPLAY_NAME_ENV_KEY)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let agent_role = std::env::var(TOGETHER_ACTOR_ROLE_ENV_KEY)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let actor_kind = match std::env::var(TOGETHER_ACTOR_KIND_ENV_KEY)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("agent") => TogetherActorKind::Agent,
+        Some("human") => TogetherActorKind::Human,
+        _ if agent_role.is_some() => TogetherActorKind::Agent,
+        _ => TogetherActorKind::Human,
+    };
+    LocalTogetherActorMetadata {
+        actor_id,
+        display_name,
+        actor_kind,
+        agent_role,
+    }
+}
+
+pub(crate) fn together_handoff_targets_from_members(
+    connected_members: Option<&[ConnectedMember]>,
+    local_connection_id: Option<&str>,
+) -> (Vec<TogetherHandoffTarget>, usize) {
+    let local = local_together_actor_metadata();
+    let local_actor_id = local.actor_id.clone();
+    let local_display_name = local.display_name.clone();
+    let local_agent_role = local.agent_role.clone();
+    let self_member = connected_members.and_then(|members| {
+        local_connection_id.and_then(|local_connection_id| {
+            members
+                .iter()
+                .find(|member| member.connection_id == local_connection_id)
+        })
+    });
+    let mut targets = vec![if let Some(self_member) = self_member {
+        TogetherHandoffTarget {
+            connection_id: self_member.connection_id.clone(),
+            actor_id: self_member.email.clone(),
+            display_name: self_member.display_name.clone().or(local_display_name),
+            actor_kind: self_member.actor_kind,
+            agent_role: self_member.agent_role.clone().or(local_agent_role),
+            membership_role: Some(self_member.role),
+            is_self: true,
+        }
+    } else {
+        TogetherHandoffTarget {
+            connection_id: "local".to_string(),
+            actor_id: local_actor_id.clone(),
+            display_name: local.display_name,
+            actor_kind: local.actor_kind,
+            agent_role: local.agent_role,
+            membership_role: None,
+            is_self: true,
+        }
+    }];
+    if let Some(members) = connected_members {
+        let mut skipped_local_actor_placeholder = false;
+        let mut remote_targets = members
+            .iter()
+            .filter(|member| {
+                if let Some(local_connection_id) = local_connection_id {
+                    return member.connection_id != local_connection_id;
+                }
+                if member.email == local_actor_id && !skipped_local_actor_placeholder {
+                    skipped_local_actor_placeholder = true;
+                    return false;
+                }
+                true
+            })
+            .map(|member| TogetherHandoffTarget {
+                connection_id: member.connection_id.clone(),
+                actor_id: member.email.clone(),
+                display_name: member.display_name.clone(),
+                actor_kind: member.actor_kind,
+                agent_role: member.agent_role.clone(),
+                membership_role: Some(member.role),
+                is_self: false,
+            })
+            .collect::<Vec<_>>();
+        remote_targets.sort_by(|left, right| {
+            (!matches!(left.actor_kind, TogetherActorKind::Agent))
+                .cmp(&!matches!(right.actor_kind, TogetherActorKind::Agent))
+                .then_with(|| {
+                    together_handoff_target_title(left).cmp(&together_handoff_target_title(right))
+                })
+                .then_with(|| left.actor_id.cmp(&right.actor_id))
+                .then_with(|| left.connection_id.cmp(&right.connection_id))
+        });
+        targets.extend(remote_targets);
+    }
+
+    let selected_handoff_target_idx = targets
+        .iter()
+        .position(|target| !target.is_self && matches!(target.actor_kind, TogetherActorKind::Agent))
+        .or_else(|| targets.iter().position(|target| !target.is_self))
+        .unwrap_or(0);
+    (targets, selected_handoff_target_idx)
 }
 
 fn local_together_actor_id() -> String {
@@ -11134,6 +11481,10 @@ fn current_together_endpoint() -> String {
         .unwrap_or_else(|| TOGETHER_DEFAULT_ENDPOINT_URL.to_string())
 }
 
+pub(crate) fn active_together_session_endpoint() -> Option<String> {
+    together_status_is_connected().then(current_together_endpoint)
+}
+
 fn set_together_status(value: Option<String>) {
     unsafe {
         match value {
@@ -11141,6 +11492,11 @@ fn set_together_status(value: Option<String>) {
             None => std::env::remove_var(status_env_key()),
         }
     }
+}
+
+pub(crate) fn set_together_disconnected() {
+    set_together_status(Some("disconnected".to_string()));
+    clear_together_endpoint();
 }
 
 fn set_together_endpoint(value: Option<String>) {
